@@ -9,7 +9,7 @@ The implementation of the Jitter RNG is independent of any operating system.
 As such, it could even run on baremetal without any operating system.
 
 The design of the RNG is given in the documentation found in at
-http://www.chronox.de/jent . This documentation also covers the full
+[http://www.chronox.de/jent](http://www.chronox.de/jent). This documentation also covers the full
 assessment of the SP800-90B compliance as well as all required test code.
 
 ## API
@@ -21,6 +21,18 @@ To use the Jitter RNG, the header file jitterentropy.h must be included.
 # Build Instructions
 
 To generate the shared library `make` followed by `make install`.
+
+Besides the Makefile based build system, CMake support is also provided.
+This may eases cross compiling or setting the relevant options for BSI's
+functionality class NTG.1, like:
+
+```sh
+mkdir build
+cd build
+cmake -DINTERNAL_TIMER=off -DEXTERNAL_CRYPTO=openssl ..
+make
+```
+CMake may also be used on platforms like Windows or MacOS to ease compilation.
 
 # Android
 
