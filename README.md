@@ -29,10 +29,25 @@ functionality class NTG.1, like:
 ```sh
 mkdir build
 cd build
-cmake -DINTERNAL_TIMER=off -DEXTERNAL_CRYPTO=openssl ..
+cmake -DINTERNAL_TIMER=off -DEXTERNAL_CRYPTO=OPENSSL ..
 make
 ```
 CMake may also be used on platforms like Windows or MacOS to ease compilation.
+
+# Operational Considerations
+
+Please keep the following aspects regarding jitterentropy's usage in mind:
+
+* Use no multithreading on a single instace of `struct rand_data`. If multiple
+  threads shall be used, allocate multiple per-thread instances via `jent_entropy_collector_alloc()`.
+* Virtual Machine Monitors/Hypervisor may trap and emulate the platforms native timestamping mechanism,
+  like `rdtsc`, leading to degraded entropy levels. Please check and disable emulation if possible.
+* Activate the health tests (JENT_FORCE_FIPS or JENT_NTG1) if you are operating in a regulated environment
+  and/or have done prior entropy estimation. Failing health tests will block the output of the RNG.
+* Startup tests take a short but noticeable amount of time, you may not create a new jitter RNG instance
+  whenever random bytes are needed.
+* While jitterentropy is a rather fast noise source, don't expect multiple MB/s or GB/s. Use it as seed
+  source for another deterministic RNG if such speeds are needed.
 
 # Android
 
@@ -123,11 +138,11 @@ the compliance to NTG.1:
 
 - Measured entropy rate must show rate 8/OSR or higher (see
   `tests/raw-entropy/README.md`):
-  
+
   * Hash loop
-  
+
   * Memory access loop
-  
+
   * Common behavior (SP800-90B restart + runtime tests)
 
 # Version Numbers
