@@ -1,7 +1,8 @@
 # Jitter RNG SP800-90B Entropy Analysis Tool
 
 This archive contains the SP800-90B analysis tool to be used for the Jitter RNG.
-The tool set consists of the following individual tools:
+In addition, the tool set also supports the AIS 20/31 NTG.1 entropy rate
+analysis. The tool set consists of the following individual tools:
 
 - `recording_runtime_kernelspace`: This tool is used to gather the raw entropy
   of the Linux kernel space Jitter RNG for the SP800-90B runtime data.
@@ -11,12 +12,13 @@ The tool set consists of the following individual tools:
 
 - `recording_userspace`: This tools is used to gather the raw entropy of
   the user space Jitter RNG implementation for the SP800-90B runtime and
-  restart data.
+  restart data. Also, this directory contains tools supporting NTG.1 analysis.
 
 - `validation-runtime`: This tool is used to calculate the minimum entropy
   values compliant to SP800-90B section 3.1.3. This tool tool is to be used
   with the user space and kernel space runtime data obtained from the
-  aforementioned `recording_*` tools.
+  aforementioned `recording_*` tools. Also, tools to perform the analysis
+  for the NTG.1 compliance are provided.
 
 - `validation-restart`: This tool is used to calculate the minimum entropy
   values for the restart test compliant to SP800-90B section 3.1.4. This tool
@@ -78,15 +80,114 @@ provided. In the example above, the measurement shows that
 1/3 bits of entropy is present which implies that the available amount of
 entropy is more than what the Jitter RNG heuristic applies.
 
-# Approach to Solve Insufficient Entropy
+# NTG.1 Considerations
+
+When enabling the NTG.1 operational behavior, it is possible to incur
+insufficient entropy. It is **strongly** advisable to perform the
+[assessment for insufficient entropy](#Approach to Analyze Insufficient Entropy).
+This is due to the fact that the health test is significantly more strict:
+
+- 8/OSR bits of entropy are heuristically expected to be available during
+start time. This value must be achieved by the hash loop and memory access loop
+**independently** of each other. For details on the independent operation of
+the hash loop and memory access loop, see the design and architecture
+specification of the Jitter RNG.
+
+- 4/OSR bits of entropy are heuristically expected to be available during
+runtime.
+
+Note, when applying the analysis in the following, you have to compare the 
+data with the heuristic entropy value of 8/OSR. 
+
+# Approach to Analyze Insufficient Entropy
 
 The Jitter RNG does not need any specific configurations or settings. However,
 in case your entropy assessment shows that insufficient entropy is
-present (e.g. by showing that the measured entropy rate is less than 1/3), you
-can perform a search whether different memory access values gives better
-entropy.
+present (e.g. by showing that the measured entropy rate is less than 1/3) or the
+health test flags an error too often, you can perform a search whether different
+configuration values gives better entropy.
+
+## Basic Requirement For Entropy Rate
+
+To be precise, the following requirements must be met - every time the following
+refers to the "OSR" value, please consider [Oversampling Rate](#Oversampling Rate): 
+
+- In all cases: The runtime and restart entropy rates given by `processdata.sh`
+  must show an entropy value that is larger than 1/OSR.
+  
+- In case of NTG.1 configuration: The runtime and restart entropy rates given by
+  `processdata_ntg1.sh` for the common case, the hash loop and the memory access
+  must show an entropy value that is larger than 8/OSR.
+
+## Background - Jitter RNG Configuration Possibilities
+
+The Jitter RNG has the following configuration options that allow altering the
+entropy rate for the hash loop and memory access loop, as well as alter the
+heuristically applied entropy rate.
+
+### Oversampling Rate
+
+The oversampling rate defines the heuristically applied entropy rate by the
+Jitter RNG. Its value defines how much raw entropy data is collected to obtain
+an output block of 256 bits that is expected to have full entropy.
+
+In addition, Its value implicitly selects the health test cutoff values and thus
+directly affects the probability that health errors are incurred.
+
+The global heuristic entropy rate is defined as 1/OSR bits of entropy per
+time delta obtained.
+
+Runtime configuration: Use the `osr` parameter during initialization
+
+Compile time configuration: Apply `-DJENT_MIN_OSR=<VALUE>` during compilation.
+
+Default value: 3
+
+Note: Runtime configuration value takes precedence over compile-time value.
+
+### Memory Access Buffer Size
+
+The buffer size defines the amount of memory allocated by the Jitter RNG to
+measure the execution timing variation over memory accesses.
+
+Rule of thumb: The larger the buffer, the higher the entropy rate.
+
+Runtime configuration: Use the `JENT_MAX_MEMSIZE_*` flags during initialization.
+
+Compile time configuration: Apply `-DJENT_DEFAULT_MEMORY_BITS=<VALUE>` during
+compilation. Note, the memory size value is 2^JENT_DEFAULT_MEMORY_BITS.
+
+Default value: 18 (resulting in 2^18 bytes)
+
+Note: Runtime configuration value takes precedence over compile-time value.
+
+Note: Compile-time value applied only if no L1-cache size is detected.
+
+### Hash Loop Iteration Count
+
+The iteration count defines the number of hash loop iterations executed to
+measure CPU instruction timing variations.
+
+Rule of thumb: The larger the iteration count, the higher the entropy rate.
+
+Runtime configuration: Us the `JENT_HASHLOOP_*` flags during initialization.
+
+Compile time configuration: Apply `-DJENT_HASH_LOOP_DEFAULT=<VALUE>` during
+compilation.
+
+Default value: 1
+
+Note: Runtime configuration value takes precedence over compile-time value.
 
 ## Tool for Searching for More Entropy
+
+Prerequisites:
+
+- R-Project must be installed
+
+- [SP800-90B Statistical Tool](https://github.com/usnistgov/SP800-90B_EntropyAssessment)
+  must be installed and available pointed to by `EATOOL_NONIID` in
+  `validation-runtime/processdata_helper.sh`.
 
 It is possible that the the default setting of the Jitter RNG does not deliver
 sufficient entropy. It is possible to adjust the memory access part of the
@@ -97,125 +198,47 @@ The goal of those test tools is to detect the proper memory setting that is
 appropriate for your environment. One memory setting consists of two values,
 one for the number of memory blocks and one for the memory block size.
 
-- `recording_userspace/analyze_options.sh`: This tool generates a large number
-  of different test results for different settings for the memory access. Simply
-  execute the tool without any options. A large set of different test results
-  directories are created.
+- `recording_userspace/invoke_testing_hashloop.sh`: This tool generates a large
+  number of different test results for different settings for the hash loop
+  operation. Simply execute the tool without any options. The tool creates
+  test result data for each hash loop configuration option possible with the
+  Jitter RNG.
+  
+- `recording_userspace/invoke_testing_memloop.sh`: This tool generates a large
+  number of different test results for different settings for the memory access
+  operation. Simply execute the tool without any options. The tool creates
+  test result data for each memory buffer size configuration option possible
+  with the Jitter RNG.
 
-- `validation-runtime/analyze_options.sh`: This tool analyzes all test results
-  directories created by the `recording_userspace/analyze_options.sh` for
+- `validation-runtime/processdata_hashloop.sh`: This tool analyzes all test
+  results created by the `recording_userspace/invoke_testing_hashloop.sh` for
   the runtime data. It generates an overview file with all test results in
-  `results-runtime-multi`. Analyze it and extract the memory access settings
-  that gives you the intended entropy rate.
+  `minentropy_collected_hashloop.txt` as well as it provides a graphical
+  display of the entropy rates in `minentropy_collected_hashloop.pdf`. Analyze
+  it and extract the hash loop iteration count that gives you the intended
+  entropy rate.
 
-- `validation-restart/analyze_options.sh`: This tool analyzes all test results
-  directories created by the `recording_userspace/analyze_options.sh` for
-  the restart data. It generates an overview file with all test results in
-  `results-restart-multi`. Analyze it and extract the memory access settings
-  that gives you the intended entropy rate.
+- `validation-runtime/processdata_memloop.sh`: This tool analyzes all test
+  results created by the `recording_userspace/invoke_testing_memloop.sh` for
+  the runtime data. It generates an overview file with all test results in
+  `minentropy_collected_memloop.txt` as well as it provides a graphical
+  display of the entropy rates in `minentropy_collected_memloop.pdf`. Analyze
+  it and extract the memory buffer size that gives you the intended entropy
+  rate.
 
-After you concluded the testing you have 2 memory settings that should be
-appropriate for you. As you need exactly one memory setting, analyze again
-the results to detect the memory setting that gives suitable entropy rates
-for both, the runtime and restart tests.
-
-Once you found the suitable memory setting, invoke the Jitter RNG with the
-respective option `JENT_MAX_MEMSIZE_*` as flag in `jent_entropy_init_ex` and
-`jent_entropy_collector_alloc`.
-
-### Example - JENT_RANDOM_MEMACCESS not defined
-
-For example, the test returns the following data (this list is truncated)
-
-```
-Number of blocks        Blocksize       min entropy
-64      32       0.542445
-64      64       0.232963
-64      128      0.232486
-64      256      0.231005
-64      512      0.401778
-64      1024     0.326805
-64      2048     0.319931
-64      4096     0.225761
-64      8192     0.220877
-64      16384    0.330431
-128     32       0.069033
-128     64       0.068805
-128     128      0.221863
-...
-```
-
-You now conclude that the following line is good for you:
-
-```
-64      512      0.401778
-```
+After you concluded the testing you have a memory buffer size and a hash loop
+iteration count that should be appropriate for you. Note, it is perfectly fine
+if only one, i.e. the hash loop count or the memory buffer size needs adjustment
+to give you the intended entropy rate as the respective other already offer
+sufficient entropy.
 
 Once you found the suitable memory setting, invoke the Jitter RNG with the
 respective option `JENT_MAX_MEMSIZE_*` as flag in `jent_entropy_init_ex` and
 `jent_entropy_collector_alloc`.
 
-### Example - JENT_RANDOM_MEMACCESS defined
-
-For example, the test returns the following data
-
-```
-Number of bits  min entropy
-10       0.406505
-11       0.445082
-12       0.402972
-13       0.459021
-14       0.436911
-15       0.578995
-16       0.643272
-17       0.573532
-18       0.627915
-19       0.503923
-20       0.720609
-21       1.871527
-22       2.491569
-23       2.481533
-24       2.493987
-25       2.491303
-26       2.495017
-```
-
-This stack tells you in the first column the actual amount of memory requested
-to be allocated by the Jitter RNG for the memory access in powers of 2 (Note,
-this amount is limited by the CPU's data cache size.). The second column is what
-you can ignore for this test.
-
-You now conclude that the following line is good for you because the measurement
-shows that about 1 bit of entropy per Jitter RNG time delta is received. This
-is compared with the Jitter RNG internally applied entropy rate of 1/3 bits
-of entropy per time delta which means that the Jitter RNG heuristics
-underestimates the available entropy - which is the result you want.
-
-```
-21       1.871527
-```
-
-This value means that the allocated memory is 2^21 = 2MBytes.
-
-Once you found the suitable memory setting, invoke the Jitter RNG with the
-respective option `JENT_MAX_MEMSIZE_*` as flag in `jent_entropy_init_ex` and
-`jent_entropy_collector_alloc` as follows:
-
-```
-unsigned int flags = 0;
-...
-flags |= JENT_MAX_MEMSIZE_2MB;
-
-ret = jent_entropy_init_ex(0, flags);
-...
-ret = jent_entropy_collector_alloc(0, flags);
-...
-
-```
-
-Note, the Jitter RNG will allocate 1 << JENT_MEMORY_BITS
-bytes for its memory access operation, but at most what
-jent_cache_size_roundup() returns.
+Once you found the suitable hash loop setting, invoke the Jitter RNG with the
+respective option `JENT_HASHLOOP_*` as flag in `jent_entropy_init_ex` and
+`jent_entropy_collector_alloc`.
 
 # Author
 Stephan Mueller <smueller@chronox.de>
