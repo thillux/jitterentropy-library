@@ -1,6 +1,9 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.20)
 
-project(jitterentropy C)
+project(jitterentropy
+    LANGUAGES C
+    VERSION 3.7.0
+)
 set(CMAKE_C_STANDARD 11)
 
 option(STACK_PROTECTOR "Compile Jitter with stack protector enabled" ON)
@@ -33,6 +36,14 @@ endif()
 if(ENABLE_SANITIZERS)
     add_compile_options(-fsanitize=address,undefined)
     add_link_options(-fsanitize=address,undefined)
+endif()
+
+if(BUILD_SHARED_LIBS)
+  set(JITTER_PC_LIBS "-l${CMAKE_PROJECT_NAME}")
+  set(JITTER_PC_LIBS_PRIVATE "")
+else()
+  set(JITTER_PC_LIBS "")
+  set(JITTER_PC_LIBS_PRIVATE "-l${CMAKE_PROJECT_NAME}")
 endif()
 
 if(WIN32)
@@ -90,11 +101,21 @@ target_compile_options(${PROJECT_NAME} PRIVATE ${JITTER_C_FLAGS})
 target_link_libraries(${PROJECT_NAME} PRIVATE ${JITTER_LINKER_FLAGS})
 install(
     DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/arch
-    DESTINATION include
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.h"
 )
 install(TARGETS ${PROJECT_NAME}
-    INCLUDES DESTINATION include
+    EXPORT jitterentropyTargets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+install(EXPORT jitterentropyTargets
+  FILE jitterentropyTargets.cmake
+  NAMESPACE jitterentropy::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -131,12 +152,14 @@ if(EXTERNAL_CRYPTO)
                 HINTS "${CMAKE_INSTALL_PREFIX}"
                 PATH_SUFFIXES build/crypto build lib64 lib
                 )
+        set(JITTER_PC_REQUIRES "${EXTERNAL_CRYPTO_LIBRARY_NAME}")
     else()
         find_library(LIBCRYPTO_LIBRARY
                 NAMES "${EXTERNAL_CRYPTO_LIBRARY_NAME}.a" "${EXTERNAL_CRYPTO_LIBRARY_NAME}.lib"
                 HINTS "${CMAKE_INSTALL_PREFIX}"
                 PATH_SUFFIXES build/crypto build lib64 lib
                 )
+        set(JITTER_PC_REQUIRES_PRIVATE "${EXTERNAL_CRYPTO_LIBRARY_NAME}")
     endif()
     message(STATUS "Found external crypto library ${LIBCRYPTO_LIBRARY}")
     target_link_libraries(${PROJECT_NAME} PUBLIC ${LIBCRYPTO_LIBRARY})
@@ -152,3 +175,33 @@ endif()
 add_subdirectory(tests/gcd)
 add_subdirectory(tests/raw-entropy/validation-runtime)
 add_subdirectory(tests/raw-entropy/recording_userspace)
+
+include(CMakePackageConfigHelpers)
+
+# pkg-config
+configure_package_config_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/jitterentropy.pc.in
+  ${CMAKE_CURRENT_BINARY_DIR}/jitterentropy.pc
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+)
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/jitterentropy.pc
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+)
+
+# cmake
+configure_package_config_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/jitterentropyConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/jitterentropyConfig.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake
+)
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/jitterentropyConfigVersion.cmake
+  VERSION       ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion
+)
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/jitterentropyConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/jitterentropyConfigVersion.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake
+)
