@@ -460,8 +460,9 @@ static void jent_rct_init(struct rand_data *ec, unsigned short safety)
 	ec->rct_cutoff_permanent = JENT_HEALTH_RCT_PERMANENT_CUTOFF(osr);
 
 	if (safety) {
-		ec->rct_cutoff = (ec->rct_cutoff + safety - 1) / safety;
-		ec->rct_cutoff_permanent =
+		ec->rct_cutoff = (unsigned short)
+			(ec->rct_cutoff + safety - 1) / safety;
+		ec->rct_cutoff_permanent = (unsigned short)
 			(ec->rct_cutoff_permanent + safety - 1) / safety;
 	}
 }
