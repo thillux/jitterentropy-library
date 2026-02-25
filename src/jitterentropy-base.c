@@ -346,8 +346,8 @@ static int jent_health_failure_reset(
 	flags = (*ec)->flags;
 	max_mem_set = (*ec)->max_mem_set;
 
-	/* generic arbitrary cutoff */
-	if (osr > 20)
+	/* generic arbitrary cutoff to prevent running "forever" */
+	if (osr > JENT_MAX_OSR)
 		return -1;
 
 	/*
@@ -367,7 +367,7 @@ static int jent_health_failure_reset(
 	/* Perform new health test with updated OSR */
 	while (jent_entropy_init_ex(osr, flags)) {
 		osr++;
-		if (osr > 20)
+		if (osr > JENT_MAX_OSR)
 			return -1;
 	}
 
