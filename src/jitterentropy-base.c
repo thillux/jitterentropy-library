@@ -320,8 +320,83 @@ err:
 	return ret ? ret : (ssize_t)orig_len;
 }
 
-static struct rand_data *_jent_entropy_collector_alloc(unsigned int osr,
-						       unsigned int flags);
+static int jent_health_failure_reset(
+	struct rand_data **ec, struct rand_data *(*alloc)(unsigned int osr,
+							  unsigned int flags))
+{
+	unsigned int osr, flags, max_mem_set, apt_observations = 0,
+		     lag_prediction_success_run, lag_prediction_success_count;
+	uint64_t current_delta;
+
+	/* Remember all health test state */
+	apt_observations = (*ec)->apt_observations;
+	current_delta = (*ec)->apt_base;
+#ifdef JENT_HEALTH_LAG_PREDICTOR
+	lag_prediction_success_run = (*ec)->lag_prediction_success_run;
+	lag_prediction_success_count = (*ec)->lag_prediction_success_count;
+#else
+	(void)lag_prediction_success_run;
+	(void)lag_prediction_success_count;
+#endif
+
+	/* Increment OSR */
+	osr = (*ec)->osr + 1;
+
+	/* Remember flags value */
+	flags = (*ec)->flags;
+	max_mem_set = (*ec)->max_mem_set;
+
+	/* generic arbitrary cutoff */
+	if (osr > 20)
+		return -1;
+
+	/*
+	 * If the caller did not set any specific maximum value let the Jitter
+	 * RNG increase the maximum memory by one step.
+	 */
+	if (!max_mem_set)
+		flags = jent_update_memsize(flags, 1);
+
+	/* Increment hash loop count by one */
+	flags = jent_update_hashloop(flags, 1);
+
+	/* re-allocate entropy collector with higher OSR and memory size */
+	jent_entropy_collector_free(*ec);
+	*ec = NULL;
+
+	/* Perform new health test with updated OSR */
+	while (jent_entropy_init_ex(osr, flags)) {
+		osr++;
+		if (osr > 20)
+			return -1;
+	}
+
+	*ec = alloc(osr, flags);
+	if (!*ec)
+		return -1;
+
+	/* Remember whether caller configured memory size */
+	(*ec)->max_mem_set = !!max_mem_set;
+
+	/* Set the health test state in case of intermittent failures. */
+	if (apt_observations) {
+		/* APT re-initialization to intermittent error */
+		jent_apt_reinit(*ec, current_delta, 0, apt_observations);
+
+		/* RCT re-initialization to intermittent error */
+		(*ec)->rct_count =
+			(int)(JENT_HEALTH_RCT_INTERMITTENT_CUTOFF(osr));
+
+		/* LAG re-initialization */
+#ifdef JENT_HEALTH_LAG_PREDICTOR
+		(*ec)->lag_prediction_success_run = lag_prediction_success_run;
+		(*ec)->lag_prediction_success_count =
+			lag_prediction_success_count;
+#endif
+	}
+
+	return 0;
+}
 
 /**
  * Entry function: Obtain entropy for the caller.
@@ -357,109 +432,38 @@ ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 		return -1;
 
 	while (len > 0) {
-		unsigned int osr, flags, max_mem_set, apt_observations = 0,
-			     lag_prediction_success_run,
-			     lag_prediction_success_count;
-		uint64_t current_delta;
-
 		ret = jent_read_entropy(*ec, p, len);
 
 		switch (ret) {
+			/* Generic errors are returned immediately */
 		case -1:
 		case -4:
 
-			/* Permanent errors are returned immediately */
+			/* Permanent health errors are returned immediately */
 		case -6:
 		case -7:
 		case -8:
 			return ret;
 
+			/* Intermittent health errors */
 		case -2:
 		case -3:
 		case -5:
-			apt_observations = (*ec)->apt_observations;
-			current_delta = (*ec)->apt_base;
-#ifdef JENT_HEALTH_LAG_PREDICTOR
-			lag_prediction_success_run =
-				(*ec)->lag_prediction_success_run;
-			lag_prediction_success_count =
-				(*ec)->lag_prediction_success_count;
-#else
-			(void)lag_prediction_success_run;
-			(void)lag_prediction_success_count;
-#endif
-
-			osr = (*ec)->osr + 1;
-			flags = (*ec)->flags;
-			max_mem_set = (*ec)->max_mem_set;
-
-			/* generic arbitrary cutoff */
-			if (osr > 20)
+			/*
+			 * Re-allocate the entropy collector with updated
+			 * OSR, hash loop count and memory size and run
+			 * the startup sequence for NTG.1 again.
+			 *
+			 * If we fail here, the Jitter RNG returns the error.
+			 */
+			if (jent_health_failure_reset(
+				ec, jent_entropy_collector_alloc))
 				return ret;
 
 			/*
-			 * If the caller did not set any specific maximum value
-			 * let the Jitter RNG increase the maximum memory by
-			 * one step.
-			 */
-			if (!max_mem_set)
-				flags = jent_update_memsize(flags, 1);
-
-			/* Increment hash loop count by one */
-			flags = jent_update_hashloop(flags, 1);
-
-			/*
-			 * re-allocate entropy collector with higher OSR and
-			 * memory size
-			 */
-			jent_entropy_collector_free(*ec);
-			*ec = NULL;
-
-			/* Perform new health test with updated OSR */
-			while (jent_entropy_init_ex(osr, flags)) {
-				osr++;
-				if (osr > 20)
-					return -1;
-			}
-
-			*ec = _jent_entropy_collector_alloc(osr, flags);
-			if (!*ec)
-				return -1;
-
-			/* Remember whether caller configured memory size */
-			(*ec)->max_mem_set = !!max_mem_set;
-
-			/*
-			 * Set the health test state in case of intermittent
-			 * failures.
-			 */
-			if (apt_observations) {
-				/*
-				 * APT re-initialization to intermittent error
-				 */
-				jent_apt_reinit(*ec, current_delta, 0,
-						apt_observations);
-
-				/*
-				 * RCT re-initialization to intermittent error
-				 */
-				(*ec)->rct_count =
-					(int)(JENT_HEALTH_RCT_INTERMITTENT_CUTOFF(osr));
-
-				/* LAG re-initialization */
-#ifdef JENT_HEALTH_LAG_PREDICTOR
-				(*ec)->lag_prediction_success_run =
-					lag_prediction_success_run;
-				(*ec)->lag_prediction_success_count =
-					lag_prediction_success_count;
-#endif
-			}
-
-			/*
-			 * We are not returning the intermittent or permanent
-			 * errors here. If a caller wants them, he should
-			 * register a callback with
-			 * jent_set_fips_failure_callback.
+			 * We are not returning the intermittent errors here.
+			 * If a caller wants them, he should register a callback
+			 * with jent_set_fips_failure_callback.
 			 */
 
 			break;
@@ -560,6 +564,8 @@ static struct rand_data
 		if (entropy_collector->mem == NULL)
 			goto err;
 		entropy_collector->memaccessloops = JENT_MEM_ACC_LOOP_DEFAULT;
+		entropy_collector->max_mem_set =
+			!!JENT_FLAGS_TO_MAX_MEMSIZE(flags);
 	}
 
 	/* Set the hash loop count */
@@ -625,8 +631,29 @@ static struct rand_data
 	if (!(flags & JENT_DISABLE_INTERNAL_TIMER)) {
 		if (jent_notime_enable(entropy_collector, flags))
 			goto err;
-		if (jent_notime_settick(entropy_collector))
-			goto err;
+	}
+
+	return entropy_collector;
+
+err:
+	jent_entropy_collector_free(entropy_collector);
+	return NULL;
+}
+
+JENT_PRIVATE_STATIC
+struct rand_data *jent_entropy_collector_alloc(unsigned int osr,
+					       unsigned int flags)
+{
+	struct rand_data *ec = jent_entropy_collector_alloc_internal(osr,
+								     flags);
+
+	if (!ec)
+		return ec;
+
+	/* fill the data pad with non-zero values */
+	if (jent_notime_settick(ec)) {
+		jent_entropy_collector_free(ec);
+		return NULL;
 	}
 
 	/*
@@ -642,54 +669,31 @@ static struct rand_data
 	 * at least at this point.
 	 */
 	do {
-		jent_random_data(entropy_collector);
-	} while(entropy_collector->startup_state != jent_startup_completed);
+		jent_random_data(ec);
 
-	/* Disable timer thread again after initialization.
-	 * Also works if not used above. */
-	jent_notime_unsettick(entropy_collector);
+		/*
+		 * Check for any kind of health error at this point including
+		 * intermittent or permanent errors. If we observed one,
+		 * re-initialize the entropy collector.
+		 */
+		if (jent_health_failure(ec)) {
 
-	return entropy_collector;
+			/*
+			 * Re-allocate the entropy collector with updated
+			 * OSR, hash loop count and memory size.
+			 */
+			if (jent_health_failure_reset(
+				&ec, jent_entropy_collector_alloc_internal)) {
+				jent_entropy_collector_free(ec);
+				return NULL;
+			}
 
-err:
-	jent_notime_unsettick(entropy_collector);
-	if (entropy_collector->mem != NULL)
-		jent_zfree(entropy_collector->mem, memsize);
-	if (entropy_collector->hash_state != NULL)
-		jent_sha3_dealloc(entropy_collector->hash_state);
-	jent_zfree(entropy_collector, sizeof(struct rand_data));
-	return NULL;
-}
+			/* Rerun startup sequence */
+			continue;
+		}
+	} while (ec->startup_state != jent_startup_completed);
 
-static struct rand_data *_jent_entropy_collector_alloc(unsigned int osr,
-						       unsigned int flags)
-{
-	struct rand_data *ec = jent_entropy_collector_alloc_internal(osr,
-								     flags);
-
-	if (!ec)
-		return ec;
-
-	/* fill the data pad with non-zero values */
-	if (jent_notime_settick(ec)) {
-		jent_entropy_collector_free(ec);
-		return NULL;
-	}
-	jent_random_data(ec);
 	jent_notime_unsettick(ec);
-
-	return ec;
-}
-
-JENT_PRIVATE_STATIC
-struct rand_data *jent_entropy_collector_alloc(unsigned int osr,
-					       unsigned int flags)
-{
-	struct rand_data *ec = _jent_entropy_collector_alloc(osr, flags);
-
-	/* Remember that the caller provided a maximum size flag */
-	if (ec)
-		ec->max_mem_set = !!JENT_FLAGS_TO_MAX_MEMSIZE(flags);
 
 	return ec;
 }
