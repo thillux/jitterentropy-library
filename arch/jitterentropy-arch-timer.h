@@ -45,10 +45,9 @@
  * Provides jent_get_nstime() implemented via the highest-resolution counter
  * available on the target. The dispatch order is:
  *
- *   - Windows (MSVC / MinGW):
- *       * ARM / ARM64 -> QueryPerformanceCounter()
- *       * otherwise   -> __rdtsc() intrinsic
- *   - x86 / x86_64       -> __rdtsc() intrinsic (<x86intrin.h>)
+ *   - Windows ARM / ARM64 (MSVC / MinGW) -> QueryPerformanceCounter()
+ *   - x86 / x86_64       -> __rdtsc() intrinsic
+ *                           (<intrin.h> on MSVC, <x86intrin.h> elsewhere)
  *   - aarch64            -> mrs <reg> (cntvct_el0 by default), or
  *                           clock_gettime_nsec_np(CLOCK_UPTIME_RAW) on Apple
  *   - s390x              -> stcke inline asm
@@ -70,20 +69,20 @@
 
 #include <stdint.h>
 
-#if defined(_MSC_VER) || defined(__MINGW32__)
-# define JENT_ARCH_TIMER_WINDOWS
+#if (defined(_MSC_VER) || defined(__MINGW32__)) && \
+    (defined(_M_ARM) || defined(_M_ARM64))
 # include <windows.h>
-# include <intrin.h>
-# if defined(_M_ARM) || defined(_M_ARM64)
-#  include <profileapi.h>
-#  define JENT_ARCH_TIMER_WINDOWS_QPC
-# else
-#  define JENT_ARCH_TIMER_WINDOWS_RDTSC
-# endif
+# include <profileapi.h>
+# define JENT_ARCH_TIMER_WINDOWS_QPC
 
-#elif defined(__x86_64__) || defined(__i386__)
+#elif defined(__x86_64__) || defined(__i386__) || \
+      defined(_M_X64)     || defined(_M_IX86)
 # define JENT_ARCH_TIMER_X86
-# include <x86intrin.h>
+# if defined(_MSC_VER)
+#  include <intrin.h>
+# else
+#  include <x86intrin.h>
+# endif
 
 #elif defined(__aarch64__)
 # define JENT_ARCH_TIMER_AARCH64
@@ -138,10 +137,6 @@ static inline void jent_get_nstime(uint64_t *out)
 	LARGE_INTEGER ticks;
 	QueryPerformanceCounter(&ticks);
 	*out = (uint64_t)ticks.QuadPart;
-
-#elif defined(JENT_ARCH_TIMER_WINDOWS_RDTSC)
-
-	*out = __rdtsc();
 
 #elif defined(JENT_ARCH_TIMER_X86)
 
