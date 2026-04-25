@@ -48,16 +48,21 @@
  *   - Windows (MSVC / MinGW):
  *       * ARM / ARM64 -> QueryPerformanceCounter()
  *       * otherwise   -> __rdtsc() intrinsic
- *   - x86 / x86_64       -> rdtsc inline asm
+ *   - x86 / x86_64       -> __rdtsc() intrinsic (<x86intrin.h>)
  *   - aarch64            -> mrs <reg> (cntvct_el0 by default), or
  *                           clock_gettime_nsec_np(CLOCK_UPTIME_RAW) on Apple
- *   - s390x              -> stcke
- *   - powerpc            -> mftbu/mftb (or mfspr on newer cores)
+ *   - s390x              -> stcke inline asm
+ *   - powerpc            -> __builtin_ppc_get_timebase()
  *   - riscv              -> rdtime (RV64), or rdtimeh/rdtime retry pair (RV32);
  *                           override via RISCV_NSTIME_INSN[_HI] to use rdcycle
  *   - generic fallback   -> mach_absolute_time() on Mach,
  *                           read_real_time() on AIX,
  *                           clock_gettime(CLOCK_REALTIME) elsewhere
+ *
+ * Where a compiler intrinsic exists for the underlying instruction we use it
+ * instead of inline asm so the compiler can schedule/optimise around the read.
+ * Inline asm is retained only on architectures (s390x, aarch64, riscv) where
+ * no portable intrinsic covers the same register/instruction.
  */
 
 #ifndef _JITTERENTROPY_ARCH_TIMER_H
@@ -78,17 +83,7 @@
 
 #elif defined(__x86_64__) || defined(__i386__)
 # define JENT_ARCH_TIMER_X86
-
-# ifdef __x86_64__
-/* specify 64 bit type since long is 32 bits in LLP64 x86_64 systems */
-#  define DECLARE_ARGS(val, low, high)    uint64_t low, high
-#  define EAX_EDX_VAL(val, low, high)     ((low) | ((high) << 32))
-#  define EAX_EDX_RET(val, low, high)     "=a" (low), "=d" (high)
-# else /* __i386__ */
-#  define DECLARE_ARGS(val, low, high)    unsigned long long val
-#  define EAX_EDX_VAL(val, low, high)     (val)
-#  define EAX_EDX_RET(val, low, high)     "=A" (val)
-# endif
+# include <x86intrin.h>
 
 #elif defined(__aarch64__)
 # define JENT_ARCH_TIMER_AARCH64
@@ -109,13 +104,6 @@
 
 #elif defined(__powerpc) || defined(__powerpc__)
 # define JENT_ARCH_TIMER_POWERPC
-/*
- * Uncomment this for newer PPC CPUs.
- * Newer PPC CPUs do not support mftbu/mftb; these instructions were
- * obsoleted and replaced by mfspr.  Special processor registers 268
- * and 269 are the ones we want.
- */
-/* #define POWER_PC_USE_NEW_INSTRUCTIONS */
 
 #elif defined(__riscv)
 # define JENT_ARCH_TIMER_RISCV
@@ -157,13 +145,7 @@ static inline void jent_get_nstime(uint64_t *out)
 
 #elif defined(JENT_ARCH_TIMER_X86)
 
-	DECLARE_ARGS(val, low, high);
-# ifdef __sun__
-	__asm("rdtsc" : EAX_EDX_RET(val, low, high));
-# else
-	__asm__ __volatile__("rdtsc" : EAX_EDX_RET(val, low, high));
-# endif
-	*out = EAX_EDX_VAL(val, low, high);
+	*out = (uint64_t)__rdtsc();
 
 #elif defined(JENT_ARCH_TIMER_AARCH64_APPLE)
 
@@ -196,27 +178,7 @@ static inline void jent_get_nstime(uint64_t *out)
 
 #elif defined(JENT_ARCH_TIMER_POWERPC)
 
-	/* taken from http://www.ecrypt.eu.org/ebats/cpucycles.html */
-	unsigned long high;
-	unsigned long low;
-	unsigned long newhigh;
-	uint64_t result;
-
-# ifdef POWER_PC_USE_NEW_INSTRUCTIONS
-	__asm__ __volatile__(
-		"Lcpucycles:mfspr %0, 269;mfspr %1, 268;mfspr %2, 269;cmpw %0,%2;bne Lcpucycles"
-		: "=r" (high), "=r" (low), "=r" (newhigh)
-		);
-# else
-	__asm__ __volatile__(
-		"Lcpucycles:mftbu %0;mftb %1;mftbu %2;cmpw %0,%2;bne Lcpucycles"
-		: "=r" (high), "=r" (low), "=r" (newhigh)
-		);
-# endif
-	result = high;
-	result <<= 32;
-	result |= low;
-	*out = result;
+	*out = (uint64_t)__builtin_ppc_get_timebase();
 
 #elif defined(JENT_ARCH_TIMER_RISCV)
 
