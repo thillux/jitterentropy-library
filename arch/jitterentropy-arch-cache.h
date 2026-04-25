@@ -119,27 +119,44 @@ static inline uint32_t jent_cache_size_to_memory(long l1, long l2, long l3,
 
 #ifdef JENT_ARCH_CACHE_LINUX
 
-# if defined(_SC_LEVEL1_DCACHE_SIZE) && \
-     defined(_SC_LEVEL2_CACHE_SIZE) &&  \
-     defined(_SC_LEVEL3_CACHE_SIZE)
-
-static inline void jent_get_cachesize_sysconf(long *l1, long *l2, long *l3)
-{
-	*l1 = sysconf(_SC_LEVEL1_DCACHE_SIZE);
-	*l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
-	*l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
-}
-
-# else
-
+/*
+ * The _SC_LEVEL*_*CACHE_SIZE selectors are a glibc extension. musl, uClibc
+ * and similar libcs do not define them - check each level individually so a
+ * libc that only exposes some of them still gets used for those, and so a
+ * libc with no support at all (musl) silently leaves the values at zero
+ * and lets the sysfs fallback below take over.
+ *
+ * We also defensively clamp negative returns to zero: a libc may define
+ * the constant but have its sysconf() reply with -1 / EINVAL at runtime.
+ */
 static inline void jent_get_cachesize_sysconf(long *l1, long *l2, long *l3)
 {
 	*l1 = 0;
 	*l2 = 0;
 	*l3 = 0;
-}
 
+# ifdef _SC_LEVEL1_DCACHE_SIZE
+	{
+		long v = sysconf(_SC_LEVEL1_DCACHE_SIZE);
+		if (v > 0)
+			*l1 = v;
+	}
 # endif
+# ifdef _SC_LEVEL2_CACHE_SIZE
+	{
+		long v = sysconf(_SC_LEVEL2_CACHE_SIZE);
+		if (v > 0)
+			*l2 = v;
+	}
+# endif
+# ifdef _SC_LEVEL3_CACHE_SIZE
+	{
+		long v = sysconf(_SC_LEVEL3_CACHE_SIZE);
+		if (v > 0)
+			*l3 = v;
+	}
+# endif
+}
 
 static inline void jent_get_cachesize_sysfs(long *l1, long *l2, long *l3)
 {
