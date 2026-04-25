@@ -49,7 +49,7 @@
  * Dispatch:
  *   - Linux            -> sysconf(_SC_LEVEL{1,2,3}_*) with /sys/devices fallback
  *   - macOS            -> sysctlbyname("hw.l{1d,2,3}cachesize")
- *   - Windows          -> GetLogicalProcessorInformation
+ *   - Windows / Cygwin -> GetLogicalProcessorInformation
  *   - {Open,Free,Net}BSD x86 -> CPUID leaf 4 (deterministic cache parameters)
  *   - {Open,Free,Net}BSD aarch64 / riscv -> zero stub (no EL0-readable source)
  *   - AIX              -> _system_configuration (dcache_size / L2_cache_size)
@@ -64,7 +64,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(_MSC_VER) || defined(__MINGW32__)
+#if defined(_MSC_VER) || defined(__MINGW32__) || defined(__CYGWIN__)
 # include <windows.h>
 # define JENT_ARCH_CACHE_WINDOWS
 #elif defined(__linux__)
