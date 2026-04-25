@@ -42,11 +42,7 @@
 #ifndef _JITTERENTROPY_H
 #define _JITTERENTROPY_H
 
-#if defined(_MSC_VER) || defined(__MINGW32__)
-#include "arch/jitterentropy-base-windows.h"
-#else
 #include "jitterentropy-base-user.h"
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -200,7 +196,7 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen);
 
 /* return secure memory support, must be done
  * in jitterentropy itself, as users may not define
- * a crypto library and so the define in jitterentropy-base-user.h
+ * a crypto library and so the define in arch/jitterentropy-arch-memory.h
  * is not set for them. */
 JENT_PRIVATE_STATIC
 int jent_secure_memory_supported(void);

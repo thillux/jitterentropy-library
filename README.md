@@ -62,8 +62,9 @@ arch/android/Android.mk	-- NDK make file template that can be used to directly
 
 ## Direct CPU instructions
 
-If the function in jent_get_nstime is not available, you can replace the
-jitterentropy-base-user.h with examples from the arch/ directory.
+If the high-resolution timer needed by jent_get_nstime is not available
+on your target, add a new branch to arch/jitterentropy-arch-timer.h
+guarded by the appropriate architecture macros.
 
 # Testing and Entropy Rate Validation
 
@@ -135,7 +136,7 @@ In order for the Jitter RNG to be NTG.1 compliant, the following usage constrain
 
 The Jitter RNG must be compiled with the compile time options of:
 
-- `CONFIG_CRYPTO_CPU_JITTERENTROPY_SECURE_MEMORY` must be enabled - this option is set when using specific memory allocation functions as defined in jitterentropy-base-user.h. Note, in case this define is not set for your given environment, ensure that a memory allocation is used which implements the following properties - after this is guaranteed, the flag can be set:
+- `CONFIG_CRYPTO_CPU_JITTERENTROPY_SECURE_MEMORY` must be enabled - this option is set when using specific memory allocation functions as defined in arch/jitterentropy-arch-memory.h. Note, in case this define is not set for your given environment, ensure that a memory allocation is used which implements the following properties - after this is guaranteed, the flag can be set:
 
 	* The memory must not be swapped to non-volatile store upon memory pressure by the OS.
 
