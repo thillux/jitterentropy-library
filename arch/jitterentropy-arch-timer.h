@@ -53,6 +53,8 @@
  *                           clock_gettime_nsec_np(CLOCK_UPTIME_RAW) on Apple
  *   - s390x              -> stcke
  *   - powerpc            -> mftbu/mftb (or mfspr on newer cores)
+ *   - riscv              -> rdtime (RV64), or rdtimeh/rdtime retry pair (RV32);
+ *                           override via RISCV_NSTIME_INSN[_HI] to use rdcycle
  *   - generic fallback   -> mach_absolute_time() on Mach,
  *                           read_real_time() on AIX,
  *                           clock_gettime(CLOCK_REALTIME) elsewhere
@@ -114,6 +116,24 @@
  * and 269 are the ones we want.
  */
 /* #define POWER_PC_USE_NEW_INSTRUCTIONS */
+
+#elif defined(__riscv)
+# define JENT_ARCH_TIMER_RISCV
+/*
+ * The "time" CSR is the platform timer and is reliably accessible from
+ * user mode on Linux (the kernel enables [s|m]counteren.TM). The "cycle"
+ * CSR has higher resolution but is not always user-readable. Override
+ * RISCV_NSTIME_INSN (and RISCV_NSTIME_INSN_HI on RV32) to switch sources,
+ * e.g. to "rdcycle" / "rdcycleh".
+ */
+# ifndef RISCV_NSTIME_INSN
+#  define RISCV_NSTIME_INSN "rdtime"
+# endif
+# if __riscv_xlen < 64
+#  ifndef RISCV_NSTIME_INSN_HI
+#   define RISCV_NSTIME_INSN_HI "rdtimeh"
+#  endif
+# endif
 
 #else /* generic fallback */
 # define JENT_ARCH_TIMER_GENERIC
@@ -197,6 +217,29 @@ static inline void jent_get_nstime(uint64_t *out)
 	result <<= 32;
 	result |= low;
 	*out = result;
+
+#elif defined(JENT_ARCH_TIMER_RISCV)
+
+# if __riscv_xlen >= 64
+	uint64_t ctr_val;
+	__asm__ __volatile__(RISCV_NSTIME_INSN " %0" : "=r" (ctr_val));
+	*out = ctr_val;
+# else
+	/*
+	 * RV32: the time CSR is 64 bits wide but only 32 bits are read at a
+	 * time. Re-read the high half and retry on rollover so the combined
+	 * value is consistent.
+	 */
+	uint32_t hi, lo, hi2;
+	__asm__ __volatile__(
+		"1:\n\t"
+		RISCV_NSTIME_INSN_HI " %0\n\t"
+		RISCV_NSTIME_INSN    " %1\n\t"
+		RISCV_NSTIME_INSN_HI " %2\n\t"
+		"bne %0, %2, 1b"
+		: "=&r" (hi), "=&r" (lo), "=&r" (hi2));
+	*out = ((uint64_t)hi << 32) | (uint64_t)lo;
+# endif
 
 #else /* JENT_ARCH_TIMER_GENERIC */
 

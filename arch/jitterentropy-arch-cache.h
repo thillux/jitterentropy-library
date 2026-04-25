@@ -51,6 +51,7 @@
  *   - macOS            -> sysctlbyname("hw.l{1d,2,3}cachesize")
  *   - Windows          -> GetLogicalProcessorInformation
  *   - {Open,Free,Net}BSD x86 -> CPUID leaf 4 (deterministic cache parameters)
+ *   - {Open,Free,Net}BSD aarch64 / riscv -> zero stub (no EL0-readable source)
  *   - AIX              -> _system_configuration (dcache_size / L2_cache_size)
  *   - other            -> return 0
  */
@@ -77,7 +78,8 @@
 # include <sys/sysctl.h>
 # define JENT_ARCH_CACHE_APPLE
 #elif (defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__NetBSD__)) && \
-      (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__))
+      (defined(__x86_64__) || defined(__i386__) ||                            \
+       defined(__aarch64__) || defined(__riscv))
 # define JENT_ARCH_CACHE_BSD
 # if defined(__x86_64__) || defined(__i386__)
 #  include <cpuid.h>
@@ -396,14 +398,15 @@ static inline void jent_get_cachesize_cpuid(long *l1, long *l2, long *l3)
 	}
 }
 
-#else /* BSD aarch64 */
+#else /* BSD aarch64 / riscv */
 
 /*
- * AArch64 carries the data cache sizes in CCSIDR_EL1, which is an EL1
- * register. The BSD arm64 kernels do not currently emulate access to it
- * from EL0, and no sysctl surfaces the value uniformly across them, so
- * we leave the cache sizes at zero. The caller treats that as "unknown"
- * and falls back to its built-in default memory-size selection.
+ * AArch64 carries the data cache sizes in CCSIDR_EL1, an EL1 register that
+ * the BSD arm64 kernels do not currently emulate for EL0. RISC-V has no
+ * standardised user-mode cache-discovery instruction at all - the values
+ * live in firmware-supplied device tree / ACPI tables that the BSDs do
+ * not surface through a uniform sysctl. In both cases leave the cache
+ * sizes at zero so the caller falls back to its built-in default.
  */
 static inline void jent_get_cachesize_cpuid(long *l1, long *l2, long *l3)
 {
