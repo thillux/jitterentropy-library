@@ -406,7 +406,12 @@ static inline void jent_get_cachesize_cpuid(long *l1, long *l2, long *l3)
 		size = (long)ways * (long)partitions *
 		       (long)line_size * (long)sets;
 
-		if (cache_level == 1 && *l1 == 0)
+		/*
+		 * L1 is typically split into separate data and instruction
+		 * caches; only the data cache (type 1) is relevant here.
+		 * L2/L3 are usually unified, so accept data or unified.
+		 */
+		if (cache_level == 1 && cache_type == 1 && *l1 == 0)
 			*l1 = size;
 		else if (cache_level == 2 && *l2 == 0)
 			*l2 = size;
