@@ -48,9 +48,18 @@
 extern "C" {
 #endif
 
+/*
+ * The Linux kernel already defines BUILD_BUG_ON and ARRAY_SIZE with
+ * identical (or stricter) semantics; avoid the macro-redefinition
+ * warning when this header is pulled into a kernel build.
+ */
+#ifndef BUILD_BUG_ON
 #define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
+#endif
 
+#ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
 
 #ifndef JENT_STUCK_INIT_THRES
 /*

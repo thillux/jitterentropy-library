@@ -59,36 +59,51 @@
 #ifndef _JITTERENTROPY_ARCH_CACHE_H
 #define _JITTERENTROPY_ARCH_CACHE_H
 
-#include <stddef.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
+#if defined(JENT_LINUX_KERNEL)
+# include <linux/types.h>
+# define JENT_ARCH_CACHE_NONE
+#elif defined(JENT_FREEBSD_KERNEL)
+# include <sys/types.h>
+# define JENT_ARCH_CACHE_NONE
+#elif defined(JENT_MACOS_KERNEL)
+# include <sys/types.h>
+# define JENT_ARCH_CACHE_NONE
+#elif defined(JENT_BAREMETAL)
+# include <stddef.h>
+# include <stdint.h>
+# define JENT_ARCH_CACHE_NONE
+#else
+# include <stddef.h>
+# include <stdint.h>
+# include <stdlib.h>
+# include <string.h>
 
-#if defined(_MSC_VER) || defined(__MINGW32__) || defined(__CYGWIN__)
-# include <windows.h>
-# define JENT_ARCH_CACHE_WINDOWS
-#elif defined(__linux__)
-# include <unistd.h>
-# include <fcntl.h>
-# include <errno.h>
-# include <limits.h>
-# include <stdio.h>
-# define JENT_ARCH_CACHE_LINUX
-#elif defined(__APPLE__)
-# include <sys/sysctl.h>
-# define JENT_ARCH_CACHE_APPLE
-#elif (defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__NetBSD__)) && \
-      (defined(__x86_64__) || defined(__i386__) ||                            \
-       defined(__aarch64__) || defined(__riscv))
-# define JENT_ARCH_CACHE_BSD
-# if defined(__x86_64__) || defined(__i386__)
-#  include <cpuid.h>
-#  define JENT_ARCH_CACHE_BSD_CPUID
+# if defined(_MSC_VER) || defined(__MINGW32__) || defined(__CYGWIN__)
+#  include <windows.h>
+#  define JENT_ARCH_CACHE_WINDOWS
+# elif defined(__linux__)
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <errno.h>
+#  include <limits.h>
+#  include <stdio.h>
+#  define JENT_ARCH_CACHE_LINUX
+# elif defined(__APPLE__)
+#  include <sys/sysctl.h>
+#  define JENT_ARCH_CACHE_APPLE
+# elif (defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__NetBSD__)) && \
+       (defined(__x86_64__) || defined(__i386__) ||                            \
+        defined(__aarch64__) || defined(__riscv))
+#  define JENT_ARCH_CACHE_BSD
+#  if defined(__x86_64__) || defined(__i386__)
+#   include <cpuid.h>
+#   define JENT_ARCH_CACHE_BSD_CPUID
+#  endif
+# elif defined(_AIX)
+#  include <sys/systemcfg.h>
+#  define JENT_ARCH_CACHE_AIX
 # endif
-#elif defined(_AIX)
-# include <sys/systemcfg.h>
-# define JENT_ARCH_CACHE_AIX
-#endif
+#endif /* JENT_KERNEL / JENT_BAREMETAL */
 
 static inline uint32_t jent_cache_size_to_memory(long l1, long l2, long l3,
 						 int all_caches)

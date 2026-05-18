@@ -54,10 +54,18 @@ static inline void le64_to_ptr(uint8_t *p, const uint64_t value)
 	le32_to_ptr(p,     (uint32_t)(value));
 }
 
+/*
+ * The Linux kernel exposes a `static inline __u64 rol64(__u64, unsigned int)`
+ * in <linux/bitops.h>; redefining it in the same translation unit would
+ * be an error. In every other environment (user space, FreeBSD kernel,
+ * baremetal) we still need a local copy.
+ */
+#ifndef JENT_LINUX_KERNEL
 static inline uint64_t rol64(uint64_t x, int n)
 {
 	return ( (x << (n&(64-1))) | (x >> ((64-n)&(64-1))) );
 }
+#endif
 
 /*********************************** Keccak ***********************************/
 /* state[x + y*5] */

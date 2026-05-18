@@ -70,7 +70,31 @@
 #ifndef _JITTERENTROPY_ARCH_SCHED_H
 #define _JITTERENTROPY_ARCH_SCHED_H
 
-#if defined(_MSC_VER) || defined(__MINGW32__)
+#if defined(JENT_LINUX_KERNEL)
+# include <linux/sched.h>
+# include <linux/processor.h>
+# define JENT_ARCH_SCHED_OS_LINUX_KERNEL
+#elif defined(JENT_FREEBSD_KERNEL)
+# include <sys/param.h>
+# include <sys/systm.h>
+# include <sys/proc.h>
+# include <sys/priority.h>
+# include <sys/sched.h>
+# define JENT_ARCH_SCHED_OS_FREEBSD_KERNEL
+#elif defined(JENT_MACOS_KERNEL)
+/*
+ * xnu: thread_block(THREAD_CONTINUE_NULL) voluntarily yields the
+ * current thread. We forward-declare instead of including
+ * <kern/thread.h> because that header transitively pulls in
+ * kpi_private bits which not every KEXT SDK exposes.
+ */
+typedef void *thread_continue_t;
+extern int thread_block(thread_continue_t);
+# define JENT_ARCH_SCHED_OS_MACOS_KERNEL
+#elif defined(JENT_BAREMETAL)
+/* No OS-level yield on baremetal; only the per-arch CPU pause hint. */
+# define JENT_ARCH_SCHED_OS_NONE
+#elif defined(_MSC_VER) || defined(__MINGW32__)
 # include <windows.h>
 # define JENT_ARCH_SCHED_OS_WINDOWS
 #elif defined(__unix__) || defined(__APPLE__) || defined(_AIX) || \
@@ -81,7 +105,9 @@
 
 #if defined(__x86_64__) || defined(__i386__) || \
     defined(_M_X64)     || defined(_M_IX86)
-# if defined(_MSC_VER)
+# if defined(JENT_KERNEL) || defined(JENT_BAREMETAL)
+/* Kernel / baremetal: no <x86intrin.h> available - emit pause inline. */
+# elif defined(_MSC_VER)
 #  include <intrin.h>
 # else
 #  include <x86intrin.h>
@@ -97,14 +123,32 @@
 static inline void jent_yield(void)
 {
 #if defined(JENT_ARCH_SCHED_PAUSE_X86)
+# if defined(JENT_KERNEL) || defined(JENT_BAREMETAL)
+	__asm__ __volatile__("pause" ::: "memory");
+# else
 	_mm_pause();
+# endif
 #elif defined(JENT_ARCH_SCHED_PAUSE_ARM)
 	__asm__ __volatile__("yield" ::: "memory");
 #elif defined(JENT_ARCH_SCHED_PAUSE_POWERPC)
 	__asm__ __volatile__("or 27,27,27" ::: "memory");
 #endif
 
-#if defined(JENT_ARCH_SCHED_OS_WINDOWS)
+#if defined(JENT_ARCH_SCHED_OS_LINUX_KERNEL)
+	cond_resched();
+#elif defined(JENT_ARCH_SCHED_OS_FREEBSD_KERNEL)
+	/*
+	 * kern_yield(PRI_USER) drops the current thread to the user-priority
+	 * run queue tail, giving any waiting thread a chance to run without
+	 * blocking. It is the FreeBSD-kernel analogue of cond_resched().
+	 */
+	kern_yield(PRI_USER);
+#elif defined(JENT_ARCH_SCHED_OS_MACOS_KERNEL)
+	/* THREAD_CONTINUE_NULL = (thread_continue_t) NULL */
+	(void)thread_block((thread_continue_t)0);
+#elif defined(JENT_ARCH_SCHED_OS_NONE)
+	/* nothing else to do without a scheduler */
+#elif defined(JENT_ARCH_SCHED_OS_WINDOWS)
 	SwitchToThread();
 #elif defined(JENT_ARCH_SCHED_OS_POSIX)
 	(void)sched_yield();

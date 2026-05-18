@@ -67,10 +67,19 @@
 #ifndef _JITTERENTROPY_ARCH_TIMER_H
 #define _JITTERENTROPY_ARCH_TIMER_H
 
-#include <stdint.h>
+#if defined(JENT_LINUX_KERNEL)
+# include <linux/types.h>
+#elif defined(JENT_FREEBSD_KERNEL)
+# include <sys/types.h>
+#elif defined(JENT_MACOS_KERNEL)
+# include <sys/types.h>
+#else
+# include <stdint.h>
+#endif
 
 #if (defined(_MSC_VER) || defined(__MINGW32__)) && \
-    (defined(_M_ARM) || defined(_M_ARM64))
+    (defined(_M_ARM) || defined(_M_ARM64)) && \
+    !defined(JENT_KERNEL) && !defined(JENT_BAREMETAL)
 # include <windows.h>
 # include <profileapi.h>
 # define JENT_ARCH_TIMER_WINDOWS_QPC
@@ -78,7 +87,16 @@
 #elif defined(__x86_64__) || defined(__i386__) || \
       defined(_M_X64)     || defined(_M_IX86)
 # define JENT_ARCH_TIMER_X86
-# if defined(_MSC_VER)
+/*
+ * On hosted user-space builds use the compiler's <x86intrin.h> __rdtsc()
+ * intrinsic. In the Linux kernel and in baremetal/EFI environments the
+ * intrinsic header is unavailable (it pulls in libc), so emit the bare
+ * RDTSC instruction inline instead.
+ */
+# if defined(JENT_KERNEL) || defined(JENT_BAREMETAL)
+/* Kernel / baremetal: emit RDTSC inline (no <x86intrin.h>). */
+#  define JENT_ARCH_TIMER_X86_INLINE_ASM
+# elif defined(_MSC_VER)
 #  include <intrin.h>
 # else
 #  include <x86intrin.h>
@@ -87,9 +105,17 @@
 #elif defined(__aarch64__)
 # define JENT_ARCH_TIMER_AARCH64
 # ifndef AARCH64_NSTIME_REGISTER
-#  define AARCH64_NSTIME_REGISTER "cntvct_el0"
+/*
+ * Bare metal / EFI typically runs at EL1 (or higher) and cntvct_el0 may
+ * not be enabled for that EL. Override to cntpct_el0 there.
+ */
+#  if defined(JENT_BAREMETAL) && !defined(AARCH64_NSTIME_REGISTER)
+#   define AARCH64_NSTIME_REGISTER "cntpct_el0"
+#  else
+#   define AARCH64_NSTIME_REGISTER "cntvct_el0"
+#  endif
 # endif
-# ifdef __MACH__
+# if defined(__MACH__) && !defined(JENT_KERNEL) && !defined(JENT_BAREMETAL)
 /*
  * On modern Apple platforms (M1+), the system counter is too coarse.
  * Use clock_gettime_nsec_np(CLOCK_UPTIME_RAW) instead.
@@ -122,6 +148,41 @@
 #  endif
 # endif
 
+#elif defined(JENT_LINUX_KERNEL)
+/*
+ * Linux kernel generic fallback: use the kernel's high-resolution timer
+ * abstraction. random_get_entropy() ultimately maps to the per-arch
+ * high-resolution cycle/timestamp counter on every supported arch.
+ */
+# define JENT_ARCH_TIMER_LINUX_GENERIC
+# include <linux/timex.h>
+
+#elif defined(JENT_FREEBSD_KERNEL)
+/*
+ * FreeBSD kernel generic fallback: get_cyclecount() returns the highest-
+ * resolution cycle counter the platform exposes, falling back to
+ * binuptime ticks where no real cycle counter is wired up.
+ */
+# define JENT_ARCH_TIMER_FREEBSD_GENERIC
+# include <machine/cpu.h>
+
+#elif defined(JENT_MACOS_KERNEL)
+/*
+ * Darwin kernel generic fallback: mach_absolute_time() ultimately maps
+ * to the same per-arch counter the inline-asm branches read directly,
+ * but going through Mach absorbs Apple's per-platform calibration.
+ */
+# define JENT_ARCH_TIMER_MACOS_GENERIC
+# include <mach/mach_time.h>
+
+#elif defined(JENT_BAREMETAL)
+/*
+ * Baremetal generic fallback: no portable time source exists. The caller
+ * must either build for a supported arch (x86/aarch64/s390x/...) or
+ * provide its own jent_get_nstime() before including this header.
+ */
+# define JENT_ARCH_TIMER_BAREMETAL_GENERIC
+
 #else /* generic fallback */
 # define JENT_ARCH_TIMER_GENERIC
 # include <time.h>
@@ -140,7 +201,18 @@ static inline void jent_get_nstime(uint64_t *out)
 
 #elif defined(JENT_ARCH_TIMER_X86)
 
+# if defined(JENT_ARCH_TIMER_X86_INLINE_ASM)
+	/*
+	 * Kernel / baremetal: emit RDTSC inline. We deliberately use the
+	 * non-serialising variant to match the upstream behaviour of the
+	 * __rdtsc() intrinsic - serialisation would change the noise source.
+	 */
+	uint32_t lo, hi;
+	__asm__ __volatile__("rdtsc" : "=a" (lo), "=d" (hi));
+	*out = ((uint64_t)hi << 32) | (uint64_t)lo;
+# else
 	*out = (uint64_t)__rdtsc();
+# endif
 
 #elif defined(JENT_ARCH_TIMER_AARCH64_APPLE)
 
@@ -197,6 +269,27 @@ static inline void jent_get_nstime(uint64_t *out)
 		: "=&r" (hi), "=&r" (lo), "=&r" (hi2));
 	*out = ((uint64_t)hi << 32) | (uint64_t)lo;
 # endif
+
+#elif defined(JENT_ARCH_TIMER_LINUX_GENERIC)
+
+	*out = (uint64_t)random_get_entropy();
+
+#elif defined(JENT_ARCH_TIMER_FREEBSD_GENERIC)
+
+	*out = (uint64_t)get_cyclecount();
+
+#elif defined(JENT_ARCH_TIMER_MACOS_GENERIC)
+
+	*out = mach_absolute_time();
+
+#elif defined(JENT_ARCH_TIMER_BAREMETAL_GENERIC)
+
+	/*
+	 * Unsupported baremetal architecture: return zero. This deliberately
+	 * forces jent_entropy_init() to fail rather than silently producing
+	 * non-entropic output.
+	 */
+	*out = 0;
 
 #else /* JENT_ARCH_TIMER_GENERIC */
 

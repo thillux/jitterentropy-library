@@ -47,33 +47,185 @@
  * Compilation for AWS-LC     #define AWSLC
  * Compilation for libgcrypt  #define LIBGCRYPT
  * Compilation for OpenSSL    #define OPENSSL
+ * Compilation for Linux kernel module       #define JENT_LINUX_KERNEL
+ *                                          (also accepts plain #define JENT_KERNEL
+ *                                           and is auto-set when __KERNEL__ is defined)
+ * Compilation for FreeBSD kernel module     #define JENT_FREEBSD_KERNEL
+ *                                          (auto-set when _KERNEL && __FreeBSD__)
+ * Compilation for macOS (Darwin) KEXT       #define JENT_MACOS_KERNEL
+ *                                          (auto-set when KERNEL && __APPLE__)
+ * Compilation for bare metal / EFI / no OS  #define JENT_BAREMETAL
+ *
+ * JENT_KERNEL is an umbrella macro that is automatically defined whenever
+ * JENT_LINUX_KERNEL or JENT_FREEBSD_KERNEL is set. Library code that does
+ * not care which kernel it is running in checks JENT_KERNEL; OS-specific
+ * branches in the arch/ helpers test the specific variant.
+ *
+ * In every JENT_KERNEL / JENT_BAREMETAL mode the user-space libc headers
+ * (stdio, stdlib, unistd, time, mlock, ...) are not pulled in and the
+ * arch/ helpers fall back to environment-specific implementations or
+ * neutral stubs. JENT_CONF_ENABLE_INTERNAL_TIMER is also force-disabled,
+ * since neither kernel exposes POSIX threads from inside a module and the
+ * baremetal target has no scheduler at all.
  */
 
-#include <limits.h>
-#include <time.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
+/* Linux: __KERNEL__ is set by Kbuild; promote it (and the legacy
+ * plain-JENT_KERNEL spelling) to the explicit JENT_LINUX_KERNEL guard.
+ * Don't promote when another kernel variant has been explicitly
+ * requested. */
+#if (defined(__KERNEL__) || \
+     (defined(JENT_KERNEL) && !defined(JENT_FREEBSD_KERNEL) && \
+      !defined(JENT_MACOS_KERNEL))) && \
+    !defined(JENT_LINUX_KERNEL)
+# define JENT_LINUX_KERNEL
+#endif
 
-#if defined(_MSC_VER) || defined(__MINGW32__)
-# include <windows.h>
-typedef int64_t ssize_t;
-#else
+/* FreeBSD: _KERNEL + __FreeBSD__ is the canonical detection. */
+#if defined(_KERNEL) && defined(__FreeBSD__) && !defined(JENT_FREEBSD_KERNEL)
+# define JENT_FREEBSD_KERNEL
+#endif
+
+/* Darwin: xnu kernel builds define KERNEL (no underscores) + __APPLE__. */
+#if defined(KERNEL) && defined(__APPLE__) && !defined(JENT_MACOS_KERNEL)
+# define JENT_MACOS_KERNEL
+#endif
+
+/* Umbrella macro - convenient for "any kernel" branches. */
+#if (defined(JENT_LINUX_KERNEL) || defined(JENT_FREEBSD_KERNEL) || \
+     defined(JENT_MACOS_KERNEL)) && \
+    !defined(JENT_KERNEL)
+# define JENT_KERNEL
+#endif
+
+/*
+ * UINT32_C / UINT64_C are <stdint.h> macros that simply suffix a literal
+ * with the right integer-promotion suffix. The Linux/FreeBSD kernel
+ * headers do not pull <stdint.h>, so synthesise them where missing.
+ */
+#if (defined(JENT_KERNEL) || defined(JENT_BAREMETAL)) && !defined(UINT32_C)
+# define UINT32_C(x) (x ## U)
+#endif
+#if (defined(JENT_KERNEL) || defined(JENT_BAREMETAL)) && !defined(UINT64_C)
+# define UINT64_C(x) (x ## ULL)
+#endif
+
+/* <stdint.h> integer limit macros likewise missing in the kernel. */
+#if defined(JENT_KERNEL) && !defined(UINT32_MAX)
+# define UINT32_MAX (0xffffffffU)
+#endif
+#if defined(JENT_KERNEL) && !defined(UINT64_MAX)
+# define UINT64_MAX (0xffffffffffffffffULL)
+#endif
+#if defined(JENT_KERNEL) && !defined(SIZE_MAX)
+# define SIZE_MAX (~(size_t)0)
+#endif
+
+#if defined(JENT_KERNEL) || defined(JENT_BAREMETAL)
+# ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
+#  undef JENT_CONF_ENABLE_INTERNAL_TIMER
+# endif
+#endif
+
+#if defined(JENT_LINUX_KERNEL)
+# include <linux/types.h>
+# include <linux/string.h>
+# include <linux/errno.h>
+# include <linux/limits.h>
+#elif defined(JENT_FREEBSD_KERNEL)
 # include <sys/types.h>
-# include <sys/stat.h>
-# include <fcntl.h>
-# include <unistd.h>
-#endif
+# include <sys/param.h>
+# include <sys/systm.h>
+# include <sys/libkern.h>
+# include <sys/errno.h>
+#elif defined(JENT_MACOS_KERNEL)
+/*
+ * Darwin / xnu kernel: the Kernel.framework headers ship POSIX-style
+ * types under <sys/...> and <mach/...>. libkern.h supplies printf,
+ * snprintf, strlen, memcpy, memset, bzero with the standard signatures.
+ */
+# include <sys/types.h>
+# include <sys/errno.h>
+# include <sys/systm.h>
+# include <libkern/libkern.h>
+#elif defined(JENT_BAREMETAL)
+# include <stddef.h>
+# include <stdint.h>
+# ifndef SSIZE_MAX
+#  define SSIZE_MAX ((ssize_t)((~(size_t)0) >> 1))
+# endif
+/*
+ * Baremetal: provide a minimal ssize_t and the small set of errno values
+ * the library returns through its API. The consumer is expected not to
+ * depend on a full libc <errno.h>.
+ */
+# ifndef _JENT_BAREMETAL_TYPES
+#  define _JENT_BAREMETAL_TYPES
+typedef long ssize_t;
+# endif
+# ifndef EINVAL
+#  define EINVAL 22
+# endif
+# ifndef ENOMEM
+#  define ENOMEM 12
+# endif
+# ifndef EAGAIN
+#  define EAGAIN 11
+# endif
+# ifndef EFAULT
+#  define EFAULT 14
+# endif
+# ifndef EBUSY
+#  define EBUSY 16
+# endif
+# ifndef ENOENT
+#  define ENOENT 2
+# endif
+# ifndef EIO
+#  define EIO 5
+# endif
+# ifndef ETIMEDOUT
+#  define ETIMEDOUT 110
+# endif
+# ifndef EPERM
+#  define EPERM 1
+# endif
+# ifndef EINTR
+#  define EINTR 4
+# endif
+/*
+ * Baremetal callers must supply memcpy/memset (typically via a freestanding
+ * compiler-rt or libgcc). They are declared here for the headers that need
+ * them; no <string.h> include is performed.
+ */
+void *memcpy(void *dest, const void *src, size_t n);
+void *memset(void *s, int c, size_t n);
+#else /* hosted user-space build */
+# include <limits.h>
+# include <time.h>
+# include <stdint.h>
+# include <stdio.h>
+# include <stdlib.h>
+# include <string.h>
+# include <errno.h>
 
-#ifdef __MACH__
-# include <assert.h>
-# include <CoreServices/CoreServices.h>
-# include <mach/mach.h>
-# include <mach/mach_time.h>
-# include <unistd.h>
-#endif
+# if defined(_MSC_VER) || defined(__MINGW32__)
+#  include <windows.h>
+typedef int64_t ssize_t;
+# else
+#  include <sys/types.h>
+#  include <sys/stat.h>
+#  include <fcntl.h>
+#  include <unistd.h>
+# endif
+
+# ifdef __MACH__
+#  include <assert.h>
+#  include <CoreServices/CoreServices.h>
+#  include <mach/mach.h>
+#  include <mach/mach_time.h>
+#  include <unistd.h>
+# endif
+#endif /* JENT_KERNEL / JENT_BAREMETAL */
 
 /*
  * Architecture- and OS-specific helpers (timestamp, secure memory, cache
@@ -194,7 +346,9 @@ extern "C" {
 #endif
 #endif
 
-#if defined(__MINGW32__) || defined(__APPLE__) || defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__NetBSD__)
+#if !defined(JENT_KERNEL) && !defined(JENT_BAREMETAL) && \
+    (defined(__MINGW32__) || defined(__APPLE__) || defined(__OpenBSD__) || \
+     defined(__FreeBSD__) || defined(__NetBSD__))
 #define JENT_PTHREAD
 #endif
 

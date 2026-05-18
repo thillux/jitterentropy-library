@@ -37,6 +37,23 @@
 #include "jitterentropy-timer.h"
 #include "jitterentropy-sha3.h"
 
+#ifdef JENT_BAREMETAL
+/*
+ * Storage for the baremetal allocator hook declared in
+ * arch/jitterentropy-arch-memory.h. The caller is expected to set this
+ * via jent_baremetal_set_allocator() before any other library call.
+ */
+struct jent_baremetal_allocator jent_baremetal_alloc_ops = { NULL, NULL };
+#endif
+
+#ifdef JENT_FREEBSD_KERNEL
+/*
+ * FreeBSD malloc(9) type tag used by the kernel-side jent_zalloc /
+ * jent_zfree implementations in arch/jitterentropy-arch-memory.h.
+ */
+MALLOC_DEFINE(M_JENT, "jitterentropy", "Jitter RNG entropy collector state");
+#endif
+
 /***************************************************************************
  * Jitter RNG Static Definitions
  *

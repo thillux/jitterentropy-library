@@ -80,18 +80,40 @@
 #ifndef _JITTERENTROPY_ARCH_NCPU_H
 #define _JITTERENTROPY_ARCH_NCPU_H
 
-#include <errno.h>
+#if defined(JENT_LINUX_KERNEL)
+# include <linux/types.h>
+# include <linux/cpumask.h>
+# include <linux/smp.h>
+# define JENT_ARCH_NCPU_LINUX_KERNEL
+#elif defined(JENT_FREEBSD_KERNEL)
+# include <sys/types.h>
+# include <sys/param.h>
+# include <sys/systm.h>
+# include <sys/smp.h>
+# define JENT_ARCH_NCPU_FREEBSD_KERNEL
+#elif defined(JENT_MACOS_KERNEL)
+# include <sys/types.h>
+/* xnu does not expose a stable C-callable "online CPU count" symbol
+ * across releases; KEXTs traditionally read processor_count() from
+ * <kern/processor.h>. We forward-declare it to avoid pulling that
+ * header (which transitively requires kpi_private). */
+extern unsigned int processor_count(void);
+# define JENT_ARCH_NCPU_MACOS_KERNEL
+#elif defined(JENT_BAREMETAL)
+# define JENT_ARCH_NCPU_BAREMETAL
+#else
+# include <errno.h>
 
-#if defined(_MSC_VER) || defined(__MINGW32__)
-# include <windows.h>
-# define JENT_ARCH_NCPU_WINDOWS
-#elif defined(__unix__) || defined(__APPLE__) || defined(_AIX) || \
-      defined(__sun) || defined(__HAIKU__) || defined(__CYGWIN__)
-# include <unistd.h>
-# define JENT_ARCH_NCPU_POSIX
-# ifdef __linux__
-#  include <sys/syscall.h>
-#  define JENT_ARCH_NCPU_LINUX_AFFINITY
+# if defined(_MSC_VER) || defined(__MINGW32__)
+#  include <windows.h>
+#  define JENT_ARCH_NCPU_WINDOWS
+# elif defined(__unix__) || defined(__APPLE__) || defined(_AIX) || \
+       defined(__sun) || defined(__HAIKU__) || defined(__CYGWIN__)
+#  include <unistd.h>
+#  define JENT_ARCH_NCPU_POSIX
+#  ifdef __linux__
+#   include <sys/syscall.h>
+#   define JENT_ARCH_NCPU_LINUX_AFFINITY
 /*
  * syscall(3) is declared in <unistd.h> only when a feature-test macro
  * such as _DEFAULT_SOURCE is set; the project builds with -std=c11
@@ -99,13 +121,14 @@
  * and musl and avoids polluting the wider compile with _GNU_SOURCE.
  */
 extern long syscall(long number, ...);
-#  ifndef __GLIBC__
-#   include <fcntl.h>
-#   include <stdlib.h>
-#   define JENT_ARCH_NCPU_LINUX_SYSFS
+#   ifndef __GLIBC__
+#    include <fcntl.h>
+#    include <stdlib.h>
+#    define JENT_ARCH_NCPU_LINUX_SYSFS
+#   endif
 #  endif
 # endif
-#endif
+#endif /* JENT_KERNEL / JENT_BAREMETAL */
 
 #ifdef JENT_ARCH_NCPU_LINUX_SYSFS
 /*
@@ -170,7 +193,19 @@ static inline long jent_ncpu_sysfs(void)
 
 static inline long jent_ncpu(void)
 {
-#if defined(JENT_ARCH_NCPU_WINDOWS)
+#if defined(JENT_ARCH_NCPU_LINUX_KERNEL)
+	return (long)num_online_cpus();
+#elif defined(JENT_ARCH_NCPU_FREEBSD_KERNEL)
+	return (long)mp_ncpus;
+#elif defined(JENT_ARCH_NCPU_MACOS_KERNEL)
+	return (long)processor_count();
+#elif defined(JENT_ARCH_NCPU_BAREMETAL)
+	/*
+	 * Baremetal / EFI: the timer thread is unusable. Returning 1 makes
+	 * the library skip the internal-timer fallback path entirely.
+	 */
+	return 1;
+#elif defined(JENT_ARCH_NCPU_WINDOWS)
 	return (long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
 #elif defined(JENT_ARCH_NCPU_POSIX)
 # ifdef JENT_ARCH_NCPU_LINUX_AFFINITY

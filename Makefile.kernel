@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Convenience wrapper for building the out-of-tree jitterentropy_kmod
+# kernel module. Defers to the kernel's own Kbuild system via M=$(PWD)
+# and reads obj-m and friends from the sibling Kbuild file.
+#
+# Usage:
+#   make -f Makefile.kernel                 # build against the running kernel
+#   make -f Makefile.kernel KDIR=/path/...  # build against a specific tree
+#   make -f Makefile.kernel modules_install
+#   make -f Makefile.kernel clean
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD  := $(shell pwd)
+
+.PHONY: all modules modules_install clean help
+
+all: modules
+
+modules:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+modules_install:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	@find . -name '*.o' -o -name '*.ko' -o -name '*.mod' -o -name '*.mod.c' \
+		-o -name 'modules.order' -o -name 'Module.symvers' \
+		-o -name '.*.cmd' -o -name '.tmp_versions' | xargs rm -rf
+
+help:
+	@echo "Targets: modules (default), modules_install, clean"
+	@echo "Variables:"
+	@echo "  KDIR   kernel build tree (default: /lib/modules/\$$(uname -r)/build)"

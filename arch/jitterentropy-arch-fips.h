@@ -58,8 +58,31 @@
 #ifndef _JITTERENTROPY_ARCH_FIPS_H
 #define _JITTERENTROPY_ARCH_FIPS_H
 
-#if !defined(LIBGCRYPT) && !defined(AWSLC) && !defined(OPENSSL) && \
-    !defined(_MSC_VER) && !defined(__MINGW32__)
+#if defined(JENT_LINUX_KERNEL)
+# include <linux/fips.h>
+/*
+ * <linux/fips.h> exposes fips_enabled either as an int (CONFIG_CRYPTO_FIPS=y)
+ * or as a 0-valued preprocessor macro (CONFIG_CRYPTO_FIPS=n). struct rand_data
+ * has a fips_enabled bitfield, so the macro form clashes: any later
+ * "ec->fips_enabled = 1" expands to "ec->0 = 1" and fails to compile.
+ *
+ * Capture the current expansion through an inline accessor, then undefine
+ * the macro so the field reference survives in the translation units that
+ * pull this header transitively.
+ */
+static inline int jent_linux_kernel_fips_enabled(void)
+{
+	return fips_enabled;
+}
+# undef fips_enabled
+#elif defined(JENT_FREEBSD_KERNEL)
+/* No first-class FIPS-mode switch in the FreeBSD kernel. */
+#elif defined(JENT_MACOS_KERNEL)
+/* No third-party-queryable FIPS mode switch in xnu. */
+#elif defined(JENT_BAREMETAL)
+/* No FIPS mode switch on baremetal / EFI. */
+#elif !defined(LIBGCRYPT) && !defined(AWSLC) && !defined(OPENSSL) && \
+      !defined(_MSC_VER) && !defined(__MINGW32__)
 # include <errno.h>
 # include <fcntl.h>
 # include <sys/types.h>
@@ -68,7 +91,15 @@
 
 static inline int jent_fips_enabled(void)
 {
-#ifdef LIBGCRYPT
+#if defined(JENT_LINUX_KERNEL)
+	return jent_linux_kernel_fips_enabled();
+#elif defined(JENT_FREEBSD_KERNEL)
+	return 0;
+#elif defined(JENT_MACOS_KERNEL)
+	return 0;
+#elif defined(JENT_BAREMETAL)
+	return 0;
+#elif defined(LIBGCRYPT)
 	return gcry_fips_mode_active();
 #elif defined(AWSLC)
 	return FIPS_mode();

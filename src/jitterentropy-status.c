@@ -17,12 +17,40 @@
  * DAMAGE.
  */
 
-#include <stdio.h>
-
 #include "jitterentropy.h"
 #include "jitterentropy-base.h"
 #include "jitterentropy-internal.h"
 
+#if defined(JENT_LINUX_KERNEL)
+# include <linux/kernel.h>
+# include <linux/string.h>
+#elif defined(JENT_FREEBSD_KERNEL)
+/* sys/systm.h (already pulled via jitterentropy.h) provides snprintf
+ * and sys/libkern.h provides strlen in the FreeBSD kernel. */
+#elif defined(JENT_MACOS_KERNEL)
+/* libkern/libkern.h (already pulled via jitterentropy.h) provides
+ * snprintf, strlen, etc. in the xnu kernel. */
+#elif defined(JENT_BAREMETAL)
+/*
+ * snprintf is not available in a freestanding baremetal environment. The
+ * status helper is omitted there: callers should not rely on it. Return
+ * an empty JSON object so consumers can still parse the output.
+ */
+int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
+{
+	(void)ec;
+	if (!buf || buflen < 3)
+		return -1;
+	buf[0] = '{';
+	buf[1] = '}';
+	buf[2] = '\0';
+	return 0;
+}
+#else
+# include <stdio.h>
+#endif
+
+#ifndef JENT_BAREMETAL
 /*
  * Always validate the output with something like "jq -e .", when doing changes here.
  *
@@ -152,3 +180,4 @@ out:
 	return (used >= buflen - 1) ? -1 : 0;
 #undef jent_add_to_status
 }
+#endif /* !JENT_BAREMETAL */

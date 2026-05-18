@@ -70,33 +70,80 @@
 #ifndef _JITTERENTROPY_ARCH_MEMORY_H
 #define _JITTERENTROPY_ARCH_MEMORY_H
 
-#include <stddef.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
+#if defined(JENT_LINUX_KERNEL)
+# include <linux/types.h>
+# include <linux/slab.h>
+# include <linux/string.h>
+# define JENT_ARCH_MEM_LINUX_KERNEL
+/*
+ * The Linux kernel slab allocator returns kernel-only memory that cannot
+ * be swapped out, so the secure-memory contract is satisfied implicitly.
+ */
+# define CONFIG_CRYPTO_CPU_JITTERENTROPY_SECURE_MEMORY
+#elif defined(JENT_FREEBSD_KERNEL)
+# include <sys/types.h>
+# include <sys/param.h>
+# include <sys/systm.h>
+# include <sys/malloc.h>
+# include <sys/libkern.h>
+# define JENT_ARCH_MEM_FREEBSD_KERNEL
+/*
+ * The FreeBSD kernel general purpose allocator returns wired kernel
+ * memory that cannot be swapped out, satisfying the secure-memory
+ * contract. M_JENT is declared in src/jitterentropy-base.c.
+ */
+# define CONFIG_CRYPTO_CPU_JITTERENTROPY_SECURE_MEMORY
+MALLOC_DECLARE(M_JENT);
+#elif defined(JENT_MACOS_KERNEL)
+# include <sys/types.h>
+# include <libkern/libkern.h>
+# include <IOKit/IOLib.h>
+# define JENT_ARCH_MEM_MACOS_KERNEL
+/*
+ * Darwin xnu IOMalloc returns wired kernel memory; secure-memory
+ * contract satisfied.
+ */
+# define CONFIG_CRYPTO_CPU_JITTERENTROPY_SECURE_MEMORY
+#elif defined(JENT_BAREMETAL)
+# include <stddef.h>
+# include <stdint.h>
+# define JENT_ARCH_MEM_BAREMETAL
+/*
+ * Baremetal: the caller must register an allocator via
+ * jent_baremetal_set_allocator() before the first jent_zalloc() call.
+ * Until that hook is set, allocations fail. Memory returned by the hook
+ * is never swap-able, so we advertise secure memory support.
+ */
+# define CONFIG_CRYPTO_CPU_JITTERENTROPY_SECURE_MEMORY
+#else
+# include <stddef.h>
+# include <stdint.h>
+# include <stdlib.h>
+# include <string.h>
 
-#ifdef LIBGCRYPT
-# include <gcrypt.h>
-#endif
+# ifdef LIBGCRYPT
+#  include <gcrypt.h>
+# endif
 
-#if defined(OPENSSL)
-# include <openssl/crypto.h>
-# include <openssl/evp.h>
-#endif
+# if defined(OPENSSL)
+#  include <openssl/crypto.h>
+#  include <openssl/evp.h>
+# endif
 
-#if defined(AWSLC)
-# include <openssl/crypto.h>
-#endif
+# if defined(AWSLC)
+#  include <openssl/crypto.h>
+# endif
 
-#if defined(_MSC_VER) || defined(__MINGW32__)
-# include <windows.h>
-# define JENT_ARCH_MEM_WINDOWS
-#elif defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
-      defined(__NetBSD__) || defined(__APPLE__)
-# include <sys/mman.h>
-# include <errno.h>
-# define JENT_ARCH_MEM_POSIX_MLOCK
-#endif
+# if defined(_MSC_VER) || defined(__MINGW32__)
+#  include <windows.h>
+#  define JENT_ARCH_MEM_WINDOWS
+# elif defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+       defined(__NetBSD__) || defined(__APPLE__)
+#  include <sys/mman.h>
+#  include <errno.h>
+#  define JENT_ARCH_MEM_POSIX_MLOCK
+# endif
+#endif /* JENT_KERNEL / JENT_BAREMETAL */
 
 /* Override this if you want to allocate more than 2 MB of secure memory */
 #ifndef JENT_SECURE_MEMORY_SIZE_MAX
@@ -108,7 +155,35 @@
 
 static inline void jent_memset_secure(void *s, size_t n)
 {
-#if defined(AWSLC) || defined(OPENSSL)
+#if defined(JENT_ARCH_MEM_LINUX_KERNEL)
+	memzero_explicit(s, n);
+#elif defined(JENT_ARCH_MEM_FREEBSD_KERNEL)
+	explicit_bzero(s, n);
+#elif defined(JENT_ARCH_MEM_MACOS_KERNEL)
+	/* xnu has no explicit_bzero; volatile-loop equivalent. */
+	{
+		volatile unsigned char *p = (volatile unsigned char *)s;
+		size_t i;
+
+		for (i = 0; i < n; i++)
+			p[i] = 0;
+		__asm__ __volatile__("" : : "r" (s) : "memory");
+	}
+#elif defined(JENT_ARCH_MEM_BAREMETAL)
+	{
+		/*
+		 * Volatile pointer ensures the compiler cannot drop the
+		 * write back, mirroring what jent_memset_secure should do
+		 * everywhere else.
+		 */
+		volatile unsigned char *p = (volatile unsigned char *)s;
+		size_t i;
+
+		for (i = 0; i < n; i++)
+			p[i] = 0;
+		__asm__ __volatile__("" : : "r" (s) : "memory");
+	}
+#elif defined(AWSLC) || defined(OPENSSL)
 	OPENSSL_cleanse(s, n);
 #elif defined(JENT_ARCH_MEM_WINDOWS)
 	SecureZeroMemory(s, n);
@@ -129,11 +204,58 @@ static inline size_t jent_round_up_to_pagesize(size_t size)
 }
 #endif /* JENT_ARCH_MEM_WINDOWS */
 
+#ifdef JENT_ARCH_MEM_BAREMETAL
+/*
+ * Allocator hook used by baremetal builds. The caller registers a pair of
+ * allocate / free functions before the first jent_zalloc() call. The
+ * allocate hook must return zeroed memory and is allowed to return NULL.
+ */
+struct jent_baremetal_allocator {
+	void *(*alloc)(size_t len);
+	void  (*free)(void *ptr, size_t len);
+};
+
+/*
+ * Defined in src/jitterentropy-base.c so the storage is unique across
+ * all translation units that include this header.
+ */
+extern struct jent_baremetal_allocator jent_baremetal_alloc_ops;
+
+static inline void jent_baremetal_set_allocator(
+	void *(*alloc_fn)(size_t),
+	void  (*free_fn)(void *, size_t))
+{
+	jent_baremetal_alloc_ops.alloc = alloc_fn;
+	jent_baremetal_alloc_ops.free  = free_fn;
+}
+#endif /* JENT_ARCH_MEM_BAREMETAL */
+
 static inline void *jent_zalloc(size_t len)
 {
 	void *tmp = NULL;
 
-#ifdef LIBGCRYPT
+#if defined(JENT_ARCH_MEM_LINUX_KERNEL)
+
+	/* kzalloc already returns zeroed kernel memory. */
+	tmp = kzalloc(len, GFP_KERNEL);
+
+#elif defined(JENT_ARCH_MEM_FREEBSD_KERNEL)
+
+	/* M_WAITOK | M_ZERO -> blocking, zeroed allocation. */
+	tmp = malloc(len, M_JENT, M_WAITOK | M_ZERO);
+
+#elif defined(JENT_ARCH_MEM_MACOS_KERNEL)
+
+	tmp = IOMalloc(len);
+	if (tmp)
+		bzero(tmp, len);
+
+#elif defined(JENT_ARCH_MEM_BAREMETAL)
+
+	if (jent_baremetal_alloc_ops.alloc)
+		tmp = jent_baremetal_alloc_ops.alloc(len);
+
+#elif defined(LIBGCRYPT)
 
 	/*
 	 * Set the maximum usable locked memory to 2 MiB at first call.
@@ -250,7 +372,36 @@ static inline void *jent_zalloc(size_t len)
 
 static inline void jent_zfree(void *ptr, size_t len)
 {
-#ifdef LIBGCRYPT
+#if defined(JENT_ARCH_MEM_LINUX_KERNEL)
+
+	if (ptr) {
+		memzero_explicit(ptr, len);
+		kfree(ptr);
+	}
+
+#elif defined(JENT_ARCH_MEM_FREEBSD_KERNEL)
+
+	if (ptr) {
+		explicit_bzero(ptr, len);
+		free(ptr, M_JENT);
+	}
+
+#elif defined(JENT_ARCH_MEM_MACOS_KERNEL)
+
+	if (ptr) {
+		jent_memset_secure(ptr, len);
+		IOFree(ptr, len);
+	}
+
+#elif defined(JENT_ARCH_MEM_BAREMETAL)
+
+	if (ptr) {
+		jent_memset_secure(ptr, len);
+		if (jent_baremetal_alloc_ops.free)
+			jent_baremetal_alloc_ops.free(ptr, len);
+	}
+
+#elif defined(LIBGCRYPT)
 
 	/*
 	 * gcry_free automatically wipes memory allocated with
