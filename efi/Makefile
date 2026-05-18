@@ -28,12 +28,25 @@ OBJCOPY ?= objcopy
 # -O0 is mandatory: jitterentropy-base.c refuses to compile under
 # __OPTIMIZE__, and the jitter measurements would be invalidated by
 # any optimisation pass.
+#
+# -DGNU_EFI_USE_MS_ABI forces gnu-efi's headers to tag every protocol
+# function-pointer typedef with __attribute__((ms_abi)). Without this,
+# direct calls into firmware would pass arguments in SysV registers
+# (rdi, rsi, ...) while the firmware reads them from Microsoft x64
+# registers (rcx, rdx, ...), which silently produces wrong output or
+# hangs.
+#
+# We deliberately do NOT define EFI_FUNCTION_WRAPPER: the legacy
+# uefi_call_wrapper(func, n, ...) macro is still available either way
+# when needed (e.g. for AllocatePool), but the protocol typedefs being
+# EFIAPI-tagged is what makes the direct-call path safe.
 CFLAGS := -O0 -fwrapv -ffreestanding -fno-stack-protector \
           -fno-stack-check -fshort-wchar -mno-red-zone \
           -fpic -fno-strict-aliasing -Wall -Wextra \
+          -maccumulate-outgoing-args \
           -I$(EFI_INC) -I$(EFI_INC)/$(ARCH) -I$(EFI_INC)/protocol \
           -I$(JENT_TOP) -I$(JENT_SRC) -I$(JENT_TOP)/arch \
-          -DEFI_FUNCTION_WRAPPER -DJENT_BAREMETAL
+          -DGNU_EFI_USE_MS_ABI -DJENT_BAREMETAL
 
 #
 # We invoke ld directly (rather than going through gcc) for the final
@@ -97,10 +110,24 @@ else
 ELF_TARGET := elf64-little
 endif
 
+#
+# Section selection MATTERS: anything not listed here is silently
+# stripped, and the firmware will then run code with dangling pointers.
+# In particular gnu-efi's LDS keeps the linker's .rodata, .dynstr,
+# .eh_frame etc. in separate sections, so the obvious -j .text/.data
+# list is not enough:
+#   - .rodata holds every L"..." string literal (omitting it leaves
+#     Print() pointing at unmapped memory and produces a silent EFI
+#     application that does nothing at all).
+#   - .dynstr backs .dynsym; gnu-efi's _relocate walks it during
+#     startup self-relocation.
+#
 build/jitterentropy.efi: build/jitterentropy.so
-	$(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic \
-	           -j .dynsym -j .rel -j .rela -j .rel.* -j .rela.* \
-	           -j .reloc \
+	$(OBJCOPY) -j .text -j .sdata -j .data    \
+	           -j .rodata -j .rodata.*        \
+	           -j .dynamic -j .dynsym -j .dynstr \
+	           -j .rel -j .rela -j .rel.* -j .rela.* \
+	           -j .reloc                      \
 	           -I $(ELF_TARGET) -O $(PEI_TARGET) \
 	           --subsystem=10 $< $@
 

@@ -4,10 +4,19 @@
  * baremetal mode, reads 32 random bytes, and prints them as hex to the
  * EFI ConOut console.
  *
- * Built with gnu-efi. The jitterentropy sources are compiled in
- * directly with -DJENT_BAREMETAL so that all libc dependencies are
- * stubbed out, and the EFI boot-services AllocatePool / FreePool are
- * wired in as the baremetal allocator.
+ * Implementation notes:
+ *
+ *   - All console output goes through gnu-efi's Print() helper rather
+ *     than poking ConOut->OutputString directly. Print() takes care of
+ *     the Microsoft x64 calling convention that EFI firmware expects;
+ *     a direct call would silently miscall the firmware if EFIAPI is
+ *     not on the function-pointer typedef.
+ *   - We use plain L"..." (wide string) literals together with
+ *     -fshort-wchar so the encoding matches CHAR16. The literals end
+ *     up in .rodata and get relocated at runtime via gnu-efi's
+ *     _relocate.
+ *   - jitterentropy is built with JENT_BAREMETAL; we wire EFI's
+ *     AllocatePool / FreePool in as the baremetal allocator.
  */
 
 #include <efi.h>
@@ -16,12 +25,10 @@
 #include "jitterentropy.h"
 
 /*
- * The library's baremetal mode declares memcpy/memset as required
- * symbols. gnu-efi's libefi.a already provides ABI-compatible
- * implementations (efi/lib/init.c), so we just use those.
- *
- * gcc may legitimately call memcmp at -O0 even without an explicit
- * source reference; provide a minimal one to avoid a link error.
+ * Baremetal mode declares memcpy / memset as required symbols. gnu-efi's
+ * libefi.a already provides ABI-compatible implementations
+ * (efi/lib/init.c), so we just use those. gcc may also call memcmp
+ * implicitly at -O0; provide a minimal one.
  */
 int memcmp(const void *a, const void *b, size_t n)
 {
@@ -45,11 +52,13 @@ static void *jent_efi_alloc(size_t len)
 
 	if (!g_bs)
 		return NULL;
-	s = g_bs->AllocatePool(EfiLoaderData, len, &out);
+	s = uefi_call_wrapper(g_bs->AllocatePool, 3,
+			      EfiLoaderData, (UINTN)len, &out);
 	if (EFI_ERROR(s))
 		return NULL;
 	/* Zero - the library expects zeroed memory. */
-	memset(out, 0, len);
+	for (size_t i = 0; i < len; i++)
+		((unsigned char *)out)[i] = 0;
 	return out;
 }
 
@@ -57,99 +66,64 @@ static void jent_efi_free(void *ptr, size_t len)
 {
 	(void)len;
 	if (ptr && g_bs)
-		g_bs->FreePool(ptr);
-}
-
-/* --- Helpers ------------------------------------------------------------- */
-
-static void print_w(EFI_SYSTEM_TABLE *st, const CHAR16 *s)
-{
-	st->ConOut->OutputString(st->ConOut, (CHAR16 *)s);
-}
-
-static void print_hex_byte(EFI_SYSTEM_TABLE *st, unsigned char b)
-{
-	static const CHAR16 hex[] = u"0123456789abcdef";
-	CHAR16 buf[3];
-
-	buf[0] = hex[(b >> 4) & 0xf];
-	buf[1] = hex[b & 0xf];
-	buf[2] = 0;
-	print_w(st, buf);
-}
-
-static void print_dec(EFI_SYSTEM_TABLE *st, int v)
-{
-	CHAR16 buf[12];
-	int i = 0, neg = 0;
-
-	if (v < 0) { neg = 1; v = -v; }
-	if (v == 0) {
-		buf[i++] = u'0';
-	} else {
-		while (v) {
-			buf[i++] = (CHAR16)(u'0' + (v % 10));
-			v /= 10;
-		}
-	}
-	if (neg)
-		buf[i++] = u'-';
-	buf[i] = 0;
-	/* reverse */
-	for (int j = 0; j < i / 2; j++) {
-		CHAR16 t = buf[j];
-		buf[j] = buf[i - 1 - j];
-		buf[i - 1 - j] = t;
-	}
-	print_w(st, buf);
+		uefi_call_wrapper(g_bs->FreePool, 1, ptr);
 }
 
 /* --- EFI entry point ----------------------------------------------------- */
 
-EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
+/*
+ * Calling convention note: gnu-efi's crt0-efi-x86_64.S calls efi_main
+ * with SysV registers (rdi = ImageHandle, rsi = SystemTable). The
+ * crt0 itself bridges from the MS-ABI entry point that the PE loader
+ * uses. Marking efi_main with EFIAPI (which is ms_abi) would mean we
+ * try to read the arguments from rcx/rdx instead - those have been
+ * clobbered by _relocate, so we'd silently run with garbage pointers
+ * and ConOut->OutputString would never produce anything.
+ *
+ * Conclusion: efi_main must be plain SysV here, even though every EFI
+ * tutorial that targets EDK2 puts EFIAPI on it. gnu-efi's crt0 is the
+ * impedance matcher.
+ */
+EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
 {
 	struct rand_data *ec;
 	unsigned char out[32];
 	ssize_t got;
 	int rc;
+	UINTN i;
 
 	InitializeLib(image, st);
 	g_bs = st->BootServices;
 
-	print_w(st, u"jitterentropy EFI demo (library v");
-	print_dec(st, (int)jent_version());
-	print_w(st, u")\r\n");
+	Print(L"jitterentropy EFI demo (library v%u)\r\n",
+	      (UINTN)jent_version());
 
 	/* Register the EFI allocator with the baremetal library. */
 	jent_baremetal_set_allocator(jent_efi_alloc, jent_efi_free);
 
 	rc = jent_entropy_init_ex(0, 0);
 	if (rc) {
-		print_w(st, u"jent_entropy_init_ex failed: ");
-		print_dec(st, rc);
-		print_w(st, u"\r\n");
+		Print(L"jent_entropy_init_ex failed: %d\r\n", rc);
 		return EFI_DEVICE_ERROR;
 	}
 
 	ec = jent_entropy_collector_alloc(0, 0);
 	if (!ec) {
-		print_w(st, u"jent_entropy_collector_alloc returned NULL\r\n");
+		Print(L"jent_entropy_collector_alloc returned NULL\r\n");
 		return EFI_OUT_OF_RESOURCES;
 	}
 
 	got = jent_read_entropy_safe(&ec, (char *)out, sizeof(out));
 	if (got != (ssize_t)sizeof(out)) {
-		print_w(st, u"jent_read_entropy_safe failed: ");
-		print_dec(st, (int)got);
-		print_w(st, u"\r\n");
+		Print(L"jent_read_entropy_safe failed: %d\r\n", (int)got);
 		jent_entropy_collector_free(ec);
 		return EFI_DEVICE_ERROR;
 	}
 
-	print_w(st, u"32 random bytes: ");
-	for (size_t i = 0; i < sizeof(out); i++)
-		print_hex_byte(st, out[i]);
-	print_w(st, u"\r\n");
+	Print(L"32 random bytes: ");
+	for (i = 0; i < sizeof(out); i++)
+		Print(L"%02x", (UINTN)out[i]);
+	Print(L"\r\n");
 
 	jent_entropy_collector_free(ec);
 	return EFI_SUCCESS;
