@@ -52,6 +52,9 @@
  *   - Windows / Cygwin -> GetLogicalProcessorInformation
  *   - {Open,Free,Net}BSD x86 -> CPUID leaf 4 (deterministic cache parameters)
  *   - {Open,Free,Net}BSD aarch64 / riscv -> zero stub (no EL0-readable source)
+ *   - Linux kernel x86 -> CPUID leaf 4 via <asm/processor.h>
+ *   - Linux kernel arm64 -> CLIDR_EL1 + CCSIDR_EL1 (CCIDX-aware)
+ *   - Linux kernel other arches -> zero stub (caller uses default memory size)
  *   - AIX              -> _system_configuration (dcache_size / L2_cache_size)
  *   - other            -> return 0
  */
@@ -61,7 +64,28 @@
 
 #if defined(JENT_LINUX_KERNEL)
 # include <linux/types.h>
-# define JENT_ARCH_CACHE_NONE
+# if defined(__x86_64__) || defined(__i386__)
+/*
+ * <asm/processor.h> pulls in the kernel's cpuid_count() / cpuid_eax()
+ * wrappers. The cacheinfo subsystem (get_cpu_cacheinfo()) would be the
+ * cleaner choice, but its symbol is not exported to out-of-tree modules,
+ * so we read CPUID leaf 4 directly instead - same approach as the BSD
+ * userspace path below.
+ */
+#  include <asm/processor.h>
+#  define JENT_ARCH_CACHE_LINUX_KERNEL_X86
+# elif defined(__aarch64__)
+/*
+ * On arm64 the kernel runs at EL1 (or EL2 with VHE) where CLIDR_EL1,
+ * CSSELR_EL1 and CCSIDR_EL1 are directly readable. preempt_disable() is
+ * required around the CSSELR_EL1 write/read sequence so a context switch
+ * cannot leak our cache selection to an unrelated task.
+ */
+#  include <linux/preempt.h>
+#  define JENT_ARCH_CACHE_LINUX_KERNEL_ARM64
+# else
+#  define JENT_ARCH_CACHE_NONE
+# endif
 #elif defined(JENT_FREEBSD_KERNEL)
 # include <sys/types.h>
 # define JENT_ARCH_CACHE_NONE
@@ -368,14 +392,45 @@ static inline uint32_t jent_cache_size_roundup(int all_caches)
 	return cache_size;
 }
 
-#elif defined(JENT_ARCH_CACHE_BSD)
+#elif defined(JENT_ARCH_CACHE_BSD) || defined(JENT_ARCH_CACHE_LINUX_KERNEL_X86)
 
-#ifdef JENT_ARCH_CACHE_BSD_CPUID
+#if defined(JENT_ARCH_CACHE_BSD_CPUID) || \
+    defined(JENT_ARCH_CACHE_LINUX_KERNEL_X86)
 
 /*
- * The BSDs do not export data-cache sizes through sysctl in a uniform way.
- * On x86 we can read them directly with CPUID leaf 4 (deterministic cache
- * parameters, Intel SDM Vol. 2A; AMD CPUID Specification rev 2.34,
+ * CPUID wrapper. Returns 1 on success and populates the output registers,
+ * or 0 if the requested leaf is not supported by the CPU.
+ *
+ *   - BSD userspace uses GCC's <cpuid.h> __get_cpuid_count() which already
+ *     validates max-leaf internally.
+ *   - The Linux kernel exposes raw cpuid_count() / cpuid_eax() via
+ *     <asm/processor.h>; cpuid_count() has no return value, so we gate it
+ *     on the max-basic-leaf check ourselves.
+ */
+#ifdef JENT_ARCH_CACHE_LINUX_KERNEL_X86
+static inline int jent_arch_cpuid_count(unsigned int leaf, unsigned int sub,
+					unsigned int *eax, unsigned int *ebx,
+					unsigned int *ecx, unsigned int *edx)
+{
+	if (cpuid_eax(leaf & 0x80000000U) < leaf)
+		return 0;
+	cpuid_count(leaf, sub, eax, ebx, ecx, edx);
+	return 1;
+}
+#else
+static inline int jent_arch_cpuid_count(unsigned int leaf, unsigned int sub,
+					unsigned int *eax, unsigned int *ebx,
+					unsigned int *ecx, unsigned int *edx)
+{
+	return __get_cpuid_count(leaf, sub, eax, ebx, ecx, edx);
+}
+#endif
+
+/*
+ * The BSDs do not export data-cache sizes through sysctl in a uniform way,
+ * and the Linux kernel's get_cpu_cacheinfo() is not exported to modules.
+ * On x86 we can read the sizes directly with CPUID leaf 4 (deterministic
+ * cache parameters, Intel SDM Vol. 2A; AMD CPUID Specification rev 2.34,
  * fn 0000_0004h).
  *
  * Each successful sub-leaf returns:
@@ -402,7 +457,7 @@ static inline void jent_get_cachesize_cpuid(long *l1, long *l2, long *l3)
 		unsigned int ways, partitions, line_size, sets;
 		long size;
 
-		if (!__get_cpuid_count(4, sub, &eax, &ebx, &ecx, &edx))
+		if (!jent_arch_cpuid_count(4, sub, &eax, &ebx, &ecx, &edx))
 			break;
 
 		cache_type = eax & 0x1F;
@@ -452,7 +507,7 @@ static inline void jent_get_cachesize_cpuid(long *l1, long *l2, long *l3)
 	*l3 = 0;
 }
 
-#endif /* JENT_ARCH_CACHE_BSD_CPUID */
+#endif /* CPUID-capable platform */
 
 static inline uint32_t jent_cache_size_roundup(int all_caches)
 {
@@ -460,6 +515,105 @@ static inline uint32_t jent_cache_size_roundup(int all_caches)
 	uint32_t cache_size;
 
 	jent_get_cachesize_cpuid(&l1, &l2, &l3);
+
+	cache_size = jent_cache_size_to_memory(l1, l2, l3, all_caches);
+	if (cache_size == 0)
+		return 0;
+
+	/*
+	 * Make the output_size the smallest power of 2 strictly greater
+	 * than cache_size.
+	 */
+	cache_size++;
+
+	return cache_size;
+}
+
+#elif defined(JENT_ARCH_CACHE_LINUX_KERNEL_ARM64)
+
+/*
+ * Read the data / unified cache sizes via the ARMv8 system registers.
+ *
+ *   CLIDR_EL1  : encodes the per-level cache type (3 bits per level,
+ *                up to 7 levels). Type values: 0 = no cache, 1 = inst,
+ *                2 = data, 3 = separate, 4 = unified.
+ *   CSSELR_EL1 : selects which (level, InD) the next CCSIDR_EL1 read
+ *                describes. Per-EL1 state, must be saved/restored.
+ *   CCSIDR_EL1 : decoded according to whether ID_AA64MMFR2_EL1.CCIDX
+ *                (bits [23:20]) is set:
+ *                  legacy   : LineSize[2:0], Assoc[12:3], Sets[27:13]
+ *                  CCIDX    : LineSize[2:0], Assoc[23:3], Sets[55:32]
+ *                LineSize is encoded as log2(bytes) - 4.
+ *
+ * Reading these registers is non-trivial (writing CSSELR_EL1 is followed
+ * by an ISB to ensure the new selection is visible to CCSIDR_EL1), so we
+ * bracket the loop with preempt_disable() and restore the prior CSSELR_EL1
+ * before re-enabling preemption.
+ */
+static inline void jent_get_cachesize_arm64(long *l1, long *l2, long *l3)
+{
+	u64 clidr, mmfr2;
+	u64 csselr_save;
+	unsigned int level;
+	int ccidx;
+
+	*l1 = 0;
+	*l2 = 0;
+	*l3 = 0;
+
+	__asm__ __volatile__("mrs %0, clidr_el1"          : "=r" (clidr));
+	__asm__ __volatile__("mrs %0, id_aa64mmfr2_el1"   : "=r" (mmfr2));
+	ccidx = ((mmfr2 >> 20) & 0xfULL) != 0;
+
+	preempt_disable();
+	__asm__ __volatile__("mrs %0, csselr_el1" : "=r" (csselr_save));
+
+	for (level = 1; level <= 3; level++) {
+		unsigned int ctype = (clidr >> (3 * (level - 1))) & 0x7;
+		u64 ccsidr, sel;
+		long line_size, ways, sets, size;
+
+		/* Skip levels that lack a data or unified cache. */
+		if (ctype != 2 && ctype != 3 && ctype != 4)
+			continue;
+
+		/* CSSELR_EL1: InD = 0 (data/unified), Level = level - 1. */
+		sel = (u64)(level - 1) << 1;
+		__asm__ __volatile__("msr csselr_el1, %0\n\t"
+				     "isb"
+				     : : "r" (sel));
+		__asm__ __volatile__("mrs %0, ccsidr_el1" : "=r" (ccsidr));
+
+		line_size = 1L << ((ccsidr & 0x7ULL) + 4);
+		if (ccidx) {
+			ways = (long)(((ccsidr >> 3)  & 0x1FFFFFULL) + 1);
+			sets = (long)(((ccsidr >> 32) & 0xFFFFFFULL) + 1);
+		} else {
+			ways = (long)(((ccsidr >> 3)  & 0x3FFULL)   + 1);
+			sets = (long)(((ccsidr >> 13) & 0x7FFFULL)  + 1);
+		}
+		size = line_size * ways * sets;
+
+		if (level == 1)
+			*l1 = size;
+		else if (level == 2)
+			*l2 = size;
+		else
+			*l3 = size;
+	}
+
+	__asm__ __volatile__("msr csselr_el1, %0\n\t"
+			     "isb"
+			     : : "r" (csselr_save));
+	preempt_enable();
+}
+
+static inline uint32_t jent_cache_size_roundup(int all_caches)
+{
+	long l1 = 0, l2 = 0, l3 = 0;
+	uint32_t cache_size;
+
+	jent_get_cachesize_arm64(&l1, &l2, &l3);
 
 	cache_size = jent_cache_size_to_memory(l1, l2, l3, all_caches);
 	if (cache_size == 0)
