@@ -46,29 +46,37 @@
  * but increment a counter. This header isolates the two pieces of code
  * that differ between platforms:
  *
- *   1. Thread creation / joining. Two threading back-ends are supported,
- *      selected by JENT_PTHREAD (see jitterentropy.h):
- *        - POSIX threads (pthread_create / pthread_join)
- *        - C11 threads   (thrd_create / thrd_join)
- *      jent_notime_thread_create() / jent_notime_thread_join() hide that
- *      difference behind a single signature and a single context struct
- *      (struct jent_notime_ctx).
+ *   1. Thread creation / joining. jent_notime_thread_create() /
+ *      jent_notime_thread_join() hide the back-end behind a single
+ *      signature and a single context struct (struct jent_notime_ctx).
  *
  *   2. Pinning the calling thread to a single logical CPU via
- *      jent_thread_pin_to_cpu(). Keeping the counting thread on one
- *      CPU avoids inter-core migration of the running counter. The
- *      dispatch is:
- *        - Windows            -> SetThreadGroupAffinity() (resolves the
- *                                CPU index across processor groups, so
- *                                CPUs beyond 64 are reachable)
- *        - Linux              -> sched_setaffinity(2)
- *        - Apple              -> thread_policy_set(THREAD_AFFINITY_POLICY)
- *                                (an affinity hint, not a hard binding;
- *                                ignored on Apple Silicon)
- *        - FreeBSD            -> cpuset_setaffinity(2)
- *        - NetBSD             -> pthread_setaffinity_np(3)
- *        - OpenBSD            -> unsupported (no public affinity API)
- *        - other              -> unsupported
+ *      jent_thread_pin_to_cpu(). Keeping the counting thread on one CPU
+ *      avoids inter-core migration of the running counter.
+ *
+ * Three execution environments are distinguished:
+ *
+ *   - Hosted userspace (JENT_ARCH_THREAD_HOSTED): a full C library is
+ *     present. Threads use POSIX threads or C11 threads (selected by
+ *     JENT_PTHREAD, see jitterentropy.h) and pinning uses the native OS
+ *     affinity API:
+ *        - Windows  -> SetThreadGroupAffinity() (resolves the CPU index
+ *                      across processor groups, so CPUs beyond 64 are
+ *                      reachable)
+ *        - Linux    -> sched_setaffinity(2)
+ *        - Apple    -> thread_policy_set(THREAD_AFFINITY_POLICY) (an
+ *                      affinity hint, ignored on Apple Silicon)
+ *        - FreeBSD  -> cpuset_setaffinity(2)
+ *        - NetBSD   -> pthread_setaffinity_np(3)
+ *        - OpenBSD  -> unsupported (no public affinity API)
+ *
+ *   - Linux kernel module (JENT_ARCH_THREAD_LINUX_KERNEL, __KERNEL__),
+ *     FreeBSD kernel module (JENT_ARCH_THREAD_FREEBSD_KERNEL, _KERNEL) and
+ *     baremetal / EFI targets (JENT_ARCH_THREAD_BAREMETAL, e.g. gnu-efi):
+ *     no hosted C library and no userspace threading or affinity APIs are
+ *     available. The built-in thread handler therefore degrades to a stub
+ *     and pinning is a no-op; such builds are expected to register their
+ *     own thread handler via jent_entropy_switch_notime_impl().
  *
  * Pinning is best-effort: callers treat a negative return as "not pinned"
  * and continue, so an unsupported platform or a denied request is never
@@ -79,6 +87,28 @@
 #define _JITTERENTROPY_ARCH_THREAD_H
 
 #ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
+
+/*
+ * Execution environment selection. A freestanding target is the Linux
+ * kernel (__KERNEL__), the FreeBSD kernel (_KERNEL) or a baremetal/EFI
+ * environment. The latter is detected from -ffreestanding
+ * (__STDC_HOSTED__ == 0, as used by gnu-efi and similar baremetal
+ * toolchains) or requested explicitly with JENT_BAREMETAL. The FreeBSD
+ * kernel is matched before the generic baremetal test because it also
+ * builds freestanding. Everything else is treated as hosted userspace.
+ */
+#if defined(__KERNEL__)
+# define JENT_ARCH_THREAD_LINUX_KERNEL
+#elif defined(_KERNEL) && defined(__FreeBSD__)
+# define JENT_ARCH_THREAD_FREEBSD_KERNEL
+#elif defined(JENT_BAREMETAL) || \
+      (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+# define JENT_ARCH_THREAD_BAREMETAL
+#else
+# define JENT_ARCH_THREAD_HOSTED
+#endif
+
+#if defined(JENT_ARCH_THREAD_HOSTED)
 
 #include <errno.h>
 
@@ -263,6 +293,43 @@ static inline void jent_notime_thread_join(struct jent_notime_ctx *ctx)
 	thrd_join(ctx->notime_thread_id, NULL);
 #endif
 }
+
+#else /* freestanding: LINUX_KERNEL / FREEBSD_KERNEL / BAREMETAL */
+
+/*
+ * Freestanding targets have no hosted C library to spawn threads or set
+ * CPU affinity. The built-in handler is a stub - such builds register
+ * their own thread handler via jent_entropy_switch_notime_impl() - and
+ * pinning is a no-op. Error returns avoid <errno.h>, which may be absent.
+ */
+struct jent_notime_ctx {
+	unsigned long notime_cpu;		/* CPU the thread pins to */
+};
+
+typedef int (*jent_notime_start_routine)(void *);
+
+static inline int jent_thread_pin_to_cpu(unsigned long cpu)
+{
+	(void)cpu;
+	return -1;
+}
+
+static inline int jent_notime_thread_create(struct jent_notime_ctx *ctx,
+					    jent_notime_start_routine routine,
+					    void *arg)
+{
+	(void)ctx;
+	(void)routine;
+	(void)arg;
+	return -1;
+}
+
+static inline void jent_notime_thread_join(struct jent_notime_ctx *ctx)
+{
+	(void)ctx;
+}
+
+#endif /* JENT_ARCH_THREAD_HOSTED */
 
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 
