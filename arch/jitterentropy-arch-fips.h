@@ -58,6 +58,27 @@
 #ifndef _JITTERENTROPY_ARCH_FIPS_H
 #define _JITTERENTROPY_ARCH_FIPS_H
 
+#ifdef __KERNEL__
+# include <linux/fips.h>		/* fips_enabled */
+
+static inline int jent_fips_enabled(void)
+{
+	return fips_enabled;
+}
+
+/*
+ * When CONFIG_CRYPTO_FIPS is disabled, <linux/fips.h> defines fips_enabled as
+ * a macro expanding to 0. The Jitter RNG uses a struct member of the same
+ * name (struct rand_data.fips_enabled), so drop the macro now that the
+ * accessor above has captured its value. When CONFIG_CRYPTO_FIPS is enabled
+ * fips_enabled is an extern variable, not a macro, and this is a no-op.
+ */
+# ifdef fips_enabled
+#  undef fips_enabled
+# endif
+
+#else /* __KERNEL__ */
+
 #if !defined(LIBGCRYPT) && !defined(AWSLC) && !defined(OPENSSL) && \
     !defined(_MSC_VER) && !defined(__MINGW32__)
 # include <errno.h>
@@ -68,7 +89,7 @@
 
 static inline int jent_fips_enabled(void)
 {
-#ifdef LIBGCRYPT
+#if defined(LIBGCRYPT)
 	return gcry_fips_mode_active();
 #elif defined(AWSLC)
 	return FIPS_mode();
@@ -97,5 +118,7 @@ static inline int jent_fips_enabled(void)
 #undef FIPS_MODE_SWITCH_FILE
 #endif
 }
+
+#endif /* __KERNEL__ */
 
 #endif /* _JITTERENTROPY_ARCH_FIPS_H */

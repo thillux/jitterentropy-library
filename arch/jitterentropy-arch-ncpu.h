@@ -78,6 +78,18 @@
 #ifndef _JITTERENTROPY_ARCH_NCPU_H
 #define _JITTERENTROPY_ARCH_NCPU_H
 
+#ifdef __KERNEL__
+
+#include <linux/types.h>
+#include <linux/cpumask.h>	/* num_online_cpus() */
+
+static inline long jent_ncpu(void)
+{
+	return (long)num_online_cpus();
+}
+
+#else /* __KERNEL__ */
+
 #include <errno.h>
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -216,5 +228,7 @@ static inline long jent_ncpu(void)
 	return 1;
 #endif
 }
+
+#endif /* __KERNEL__ */
 
 #endif /* _JITTERENTROPY_ARCH_NCPU_H */

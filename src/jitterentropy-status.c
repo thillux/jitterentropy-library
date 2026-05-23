@@ -21,7 +21,9 @@
 #include "jitterentropy-base.h"
 #include "jitterentropy-internal.h"
 
+#ifndef __KERNEL__
 #include <stdio.h>
+#endif
 
 /*
  * Always validate the output with something like "jq -e .", when doing changes here.

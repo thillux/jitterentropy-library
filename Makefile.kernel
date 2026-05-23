@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-2.0-or-later OR BSD-3-Clause
+#
+# Build the out-of-tree jitterentropy kernel module (in kernel/) together
+# with the userspace status helper (in kernel/userspace/).
+#
+# Usage:
+#   make -f Makefile.kernel               # build module + userspace helper
+#   make -f Makefile.kernel modules       # build only the kernel module
+#   make -f Makefile.kernel userspace     # build only the userspace helper
+#   make -f Makefile.kernel modules_install
+#   make -f Makefile.kernel clean
+#
+# Build against a specific kernel tree by overriding KDIR:
+#   make -f Makefile.kernel KDIR=/path/to/linux
+#
+# Both 64-bit and 32-bit kernels are supported: the few 64-bit divisions in
+# the library are routed through div64_u64() on kernel builds (see
+# jent_div64()/jent_mod64() in src/jitterentropy-internal.h).
+
+KDIR   ?= /lib/modules/$(shell uname -r)/build
+PWD    := $(shell pwd)
+MODDIR := $(PWD)/kernel
+
+.PHONY: all modules userspace modules_install clean
+
+all: modules userspace
+
+modules:
+	$(MAKE) -C $(KDIR) M=$(MODDIR) modules
+
+modules_install:
+	$(MAKE) -C $(KDIR) M=$(MODDIR) modules_install
+
+userspace:
+	$(MAKE) -C $(MODDIR)/userspace
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(MODDIR) clean
+	$(MAKE) -C $(MODDIR)/userspace clean

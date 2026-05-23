@@ -258,8 +258,8 @@ static void jent_memaccess_pseudorandom(struct rand_data *ec, uint64_t loop_cnt,
 	 */
 	if (current_delta) {
 		jent_get_nstime_internal(ec, &time_now_end);
-		tmp_delta += jent_delta(time_now_start, time_now_end) /
-					ec->jent_common_timer_gcd;
+		tmp_delta += jent_div64(jent_delta(time_now_start, time_now_end),
+					ec->jent_common_timer_gcd);
 		*current_delta = tmp_delta;
 	}
 }
@@ -333,8 +333,8 @@ static void jent_memaccess_deterministic(struct rand_data *ec,
 
 	if (current_delta) {
 		jent_get_nstime_internal(ec, &time_now_end);
-		tmp_delta += jent_delta(time_now_start, time_now_end) /
-					ec->jent_common_timer_gcd;
+		tmp_delta += jent_div64(jent_delta(time_now_start, time_now_end),
+					ec->jent_common_timer_gcd);
 		*current_delta = tmp_delta;
 	}
 }
@@ -449,8 +449,8 @@ unsigned int jent_measure_jitter_ntg1_sha3(struct rand_data *ec,
 	 * invocation to measure the timing variations
 	 */
 	jent_get_nstime_internal(ec, &time_now);
-	current_delta = jent_delta(ec->prev_time, time_now) /
-				   ec->jent_common_timer_gcd;
+	current_delta = jent_div64(jent_delta(ec->prev_time, time_now),
+				   ec->jent_common_timer_gcd);
 
 	/*
 	 * Check whether we have a stuck measurement - and apply the health
@@ -509,8 +509,8 @@ unsigned int jent_measure_jitter(struct rand_data *ec,
 	 * invocation to measure the timing variations
 	 */
 	jent_get_nstime_internal(ec, &time_now);
-	current_delta = jent_delta(ec->prev_time, time_now) /
-				   ec->jent_common_timer_gcd;
+	current_delta = jent_div64(jent_delta(ec->prev_time, time_now),
+				   ec->jent_common_timer_gcd);
 	ec->prev_time = time_now;
 
 	/* Check whether we have a stuck measurement. */

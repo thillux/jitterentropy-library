@@ -5,3 +5,21 @@ build
 inst
 tests/raw-entropy/results-measurements/*.data
 /.vs
+
+# Kernel module build artifacts
+*.ko
+*.mod
+*.mod.c
+*.o.cmd
+*.ko.cmd
+.*.cmd
+*.order
+Module.symvers
+modules.order
+kernel/.tmp_versions/
+kernel/userspace/jitterentropy-status
+kernel/userspace/libjent_status.a
+
+# Nix build artifacts
+result
+result-*

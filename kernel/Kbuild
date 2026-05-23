@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0-or-later OR BSD-3-Clause
+#
+# Kbuild file for the out-of-tree jitterentropy kernel module. It is normally
+# driven through ../Makefile.kernel but can also be used directly with:
+#
+#   make -C /lib/modules/$(uname -r)/build M=$(pwd)/kernel modules
+
+obj-m += jitterentropy_drv.o
+
+jitterentropy_drv-y := \
+	jitterentropy_dev.o \
+	jent_lib_base.o \
+	jent_lib_gcd.o \
+	jent_lib_health.o \
+	jent_lib_noise.o \
+	jent_lib_sha3.o \
+	jent_lib_status.o
+
+# Find the library headers: the public jitterentropy.h and arch/ live in the
+# repository root, the internal headers in src/.
+ccflags-y := -I$(src)/.. -I$(src)/../src
+
+# The Jitter RNG must be built without optimization so the compiler does not
+# eliminate the timing variations the noise source relies on. Force -O0 on
+# each library translation unit; jitterentropy-base.c enforces this with an
+# #error guard, the others need it for correct entropy collection. The module
+# glue (jitterentropy_dev.o) is built with the normal kernel flags.
+CFLAGS_jent_lib_base.o   := -O0
+CFLAGS_jent_lib_gcd.o    := -O0
+CFLAGS_jent_lib_health.o := -O0
+CFLAGS_jent_lib_noise.o  := -O0
+CFLAGS_jent_lib_sha3.o   := -O0
+CFLAGS_jent_lib_status.o := -O0

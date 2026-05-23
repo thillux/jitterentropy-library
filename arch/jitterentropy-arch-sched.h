@@ -70,6 +70,17 @@
 #ifndef _JITTERENTROPY_ARCH_SCHED_H
 #define _JITTERENTROPY_ARCH_SCHED_H
 
+#ifdef __KERNEL__
+
+#include <linux/processor.h>	/* cpu_relax() */
+
+static inline void jent_yield(void)
+{
+	cpu_relax();
+}
+
+#else /* __KERNEL__ */
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 # include <windows.h>
 # define JENT_ARCH_SCHED_OS_WINDOWS
@@ -110,5 +121,7 @@ static inline void jent_yield(void)
 	(void)sched_yield();
 #endif
 }
+
+#endif /* __KERNEL__ */
 
 #endif /* _JITTERENTROPY_ARCH_SCHED_H */

@@ -49,6 +49,34 @@
  * Compilation for OpenSSL    #define OPENSSL
  */
 
+#ifdef __KERNEL__
+
+/*
+ * Linux kernel build (out-of-tree module). No hosted C library is
+ * available, so pull in the kernel equivalents of the libc facilities the
+ * library relies on (fixed-width types, string/memory helpers, snprintf,
+ * allocation) and provide the handful of stdint-style macros the source
+ * uses but that the kernel headers do not define.
+ */
+#include <linux/types.h>
+#include <linux/limits.h>
+#include <linux/kernel.h>
+#include <linux/string.h>
+#include <linux/slab.h>
+#include <linux/errno.h>
+
+#ifndef UINT32_C
+# define UINT32_C(c)	c ## U
+#endif
+#ifndef UINT64_C
+# define UINT64_C(c)	c ## ULL
+#endif
+#ifndef UINT32_MAX
+# define UINT32_MAX	(0xffffffffU)
+#endif
+
+#else /* __KERNEL__ */
+
 /* used for sched_getaffinity and CPU_* macros */
 #ifdef __linux__
 	#define _GNU_SOURCE
@@ -79,6 +107,8 @@ typedef int64_t ssize_t;
 # include <mach/mach_time.h>
 # include <unistd.h>
 #endif
+
+#endif /* __KERNEL__ */
 
 /*
  * Architecture- and OS-specific helpers (timestamp, secure memory, cache

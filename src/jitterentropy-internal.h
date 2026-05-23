@@ -48,9 +48,52 @@
 extern "C" {
 #endif
 
+/*
+ * The kernel build pulls in <linux/build_bug.h>, whose BUILD_BUG_ON()
+ * relies on the optimizer to drop a compile-time assertion helper. As the
+ * Jitter RNG sources are compiled with -O0 (see the __OPTIMIZE__ guard in
+ * jitterentropy-base.c) that helper would survive and fail to link, so the
+ * self-contained sizeof()-based definition below is used unconditionally.
+ */
+#undef BUILD_BUG_ON
 #define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
 
+#ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
+
+#ifdef __KERNEL__
+#include <linux/math64.h>
+#endif
+
+/*
+ * 64-bit by 64-bit division and modulo. On 32-bit Linux kernels the compiler
+ * may not emit a native 64-bit division (it would reference libgcc helpers
+ * the kernel deliberately does not provide), so the dedicated kernel helpers
+ * are used there. Everywhere else this is a plain division. These run outside
+ * the timed measurement region, so the call does not affect entropy
+ * collection.
+ */
+static inline uint64_t jent_div64(uint64_t dividend, uint64_t divisor)
+{
+#ifdef __KERNEL__
+	return div64_u64(dividend, divisor);
+#else
+	return dividend / divisor;
+#endif
+}
+
+static inline uint64_t jent_mod64(uint64_t dividend, uint64_t divisor)
+{
+#ifdef __KERNEL__
+	uint64_t remainder;
+
+	div64_u64_rem(dividend, divisor, &remainder);
+	return remainder;
+#else
+	return dividend % divisor;
+#endif
+}
 
 #ifndef JENT_STUCK_INIT_THRES
 /*

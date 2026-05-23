@@ -70,6 +70,44 @@
 #ifndef _JITTERENTROPY_ARCH_MEMORY_H
 #define _JITTERENTROPY_ARCH_MEMORY_H
 
+#ifdef __KERNEL__
+
+#include <linux/types.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+/*
+ * Kernel memory is not swapped to disk and kvzalloc() returns zeroed
+ * memory, so the secure-memory guarantees the library advertises hold.
+ */
+#define CONFIG_CRYPTO_CPU_JITTERENTROPY_SECURE_MEMORY
+
+static inline void jent_memset_secure(void *s, size_t n)
+{
+	memzero_explicit(s, n);
+}
+
+static inline void *jent_zalloc(size_t len)
+{
+	/*
+	 * kvzalloc() transparently falls back to vmalloc() for the larger
+	 * memory-access buffers (up to several MiB) that kmalloc() cannot
+	 * always satisfy. This runs in process context (module init / open()),
+	 * so sleeping with GFP_KERNEL is fine.
+	 */
+	return kvzalloc(len, GFP_KERNEL);
+}
+
+static inline void jent_zfree(void *ptr, size_t len)
+{
+	if (!ptr)
+		return;
+	memzero_explicit(ptr, len);
+	kvfree(ptr);
+}
+
+#else /* __KERNEL__ */
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -305,5 +343,7 @@ static inline void jent_zfree(void *ptr, size_t len)
 
 #undef JENT_IS_POWER_OF_2
 #undef JENT_BUILD_BUG_ON
+
+#endif /* __KERNEL__ */
 
 #endif /* _JITTERENTROPY_ARCH_MEMORY_H */

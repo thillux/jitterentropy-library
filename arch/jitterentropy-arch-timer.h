@@ -67,6 +67,14 @@
 #ifndef _JITTERENTROPY_ARCH_TIMER_H
 #define _JITTERENTROPY_ARCH_TIMER_H
 
+#ifdef __KERNEL__
+
+#include <linux/types.h>
+#include <linux/timex.h>	/* random_get_entropy() */
+#define JENT_ARCH_TIMER_KERNEL
+
+#else /* __KERNEL__ */
+
 #include <stdint.h>
 
 #if (defined(_MSC_VER) || defined(__MINGW32__)) && \
@@ -130,9 +138,21 @@
 # endif
 #endif
 
+#endif /* __KERNEL__ */
+
 static inline void jent_get_nstime(uint64_t *out)
 {
-#if defined(JENT_ARCH_TIMER_WINDOWS_QPC)
+#if defined(JENT_ARCH_TIMER_KERNEL)
+
+	/*
+	 * In the kernel the canonical high-resolution timestamp for entropy
+	 * gathering is random_get_entropy(), which resolves to get_cycles()
+	 * (e.g. RDTSC on x86, the cycle/virtual counter on arm64, ...) where
+	 * a cycle counter exists.
+	 */
+	*out = (uint64_t)random_get_entropy();
+
+#elif defined(JENT_ARCH_TIMER_WINDOWS_QPC)
 
 	LARGE_INTEGER ticks;
 	QueryPerformanceCounter(&ticks);

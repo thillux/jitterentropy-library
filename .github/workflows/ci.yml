@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Builds the kernel module, the glibc and musl userspace libraries, the
+# userspace status tool and the Windows (mingw-w64) cross build, and runs the
+# NixOS VM test. Everything is driven through the flake so the same commands
+# reproduce locally.
+
+jobs:
+  nix-build:
+    name: "build ${{ matrix.attr }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        attr:
+          - jitterentropy             # core library, glibc (+ runtime smoke test)
+          - jitterentropy-musl        # core library, musl (+ runtime smoke test)
+          - jitterentropy-cmake       # core library + tools via the CMake build
+          - jitterentropy-openssl     # external crypto backend: OpenSSL
+          - jitterentropy-gcrypt      # external crypto backend: libgcrypt
+          - jitterentropy-awslc       # external crypto backend: AWS-LC
+          - jitterentropy-mingw       # core library, Windows cross build (mingw-w64)
+          - jitterentropy-status      # userspace status tool/library, glibc
+          - jitterentropy-status-musl # userspace status tool/library, musl
+          - kernel-module             # out-of-tree Linux kernel module
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Build .#${{ matrix.attr }}
+        run: nix build -L --print-build-logs ".#${{ matrix.attr }}"
+
+  vm-test:
+    name: "NixOS VM test (load module + tools)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # NixOS VM tests boot QEMU; expose /dev/kvm to the build user for speed.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Run NixOS VM test
+        run: nix build -L --print-build-logs .#checks.x86_64-linux.vm-test

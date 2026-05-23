@@ -59,6 +59,126 @@
 #ifndef _JITTERENTROPY_ARCH_CACHE_H
 #define _JITTERENTROPY_ARCH_CACHE_H
 
+#ifdef __KERNEL__
+
+#include <linux/types.h>
+
+/*
+ * On x86 the data and unified cache sizes are read directly with CPUID leaf 4
+ * (deterministic cache parameters) via the kernel's cpuid_count() helper. This
+ * is module-safe: unlike the generic cacheinfo subsystem (get_cpu_cacheinfo()),
+ * it does not depend on a symbol that is unexported to modules.
+ *
+ * On arm/arm64 (and any other architecture) the in-kernel build falls back to
+ * the library's built-in default memory size (jent_cache_size_roundup()
+ * returning 0): get_cpu_cacheinfo() is not exported to modules and reading the
+ * cache-geometry system registers (CCSIDR_EL1 and friends, including the
+ * FEAT_CCIDX format variations) directly from a module is error prone.
+ */
+#if defined(__x86_64__) || defined(__i386__)
+# include <asm/processor.h>	/* cpuid_count() */
+# define JENT_ARCH_CACHE_KERNEL_X86
+#endif
+
+static inline uint32_t jent_cache_size_to_memory(long l1, long l2, long l3,
+						 int all_caches)
+{
+	uint32_t cache_size = 0;
+
+	if (l1 > 0)
+		cache_size += (uint32_t)l1;
+	if (all_caches) {
+		if (l2 > 0)
+			cache_size += (uint32_t)l2;
+		if (l3 > 0)
+			cache_size += (uint32_t)l3;
+	}
+
+	/* Force the output_size to be of the form (bounding_power_of_2 - 1). */
+	cache_size |= (cache_size >> 1);
+	cache_size |= (cache_size >> 2);
+	cache_size |= (cache_size >> 4);
+	cache_size |= (cache_size >> 8);
+	cache_size |= (cache_size >> 16);
+
+	return cache_size;
+}
+
+#ifdef JENT_ARCH_CACHE_KERNEL_X86
+/*
+ * Read the data (type 1) and unified (type 3) cache sizes from CPUID leaf 4.
+ * Total size = (ways) * (partitions) * (line_size) * (sets). See the userspace
+ * BSD CPUID path below for the bit-field documentation.
+ */
+static inline void jent_get_cachesize_cpuid(long *l1, long *l2, long *l3)
+{
+	unsigned int sub;
+
+	*l1 = 0;
+	*l2 = 0;
+	*l3 = 0;
+
+	for (sub = 0; sub < 16; sub++) {
+		unsigned int eax, ebx, ecx, edx;
+		unsigned int cache_type, cache_level;
+		unsigned int ways, partitions, line_size, sets;
+		long size;
+
+		cpuid_count(4, sub, &eax, &ebx, &ecx, &edx);
+
+		cache_type = eax & 0x1F;
+		if (cache_type == 0)
+			break;
+
+		/* Only data (1) and unified (3) caches matter here. */
+		if (cache_type != 1 && cache_type != 3)
+			continue;
+
+		cache_level = (eax >> 5) & 0x7;
+		ways        = ((ebx >> 22) & 0x3FF) + 1;
+		partitions  = ((ebx >> 12) & 0x3FF) + 1;
+		line_size   = (ebx & 0xFFF) + 1;
+		sets        = ecx + 1;
+		size = (long)ways * (long)partitions *
+		       (long)line_size * (long)sets;
+
+		if (cache_level == 1 && cache_type == 1 && *l1 == 0)
+			*l1 = size;
+		else if (cache_level == 2 && *l2 == 0)
+			*l2 = size;
+		else if (cache_level == 3 && *l3 == 0)
+			*l3 = size;
+	}
+}
+#endif /* JENT_ARCH_CACHE_KERNEL_X86 */
+
+static inline uint32_t jent_cache_size_roundup(int all_caches)
+{
+#ifdef JENT_ARCH_CACHE_KERNEL_X86
+	long l1 = 0, l2 = 0, l3 = 0;
+	uint32_t cache_size;
+
+	jent_get_cachesize_cpuid(&l1, &l2, &l3);
+
+	cache_size = jent_cache_size_to_memory(l1, l2, l3, all_caches);
+	if (cache_size == 0)
+		return 0;
+
+	/*
+	 * Make the output_size the smallest power of 2 strictly greater
+	 * than cache_size.
+	 */
+	cache_size++;
+
+	return cache_size;
+#else
+	(void)all_caches;
+	return 0;
+#endif
+}
+
+#else /* __KERNEL__ */
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -496,5 +616,7 @@ static inline uint32_t jent_cache_size_roundup(int all_caches)
 }
 
 #endif
+
+#endif /* __KERNEL__ */
 
 #endif /* _JITTERENTROPY_ARCH_CACHE_H */
