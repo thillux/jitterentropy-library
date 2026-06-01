@@ -1,0 +1,47 @@
+# Out-of-tree bsd.kmod.mk Makefile for the jitterentropy FreeBSD KLD.
+#
+# Mirrors Makefile.kernel (which targets Linux kbuild). Only the
+# loadable-module build path is supported; this file is meant to be
+# invoked from a checkout of the library, not dropped into a kernel
+# source tree.
+#
+# Usage:
+#   make -f Makefile.kernel.freebsd            # build jitterentropy.ko
+#   make -f Makefile.kernel.freebsd clean
+#   make -f Makefile.kernel.freebsd install    # install into /boot/modules
+#
+# Requires FreeBSD's make(1) (BSD make / bmake), not GNU make.
+
+KMOD =	jitterentropy
+
+SRCS =	jitterentropy-kmod.c \
+	jitterentropy-base.c \
+	jitterentropy-gcd.c \
+	jitterentropy-health.c \
+	jitterentropy-noise.c \
+	jitterentropy-sha3.c \
+	jitterentropy-status.c \
+	jitterentropy-timer.c
+
+# Pick the shim out of freebsd-kmod/ and the library sources out of src/.
+.PATH:	${.CURDIR}/freebsd-kmod ${.CURDIR}/src
+
+CFLAGS+=	-I${.CURDIR}
+CFLAGS+=	-I${.CURDIR}/src
+CFLAGS+=	-I${.CURDIR}/arch
+CFLAGS+=	-DJENT_CONF_ENABLE_INTERNAL_TIMER
+
+# The library mandates -O0 (see the #error in src/jitterentropy-base.c).
+# Apply per-file only -- at -O0 the constant-constraint inline asm in
+# kernel macros (KASSERT, copyin/copyout helpers, ...) used by the shim
+# may stop satisfying its constraints. The shim therefore keeps the
+# kernel's normal optimization level.
+CFLAGS.jitterentropy-base.c+=	-O0
+CFLAGS.jitterentropy-gcd.c+=	-O0
+CFLAGS.jitterentropy-health.c+=	-O0
+CFLAGS.jitterentropy-noise.c+=	-O0
+CFLAGS.jitterentropy-sha3.c+=	-O0
+CFLAGS.jitterentropy-status.c+=	-O0
+CFLAGS.jitterentropy-timer.c+=	-O0
+
+.include <bsd.kmod.mk>

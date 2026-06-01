@@ -67,7 +67,16 @@
 #ifndef _JITTERENTROPY_ARCH_TIMER_H
 #define _JITTERENTROPY_ARCH_TIMER_H
 
-#include <stdint.h>
+#ifdef __KERNEL__
+# include <linux/types.h>
+# include <linux/ktime.h>
+#elif defined(_KERNEL) && defined(__FreeBSD__)
+# include <sys/types.h>
+/* get_cyclecount() declaration arrives via <sys/systm.h>, which is
+ * pulled in by jitterentropy.h above. */
+#else
+# include <stdint.h>
+#endif
 
 #if (defined(_MSC_VER) || defined(__MINGW32__)) && \
     (defined(_M_ARM) || defined(_M_ARM64))
@@ -80,7 +89,15 @@
 # define JENT_ARCH_TIMER_X86
 # if defined(_MSC_VER)
 #  include <intrin.h>
-# else
+# elif !defined(__KERNEL__) && \
+       !(defined(_KERNEL) && defined(__FreeBSD__)) && \
+       !defined(JENT_BAREMETAL) && \
+       !(defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+/*
+ * In a kernel or baremetal build <x86intrin.h> is not on the include
+ * path; __rdtsc() is still available as a GCC/Clang builtin without
+ * any header (see jent_get_nstime below).
+ */
 #  include <x86intrin.h>
 # endif
 
@@ -124,9 +141,14 @@
 
 #else /* generic fallback */
 # define JENT_ARCH_TIMER_GENERIC
-# include <time.h>
-# ifdef __MACH__
-#  include <mach/mach_time.h>
+# if !defined(__KERNEL__) && \
+     !(defined(_KERNEL) && defined(__FreeBSD__)) && \
+     !defined(JENT_BAREMETAL) && \
+     !(defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+#  include <time.h>
+#  ifdef __MACH__
+#   include <mach/mach_time.h>
+#  endif
 # endif
 #endif
 
@@ -140,7 +162,20 @@ static inline void jent_get_nstime(uint64_t *out)
 
 #elif defined(JENT_ARCH_TIMER_X86)
 
+# if defined(__KERNEL__) || \
+     (defined(_KERNEL) && defined(__FreeBSD__)) || \
+     defined(JENT_BAREMETAL) || \
+     (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+	/*
+	 * __rdtsc() is exposed by <x86intrin.h> in userspace; that header
+	 * is not on the include path of kernel-module or baremetal /
+	 * GNU-EFI builds, but the underlying GCC / Clang builtin is
+	 * always available.
+	 */
+	*out = (uint64_t)__builtin_ia32_rdtsc();
+# else
 	*out = (uint64_t)__rdtsc();
+# endif
 
 #elif defined(JENT_ARCH_TIMER_AARCH64_APPLE)
 
@@ -200,7 +235,18 @@ static inline void jent_get_nstime(uint64_t *out)
 
 #else /* JENT_ARCH_TIMER_GENERIC */
 
-# ifdef __MACH__
+# ifdef __KERNEL__
+	*out = (uint64_t)ktime_get_ns();
+# elif defined(_KERNEL) && defined(__FreeBSD__)
+	*out = (uint64_t)get_cyclecount();
+# elif defined(JENT_BAREMETAL) || \
+       (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+	/* x86 and aarch64 have already been handled above; baremetal on
+	 * any other architecture lands here with no portable cycle
+	 * counter. The entropy collector's init self-test will fail and
+	 * the caller can decide what to do. */
+	*out = 0;
+# elif defined(__MACH__)
 	/*
 	 * macOS lacks clock_gettime on older releases. Taken from
 	 * http://developer.apple.com/library/mac/qa/qa1398/_index.html

@@ -48,9 +48,13 @@
 extern "C" {
 #endif
 
+#ifndef BUILD_BUG_ON
 #define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
+#endif
 
+#ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
 
 #ifndef JENT_STUCK_INIT_THRES
 /*

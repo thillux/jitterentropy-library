@@ -1,0 +1,71 @@
+# Out-of-tree kbuild Makefile for the jitterentropy kernel module.
+#
+# Only the loadable-module build path is supported. There is no
+# in-tree integration (no Kconfig, no obj-y); this is meant to be
+# invoked from a checkout of the library, not dropped into a kernel
+# source tree.
+#
+# Usage:
+#   make -f Makefile.kernel                   # build jitterentropy.ko
+#   make -f Makefile.kernel clean
+#   make -f Makefile.kernel modules_install   # install into /lib/modules
+#
+# Override KDIR to build against a kernel tree other than the running one:
+#   make -f Makefile.kernel KDIR=/path/to/linux
+#
+# kbuild reads $(M)/Kbuild (the small companion file next to this one),
+# which simply pulls this file back in so all module rules live here.
+
+ifneq ($(KERNELRELEASE),)
+
+# -------- kbuild context: building the module from inside the kernel build --
+
+obj-m := jitterentropy.o
+
+jitterentropy-y := \
+	linux-kmod/jitterentropy-kmod.o \
+	src/jitterentropy-base.o \
+	src/jitterentropy-gcd.o \
+	src/jitterentropy-health.o \
+	src/jitterentropy-noise.o \
+	src/jitterentropy-sha3.o \
+	src/jitterentropy-status.o \
+	src/jitterentropy-timer.o
+
+ccflags-y := \
+	-I$(src) -I$(src)/src -I$(src)/arch \
+	-DJENT_CONF_ENABLE_INTERNAL_TIMER
+
+# The library mandates -O0 (see the #error in src/jitterentropy-base.c).
+# Apply it only to the library sources, NOT globally: at -O0 the
+# constant-constraint inline asm in kernel macros (WARN_ON_ONCE,
+# copy_to_user, ...) used by the shim no longer satisfies its
+# constraints. The shim therefore keeps the kernel's normal
+# optimization level.
+CFLAGS_src/jitterentropy-base.o   := -O0
+CFLAGS_src/jitterentropy-gcd.o    := -O0
+CFLAGS_src/jitterentropy-health.o := -O0
+CFLAGS_src/jitterentropy-noise.o  := -O0
+CFLAGS_src/jitterentropy-sha3.o   := -O0
+CFLAGS_src/jitterentropy-status.o := -O0
+CFLAGS_src/jitterentropy-timer.o  := -O0
+
+else
+
+# -------- user-facing context: dispatch into the kernel build system --------
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD  := $(CURDIR)
+
+.PHONY: all clean modules_install
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+modules_install:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
+
+endif

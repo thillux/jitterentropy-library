@@ -70,6 +70,60 @@
 #ifndef _JITTERENTROPY_ARCH_SCHED_H
 #define _JITTERENTROPY_ARCH_SCHED_H
 
+#ifdef __KERNEL__
+
+# include <linux/sched.h>
+
+/*
+ * cpu_relax() is the kernel's CPU-pause hint (same pause/yield
+ * instructions used in userspace); cond_resched() lets the scheduler
+ * swap us out if a higher-priority task is waiting. The notime
+ * busy-wait calls this on every spin, but the read paths are sleepable
+ * (misc cdev read, hwrng fill thread).
+ */
+static inline void jent_yield(void)
+{
+	cpu_relax();
+	cond_resched();
+}
+
+#elif defined(_KERNEL) && defined(__FreeBSD__)
+
+# include <machine/cpu.h>
+
+/*
+ * cpu_spinwait() emits the architecture's pause/yield hint. The
+ * FreeBSD scheduler preempts us normally on its own ticks, so no
+ * explicit kern_yield() is needed in this tight spin.
+ */
+static inline void jent_yield(void)
+{
+	cpu_spinwait();
+}
+
+#elif defined(JENT_BAREMETAL) || \
+      (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+
+/*
+ * Baremetal: no scheduler to yield to, just emit the architecture's
+ * pause/yield hint to ease SMT contention on the spin.
+ */
+static inline void jent_yield(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+	__asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__) || \
+      (defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 7)
+	__asm__ __volatile__("yield" ::: "memory");
+#elif defined(__powerpc) || defined(__powerpc__)
+	__asm__ __volatile__("or 27,27,27" ::: "memory");
+#else
+	__asm__ __volatile__("" ::: "memory");
+#endif
+}
+
+#else /* hosted userspace */
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 # include <windows.h>
 # define JENT_ARCH_SCHED_OS_WINDOWS
@@ -110,5 +164,7 @@ static inline void jent_yield(void)
 	(void)sched_yield();
 #endif
 }
+
+#endif /* any kernel vs userspace */
 
 #endif /* _JITTERENTROPY_ARCH_SCHED_H */

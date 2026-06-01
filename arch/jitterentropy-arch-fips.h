@@ -58,6 +58,49 @@
 #ifndef _JITTERENTROPY_ARCH_FIPS_H
 #define _JITTERENTROPY_ARCH_FIPS_H
 
+#ifdef __KERNEL__
+
+/*
+ * Do NOT pull in <linux/fips.h>: when CONFIG_CRYPTO_FIPS is disabled it
+ * exposes "fips_enabled" as a #define to the integer literal 0, which
+ * then clashes with struct rand_data's bitfield member of the same
+ * name. Forward-declare the extern ourselves under CONFIG_CRYPTO_FIPS
+ * and stub to 0 otherwise.
+ */
+# include <linux/kconfig.h>
+# ifdef CONFIG_CRYPTO_FIPS
+extern int fips_enabled;
+# endif
+
+static inline int jent_fips_enabled(void)
+{
+# ifdef CONFIG_CRYPTO_FIPS
+	return fips_enabled;
+# else
+	return 0;
+# endif
+}
+
+#elif defined(_KERNEL) && defined(__FreeBSD__)
+
+/* FreeBSD has no runtime FIPS-mode switch comparable to the Linux
+ * /proc/sys/crypto/fips_enabled file -- always report disabled. */
+static inline int jent_fips_enabled(void)
+{
+	return 0;
+}
+
+#elif defined(JENT_BAREMETAL) || \
+      (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+
+/* No runtime FIPS switch in baremetal / pre-OS firmware. */
+static inline int jent_fips_enabled(void)
+{
+	return 0;
+}
+
+#else /* hosted userspace */
+
 #if !defined(LIBGCRYPT) && !defined(AWSLC) && !defined(OPENSSL) && \
     !defined(_MSC_VER) && !defined(__MINGW32__)
 # include <errno.h>
@@ -97,5 +140,7 @@ static inline int jent_fips_enabled(void)
 #undef FIPS_MODE_SWITCH_FILE
 #endif
 }
+
+#endif /* any kernel vs userspace */
 
 #endif /* _JITTERENTROPY_ARCH_FIPS_H */

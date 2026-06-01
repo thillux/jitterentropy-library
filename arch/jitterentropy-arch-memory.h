@@ -70,6 +70,36 @@
 #ifndef _JITTERENTROPY_ARCH_MEMORY_H
 #define _JITTERENTROPY_ARCH_MEMORY_H
 
+#ifdef __KERNEL__
+
+# include <linux/slab.h>
+# include <linux/string.h>
+# include <linux/vmalloc.h>
+
+#elif defined(_KERNEL) && defined(__FreeBSD__)
+
+# include <sys/types.h>
+# include <sys/systm.h>
+# include <sys/malloc.h>
+
+/*
+ * Per-module memory type. Declared here so every translation unit
+ * that pulls jent_zalloc / jent_zfree in via the static inlines below
+ * sees the extern; MALLOC_DEFINE lives once in the FreeBSD kmod shim.
+ */
+MALLOC_DECLARE(M_JITTERENTROPY);
+
+#elif defined(JENT_BAREMETAL) || \
+      (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+
+/* Freestanding / baremetal: only stddef + stdint (both in the
+ * compiler's freestanding header set). The allocator/wipe primitives
+ * cannot be inline here -- whoever is hosting us provides them. */
+# include <stddef.h>
+# include <stdint.h>
+
+#else /* hosted userspace */
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -98,6 +128,8 @@
 # define JENT_ARCH_MEM_POSIX_MLOCK
 #endif
 
+#endif /* __KERNEL__ */
+
 /* Override this if you want to allocate more than 2 MB of secure memory */
 #ifndef JENT_SECURE_MEMORY_SIZE_MAX
 # define JENT_SECURE_MEMORY_SIZE_MAX 2097152
@@ -105,6 +137,71 @@
 
 #define JENT_BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
 #define JENT_IS_POWER_OF_2(n) (JENT_BUILD_BUG_ON((n & (n - 1)) != 0))
+
+/*
+ * Memory the noise source allocates for the cache-miss loop can be
+ * many MB; on Linux kvzalloc keeps small allocations in the slab and
+ * falls back to vmalloc for larger sizes, and on FreeBSD malloc(9)
+ * with M_WAITOK serves the same purpose. Pages locked into RAM are
+ * inherent in either kernel, so we advertise secure memory there.
+ */
+#ifdef __KERNEL__
+
+# define CONFIG_CRYPTO_CPU_JITTERENTROPY_SECURE_MEMORY
+
+static inline void jent_memset_secure(void *s, size_t n)
+{
+	memzero_explicit(s, n);
+}
+
+static inline void *jent_zalloc(size_t len)
+{
+	return kvzalloc(len, GFP_KERNEL);
+}
+
+static inline void jent_zfree(void *ptr, size_t len)
+{
+	if (!ptr)
+		return;
+	memzero_explicit(ptr, len);
+	kvfree(ptr);
+}
+
+#elif defined(_KERNEL) && defined(__FreeBSD__)
+
+# define CONFIG_CRYPTO_CPU_JITTERENTROPY_SECURE_MEMORY
+
+static inline void jent_memset_secure(void *s, size_t n)
+{
+	explicit_bzero(s, n);
+}
+
+static inline void *jent_zalloc(size_t len)
+{
+	return malloc(len, M_JITTERENTROPY, M_WAITOK | M_ZERO);
+}
+
+static inline void jent_zfree(void *ptr, size_t len)
+{
+	if (!ptr)
+		return;
+	explicit_bzero(ptr, len);
+	free(ptr, M_JITTERENTROPY);
+}
+
+#elif defined(JENT_BAREMETAL) || \
+      (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+
+/*
+ * Freestanding: the host application (e.g. the GNU-EFI shim under
+ * efi/) provides the allocator and the secure-wipe routine. The
+ * library links against these symbols.
+ */
+extern void *jent_zalloc(size_t len);
+extern void  jent_zfree(void *ptr, size_t len);
+extern void  jent_memset_secure(void *s, size_t n);
+
+#else /* hosted userspace */
 
 static inline void jent_memset_secure(void *s, size_t n)
 {
@@ -302,6 +399,8 @@ static inline void jent_zfree(void *ptr, size_t len)
 
 #endif
 }
+
+#endif /* __KERNEL__ */
 
 #undef JENT_IS_POWER_OF_2
 #undef JENT_BUILD_BUG_ON

@@ -21,7 +21,12 @@
 #include "jitterentropy-base.h"
 #include "jitterentropy-internal.h"
 
+#if !defined(__KERNEL__) && \
+    !(defined(_KERNEL) && defined(__FreeBSD__)) && \
+    !defined(JENT_BAREMETAL) && \
+    !(defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
 #include <stdio.h>
+#endif
 
 /*
  * Always validate the output with something like "jq -e .", when doing changes here.

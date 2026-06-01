@@ -54,10 +54,17 @@ static inline void le64_to_ptr(uint8_t *p, const uint64_t value)
 	le32_to_ptr(p,     (uint32_t)(value));
 }
 
+#ifndef __KERNEL__
+/*
+ * The kernel already exports an inline rol64 from <linux/bitops.h>
+ * with the same semantics; reuse it there to avoid a redefinition
+ * error.
+ */
 static inline uint64_t rol64(uint64_t x, int n)
 {
 	return ( (x << (n&(64-1))) | (x >> ((64-n)&(64-1))) );
 }
+#endif
 
 /*********************************** Keccak ***********************************/
 /* state[x + y*5] */

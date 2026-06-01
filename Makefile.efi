@@ -1,0 +1,108 @@
+# Out-of-tree Makefile for the small GNU-EFI demo binary.
+#
+# Builds a freestanding (-ffreestanding) UEFI application that links
+# the jitterentropy library and prints 32 random bytes over the EFI
+# console. The library is compiled in baremetal mode (JENT_BAREMETAL);
+# the EFI shim in efi/freestanding.c backs jent_zalloc / jent_zfree /
+# jent_memset_secure with EFI boot-services and supplies memcpy /
+# memset / strlen so gcc has them at link time.
+#
+# Usage:
+#   make -f Makefile.efi                          # build jitterentropy.efi
+#   make -f Makefile.efi clean
+#   make -f Makefile.efi EFI_PREFIX=/usr/local    # custom gnu-efi prefix
+#   make -f Makefile.efi ARCH=aarch64             # cross-targeted build
+#
+# EFI_PREFIX must point at a gnu-efi install holding:
+#   $EFI_PREFIX/include/efi/{,$ARCH,protocol}/*.h
+#   $EFI_PREFIX/lib/{libefi.a,libgnuefi.a,crt0-efi-$ARCH.o,elf_$ARCH_efi.lds}
+
+ARCH       ?= x86_64
+EFI_PREFIX ?= /usr
+EFI_INCDIR ?= $(EFI_PREFIX)/include/efi
+EFI_LIBDIR ?= $(EFI_PREFIX)/lib
+
+CC      ?= gcc
+LD      ?= ld
+OBJCOPY ?= objcopy
+
+CRT0 := $(EFI_LIBDIR)/crt0-efi-$(ARCH).o
+LDS  := $(EFI_LIBDIR)/elf_$(ARCH)_efi.lds
+
+CPPFLAGS := \
+	-I. -Isrc -Iarch \
+	-I$(EFI_INCDIR) \
+	-I$(EFI_INCDIR)/$(ARCH) \
+	-I$(EFI_INCDIR)/protocol \
+	-DJENT_BAREMETAL \
+	-DJENT_CONF_ENABLE_INTERNAL_TIMER \
+	-DEFI_FUNCTION_WRAPPER
+
+CFLAGS_COMMON := \
+	-ffreestanding \
+	-fno-stack-protector \
+	-fno-strict-aliasing \
+	-fPIC \
+	-fshort-wchar \
+	-mno-red-zone \
+	-Wall -Wno-unused-parameter
+
+LDFLAGS := \
+	-nostdlib \
+	-znocombreloc \
+	-T $(LDS) \
+	-shared \
+	-Bsymbolic \
+	-L$(EFI_LIBDIR) \
+	$(CRT0)
+
+LIBS := -lefi -lgnuefi $(shell $(CC) -print-libgcc-file-name)
+
+# The library mandates -O0 (see the #error in src/jitterentropy-base.c);
+# the EFI shim itself compiles at -O2.
+LIB_OBJS := \
+	src/jitterentropy-base.o \
+	src/jitterentropy-gcd.o \
+	src/jitterentropy-health.o \
+	src/jitterentropy-noise.o \
+	src/jitterentropy-sha3.o \
+	src/jitterentropy-timer.o
+
+SHIM_OBJS := \
+	efi/jitterentropy-efi.o \
+	efi/freestanding.o
+
+OBJS := $(LIB_OBJS) $(SHIM_OBJS)
+
+.PHONY: all clean
+
+all: jitterentropy.efi
+
+$(LIB_OBJS): %.o: %.c
+	$(CC) $(CPPFLAGS) $(CFLAGS_COMMON) -O0 -c -o $@ $<
+
+$(SHIM_OBJS): %.o: %.c
+	$(CC) $(CPPFLAGS) $(CFLAGS_COMMON) -O2 -c -o $@ $<
+
+jitterentropy.so: $(OBJS)
+	$(LD) $(LDFLAGS) $^ -o $@ $(LIBS)
+
+# Convert the ELF shared object emitted by ld(1) into a PE-COFF EFI
+# application. The legacy "--target=efi-app-<arch>" alias has been
+# dropped from recent binutils (2.43+); the modern spelling explicitly
+# sets the ELF input format, the PE output format, and the EFI
+# application subsystem (PE subsystem 10).
+# objcopy spells the bfd target with a hyphen (pei-x86-64), so transform
+# the underscore form ARCH uses (x86_64).
+PEI_TARGET := pei-$(subst _,-,$(ARCH))
+
+jitterentropy.efi: jitterentropy.so
+	$(OBJCOPY) \
+		-I elf64-$(subst _,-,$(ARCH)) -O $(PEI_TARGET) \
+		--subsystem efi-app \
+		-j .text -j .sdata -j .data -j .dynamic \
+		-j .dynsym -j .rel -j .rela -j .reloc \
+		$< $@
+
+clean:
+	$(RM) $(OBJS) jitterentropy.so jitterentropy.efi

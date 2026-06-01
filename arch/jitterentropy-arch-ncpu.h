@@ -78,6 +78,37 @@
 #ifndef _JITTERENTROPY_ARCH_NCPU_H
 #define _JITTERENTROPY_ARCH_NCPU_H
 
+#ifdef __KERNEL__
+
+# include <linux/smp.h>
+
+static inline long jent_ncpu(void)
+{
+	return (long)num_online_cpus();
+}
+
+#elif defined(_KERNEL) && defined(__FreeBSD__)
+
+# include <sys/smp.h>
+
+static inline long jent_ncpu(void)
+{
+	return (long)mp_ncpus;
+}
+
+#elif defined(JENT_BAREMETAL) || \
+      (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+
+/* Baremetal / pre-OS firmware (GNU-EFI is single-threaded from our
+ * perspective): report a single CPU so the notime timer thread stays
+ * disabled. */
+static inline long jent_ncpu(void)
+{
+	return 1;
+}
+
+#else /* hosted userspace */
+
 #include <errno.h>
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -216,5 +247,7 @@ static inline long jent_ncpu(void)
 	return 1;
 #endif
 }
+
+#endif /* any kernel vs userspace */
 
 #endif /* _JITTERENTROPY_ARCH_NCPU_H */

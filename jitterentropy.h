@@ -49,6 +49,94 @@
  * Compilation for OpenSSL    #define OPENSSL
  */
 
+#ifdef __KERNEL__
+
+/*
+ * Freestanding Linux kernel build. Pull in the kernel equivalents of
+ * the userspace headers below and polyfill the few fixed-width
+ * constant macros the library uses (UINT32_C / UINT64_C / UINT32_MAX /
+ * UINT64_MAX are stdint.h territory and are not provided by
+ * <linux/types.h>; we map the *_MAX names onto the kernel's U*_MAX).
+ */
+# include <linux/types.h>
+# include <linux/kernel.h>
+# include <linux/string.h>
+# include <linux/errno.h>
+# include <linux/limits.h>
+# ifndef UINT32_C
+#  define UINT32_C(x) (x ## U)
+# endif
+# ifndef UINT64_C
+#  define UINT64_C(x) (x ## ULL)
+# endif
+# ifndef UINT32_MAX
+#  define UINT32_MAX U32_MAX
+# endif
+# ifndef UINT64_MAX
+#  define UINT64_MAX U64_MAX
+# endif
+
+#elif defined(_KERNEL) && defined(__FreeBSD__)
+
+/*
+ * Freestanding FreeBSD kernel build. <sys/stdint.h> provides the
+ * fixed-width types and UINT*_C / UINT*_MAX macros; <sys/systm.h>
+ * brings snprintf, bcopy/memcpy, printf, panic, and friends.
+ */
+# include <sys/param.h>
+# include <sys/types.h>
+# include <sys/systm.h>
+# include <sys/stdint.h>
+# include <sys/limits.h>
+# include <sys/errno.h>
+
+#elif defined(JENT_BAREMETAL) || \
+      (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+
+/*
+ * Freestanding / baremetal build (e.g. GNU-EFI). <stdint.h> and
+ * <stddef.h> are part of the C99 freestanding header set, so the
+ * compiler ships them even when -ffreestanding is in effect. The
+ * host application must provide jent_zalloc / jent_zfree /
+ * jent_memset_secure (see arch/jitterentropy-arch-memory.h) plus the
+ * usual memcpy / memset symbols the compiler may emit calls to.
+ */
+# include <stdint.h>
+# include <stddef.h>
+
+typedef long ssize_t;
+
+/* Subset of errno codes the library returns. The values match Linux
+ * (the most common consumer) but are only used internally; the host
+ * application never has to interpret them. */
+# ifndef EAGAIN
+#  define EAGAIN  11
+# endif
+# ifndef ENOMEM
+#  define ENOMEM  12
+# endif
+# ifndef EINVAL
+#  define EINVAL  22
+# endif
+# ifndef ENOENT
+#  define ENOENT  2
+# endif
+
+/*
+ * Forward declarations for the string-manipulation primitives the
+ * library uses. <string.h> is not part of the C99 freestanding header
+ * set, so we cannot rely on it being present; the host environment
+ * must provide these symbols at link time (gnu-efi's libefi.a ships
+ * memcpy / memset, and our shim defines strlen).
+ */
+extern void  *memcpy(void *dst, const void *src, size_t n);
+extern void  *memset(void *dst, int c, size_t n);
+extern int    memcmp(const void *a, const void *b, size_t n);
+extern void  *memmove(void *dst, const void *src, size_t n);
+extern size_t strlen(const char *s);
+
+#else /* hosted userspace */
+
 /* used for sched_getaffinity and CPU_* macros */
 #ifdef __linux__
 	#define _GNU_SOURCE
@@ -79,6 +167,8 @@ typedef int64_t ssize_t;
 # include <mach/mach_time.h>
 # include <unistd.h>
 #endif
+
+#endif /* __KERNEL__ */
 
 /*
  * Architecture- and OS-specific helpers (timestamp, secure memory, cache

@@ -59,6 +59,219 @@
 #ifndef _JITTERENTROPY_ARCH_CACHE_H
 #define _JITTERENTROPY_ARCH_CACHE_H
 
+/*
+ * Common helper used by every back-end below: sum the per-level cache
+ * sizes and round to the next-higher power-of-two minus one (the
+ * caller then increments by one to get the power of two).
+ */
+static inline uint32_t jent_cache_size_to_memory(long l1, long l2, long l3,
+						 int all_caches)
+{
+	uint32_t cache_size = 0;
+
+	if (l1 > 0)
+		cache_size += (uint32_t)l1;
+	if (all_caches) {
+		if (l2 > 0)
+			cache_size += (uint32_t)l2;
+		if (l3 > 0)
+			cache_size += (uint32_t)l3;
+	}
+
+	/* (bounding_power_of_2 - 1) */
+	cache_size |= (cache_size >> 1);
+	cache_size |= (cache_size >> 2);
+	cache_size |= (cache_size >> 4);
+	cache_size |= (cache_size >> 8);
+	cache_size |= (cache_size >> 16);
+
+	return cache_size;
+}
+
+#if defined(__KERNEL__)                                              || \
+    (defined(_KERNEL) && defined(__FreeBSD__))                       || \
+    defined(JENT_BAREMETAL)                                          || \
+    (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+
+/*
+ * Freestanding back-ends: kernel module (Linux / FreeBSD) or
+ * baremetal. The userspace paths (sysconf, sysfs, CPUID via
+ * <cpuid.h>, Windows GetLogicalProcessorInformation, ...) are
+ * either unreachable here or pull in unavailable headers, so we
+ * implement the architectures we can do entirely from inline asm
+ * and fall back to 0 elsewhere.
+ */
+
+#if defined(__x86_64__) || defined(__i386__)
+
+/*
+ * CPUID leaf 4 (deterministic cache parameters); same fields as the
+ * userspace BSD path, but inline asm so we don't need <cpuid.h>.
+ *
+ *   EAX[ 4: 0]  cache type (1 = data, 2 = instruction, 3 = unified)
+ *   EAX[ 7: 5]  cache level (1, 2, 3, ...)
+ *   EBX[11: 0]  L = system coherency line size - 1
+ *   EBX[21:12]  P = physical line partitions - 1
+ *   EBX[31:22]  W = ways of associativity - 1
+ *   ECX         S = number of sets - 1
+ */
+static inline void jent_get_cachesize_cpuid(long *l1, long *l2, long *l3)
+{
+	unsigned int sub;
+
+	*l1 = 0;
+	*l2 = 0;
+	*l3 = 0;
+
+	for (sub = 0; sub < 16; sub++) {
+		unsigned int eax, ebx, ecx, edx;
+		unsigned int cache_type, cache_level;
+		unsigned int ways, partitions, line_size, sets;
+		long size;
+
+#if defined(__i386__) && defined(__PIC__)
+		/* On 32-bit PIC, %ebx is reserved for the GOT; swap it
+		 * around the CPUID instruction. */
+		__asm__ __volatile__(
+			"xchgl %%ebx, %1\n\t"
+			"cpuid\n\t"
+			"xchgl %%ebx, %1"
+			: "=a" (eax), "=&r" (ebx), "=c" (ecx), "=d" (edx)
+			: "0" (4U), "2" (sub));
+#else
+		__asm__ __volatile__("cpuid"
+			: "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
+			: "0" (4U), "2" (sub));
+#endif
+
+		cache_type = eax & 0x1F;
+		if (cache_type == 0)
+			break;
+
+		/* Only data (1) and unified (3) caches are relevant. */
+		if (cache_type != 1 && cache_type != 3)
+			continue;
+
+		cache_level = (eax >> 5) & 0x7;
+		ways        = ((ebx >> 22) & 0x3FF) + 1;
+		partitions  = ((ebx >> 12) & 0x3FF) + 1;
+		line_size   = (ebx & 0xFFF) + 1;
+		sets        = ecx + 1;
+		size = (long)ways * (long)partitions *
+		       (long)line_size * (long)sets;
+
+		if (cache_level == 1 && cache_type == 1 && *l1 == 0)
+			*l1 = size;
+		else if (cache_level == 2 && *l2 == 0)
+			*l2 = size;
+		else if (cache_level == 3 && *l3 == 0)
+			*l3 = size;
+	}
+}
+
+static inline uint32_t jent_cache_size_roundup(int all_caches)
+{
+	long l1 = 0, l2 = 0, l3 = 0;
+	uint32_t cache_size;
+
+	jent_get_cachesize_cpuid(&l1, &l2, &l3);
+	cache_size = jent_cache_size_to_memory(l1, l2, l3, all_caches);
+	if (cache_size == 0)
+		return 0;
+	cache_size++;
+	return cache_size;
+}
+
+#elif defined(__aarch64__)
+
+/*
+ * AArch64: walk CLIDR_EL1, then CSSELR_EL1 / CCSIDR_EL1 for each
+ * data or unified cache level. These registers live at EL1, which
+ * is why the userspace BSD path stubs out aarch64 -- it has no way
+ * to read them. Kernel modules and baremetal run at EL1+ and can.
+ *
+ *   CLIDR_EL1   [3*N+2 : 3*N]  Ctype for level N+1
+ *                   0=none, 1=I-only, 2=D-only, 3=separate I/D,
+ *                   4=unified
+ *   CSSELR_EL1  [3:1]   level (0-indexed)
+ *               [0]     InD: 0 = data/unified, 1 = instruction
+ *   CCSIDR_EL1  [ 2: 0] LineSize = log2(words per line) - 4
+ *               [12: 3] Associativity - 1
+ *               [27:13] NumSets       - 1
+ *
+ * (The optional FEAT_CCIDX layout widens the way / set fields, but
+ * the classic layout used here yields correct sizes for every cache
+ * geometry up to 64 MiB which is well past what jitterentropy ever
+ * needs.)
+ */
+static inline void jent_get_cachesize_ccsidr(long *l1, long *l2, long *l3)
+{
+	unsigned long clidr;
+	long *targets[3];
+	int level;
+
+	targets[0] = l1;
+	targets[1] = l2;
+	targets[2] = l3;
+	*l1 = 0;
+	*l2 = 0;
+	*l3 = 0;
+
+	__asm__ __volatile__("mrs %0, clidr_el1" : "=r" (clidr));
+
+	for (level = 0; level < 3; level++) {
+		unsigned int ctype = (clidr >> (level * 3)) & 0x7;
+		unsigned long csselr, ccsidr;
+		long line_size, ways, sets;
+
+		/* 0 = none, 1 = instruction-only -- skip. 2 = data,
+		 * 3 = separate I/D, 4 = unified all have a usable
+		 * data-side CCSIDR. */
+		if (ctype < 2)
+			continue;
+
+		csselr = ((unsigned long)level) << 1;	/* InD = 0 */
+		__asm__ __volatile__(
+			"msr csselr_el1, %0\n\t"
+			"isb"
+			:: "r" (csselr) : "memory");
+		__asm__ __volatile__("mrs %0, ccsidr_el1" : "=r" (ccsidr));
+
+		line_size = 1L << ((ccsidr & 0x7) + 4);
+		ways      = (long)((ccsidr >>  3) & 0x3FF) + 1;
+		sets      = (long)((ccsidr >> 13) & 0x7FFF) + 1;
+
+		*(targets[level]) = line_size * ways * sets;
+	}
+}
+
+static inline uint32_t jent_cache_size_roundup(int all_caches)
+{
+	long l1 = 0, l2 = 0, l3 = 0;
+	uint32_t cache_size;
+
+	jent_get_cachesize_ccsidr(&l1, &l2, &l3);
+	cache_size = jent_cache_size_to_memory(l1, l2, l3, all_caches);
+	if (cache_size == 0)
+		return 0;
+	cache_size++;
+	return cache_size;
+}
+
+#else
+
+/* No portable cache discovery for this architecture in freestanding
+ * mode; the noise source falls back to JENT_DEFAULT_MEMORY_BITS. */
+static inline uint32_t jent_cache_size_roundup(int all_caches)
+{
+	(void)all_caches;
+	return 0;
+}
+
+#endif /* arch */
+
+#else /* hosted userspace */
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -89,31 +302,6 @@
 # include <sys/systemcfg.h>
 # define JENT_ARCH_CACHE_AIX
 #endif
-
-static inline uint32_t jent_cache_size_to_memory(long l1, long l2, long l3,
-						 int all_caches)
-{
-	uint32_t cache_size = 0;
-
-	/* Cache size reported by system */
-	if (l1 > 0)
-		cache_size += (uint32_t)l1;
-	if (all_caches) {
-		if (l2 > 0)
-			cache_size += (uint32_t)l2;
-		if (l3 > 0)
-			cache_size += (uint32_t)l3;
-	}
-
-	/* Force the output_size to be of the form (bounding_power_of_2 - 1). */
-	cache_size |= (cache_size >> 1);
-	cache_size |= (cache_size >> 2);
-	cache_size |= (cache_size >> 4);
-	cache_size |= (cache_size >> 8);
-	cache_size |= (cache_size >> 16);
-
-	return cache_size;
-}
 
 #if defined(JENT_ARCH_CACHE_LINUX) || defined(JENT_ARCH_CACHE_APPLE)
 
@@ -496,5 +684,7 @@ static inline uint32_t jent_cache_size_roundup(int all_caches)
 }
 
 #endif
+
+#endif /* any kernel vs userspace */
 
 #endif /* _JITTERENTROPY_ARCH_CACHE_H */
