@@ -46,19 +46,54 @@
  * DAMAGE.
  */
 
+/*
+ * MAP_ANONYMOUS, MAP_ANON and madvise()/MADV_DONTDUMP are all __USE_MISC on
+ * glibc, so a strict -std=c11 - which the Makefile uses - hides them. Current
+ * glibc happens to define MAP_ANONYMOUS unconditionally, which is why this was
+ * only noticed on glibc 2.17 (RHEL 7), where neither spelling exists and the
+ * MAP_ANON fallback below expands to an undeclared identifier.
+ *
+ * _DEFAULT_SOURCE is the modern spelling and _BSD_SOURCE the one glibc before
+ * 2.19 understands; both are defined because 2.17 ignores the former and
+ * everything from 2.20 on warns about the latter unless the former is present
+ * too. Defined here rather than in the public jitterentropy.h so the header
+ * imposes no feature-test macro on consumers; they must precede every system
+ * header. Same reasoning as arch/jitterentropy-arch-timer.c.
+ */
+#if defined(__linux__)
+# ifndef _DEFAULT_SOURCE
+#  define _DEFAULT_SOURCE
+# endif
+# ifndef _BSD_SOURCE
+#  define _BSD_SOURCE
+# endif
+#endif
+
 #include "jitterentropy.h"
 #include "jitterentropy-internal.h"
 
 /*
  * Platform detection.
+ *
+ * The POSIX backend is selected from the option macros the platform itself
+ * publishes in <unistd.h>, not from a list of operating systems.
+ *
+ * _POSIX_MEMLOCK_RANGE is required to be strictly positive rather than merely
+ * not -1: a value of 0 means "ask sysconf() at runtime", and since a failed
+ * mlock() makes jent_zalloc() fail the allocation outright, such a platform is
+ * better served by the malloc() path than by an allocator that might refuse
+ * every request.
  */
 #ifdef LINUX_KERNEL
 # define JENT_ARCH_MEM_LINUX_KERNEL
+#elif defined(_MSC_VER) || defined(__MINGW32__)
+# define JENT_ARCH_MEM_WINDOWS
 #else
-# if defined(_MSC_VER) || defined(__MINGW32__)
-#  define JENT_ARCH_MEM_WINDOWS
-# elif defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
-       defined(__NetBSD__) || defined(__APPLE__)
+# include <unistd.h>
+# if defined(_POSIX_MAPPED_FILES) && (_POSIX_MAPPED_FILES - 0) > 0 &&	      \
+     defined(_POSIX_MEMORY_PROTECTION) &&				      \
+     (_POSIX_MEMORY_PROTECTION - 0) > 0 &&				      \
+     defined(_POSIX_MEMLOCK_RANGE) && (_POSIX_MEMLOCK_RANGE - 0) > 0
 #  define JENT_ARCH_MEM_POSIX_MLOCK
 # endif
 #endif
@@ -94,9 +129,6 @@
 
 #endif /* JENT_ARCH_MEM_LINUX_KERNEL */
 
-#define JENT_BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
-#define JENT_IS_POWER_OF_2(n) (JENT_BUILD_BUG_ON(((n) & ((n) - 1)) != 0))
-
 /*
  * Whether the active backend provides secure (locked / wiped) memory. This
  * mirrors the dispatch priority in jent_zalloc() below: the crypto libraries
@@ -110,12 +142,33 @@
 # define JENT_MEM_SECURE
 #elif defined(LIBGCRYPT) || defined(OPENSSL)
 # define JENT_MEM_SECURE
+  /*
+   * The secure arena of these two - libgcrypt's secmem pool, OpenSSL's secure
+   * heap - is created by the application, so it can be absent altogether and
+   * it can run out. Either way the allocation comes back from the regular
+   * heap, which is the one thing that is not secure memory.
+   */
+# define JENT_MEM_SECURE_ON_REQUEST
 #elif defined(AWSLC)
   /* AWS-LC memory is wiped but not locked; not advertised as secure. */
-#elif (defined(JENT_ARCH_MEM_WINDOWS) || defined(JENT_ARCH_MEM_POSIX_MLOCK)) && \
-      !defined(JENT_CONF_RELAX_MLOCK)
+#elif defined(JENT_ARCH_MEM_WINDOWS) || defined(JENT_ARCH_MEM_POSIX_MLOCK)
 # define JENT_MEM_SECURE
+  /*
+   * Here it is the memory lock that provides the security property, and the
+   * lock is the one thing the environment can refuse.
+   */
+# define JENT_MEM_SECURE_ON_REQUEST
 #endif
+
+/*
+ * JENT_MEM_SECURE_ON_REQUEST marks the backends whose secure memory can be
+ * denied at runtime: the memory lock the environment refuses, and the arena
+ * the application did not provide. Only there does JENT_FORCE_SECURE_MEM
+ * have a meaning - it turns that denial from a silent fallback to
+ * unprotected memory into a failed allocation. The Linux kernel backend
+ * cannot be denied and AWS-LC never claimed to be secure, so neither
+ * consults the flag.
+ */
 
 int jent_secure_memory_supported(void)
 {
@@ -124,6 +177,26 @@ int jent_secure_memory_supported(void)
 #else
 	return 0;
 #endif
+}
+
+int jent_memory_is_secure(unsigned int flags)
+{
+#ifdef JENT_MEM_SECURE_ON_REQUEST
+	/*
+	 * Only JENT_FORCE_SECURE_MEM makes secure memory a condition of the
+	 * allocation and therefore a property the memory is known to have.
+	 * Without it the lock is still attempted and the secure arena still
+	 * tried first and, on a normal system, both still succeed - but whether
+	 * they did is not recorded, so the caller is told the conservative
+	 * answer.
+	 */
+	if (!(flags & JENT_FORCE_SECURE_MEM))
+		return 0;
+#else
+	(void)flags;
+#endif
+
+	return jent_secure_memory_supported();
 }
 
 void jent_memset_secure(void *s, size_t n)
@@ -166,8 +239,10 @@ static size_t jent_pagesize(void)
 
 #ifdef JENT_ARCH_MEM_LINUX_KERNEL
 
-void *jent_zalloc(size_t len)
+void *jent_zalloc(size_t len, unsigned int flags)
 {
+	/* Kernel memory is not paged out, so there is nothing to relax. */
+	(void)flags;
 	return kvzalloc(len, GFP_KERNEL);
 }
 
@@ -178,35 +253,51 @@ void jent_zfree(void *ptr, size_t len)
 
 #else /* !JENT_ARCH_MEM_LINUX_KERNEL */
 
-void *jent_zalloc(size_t len)
+void *jent_zalloc(size_t len, unsigned int flags)
 {
 	void *tmp = NULL;
+
+#ifndef JENT_MEM_SECURE_ON_REQUEST
+	/* Only a backend that can be denied secure memory reads the flag. */
+	(void)flags;
+#endif
 
 #ifdef LIBGCRYPT
 
 	/*
-	 * Set the maximum usable locked memory to 2 MiB at first call.
+	 * The secmem pool is not initialized here: it is created once per
+	 * process with GCRYCTL_INIT_SECMEM, which fixes its size for every
+	 * user of libgcrypt in that process, and libgcrypt has to be
+	 * initialized (gcry_check_version(), GCRYCTL_INITIALIZATION_FINISHED)
+	 * by the application anyway. Sizing it from in here would overrule a
+	 * decision that is not the library's to make - see
+	 * arch/jitterentropy-arch-memory.h.
 	 *
-	 * You may have to adapt or delete this if you also use libgcrypt
-	 * elsewhere in your software!
-	 */
-	if (!gcry_control(GCRYCTL_INITIALIZATION_FINISHED_P)) {
-		gcry_control(GCRYCTL_INIT_SECMEM, JENT_SECURE_MEMORY_SIZE_MAX, 0);
-		gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
-	}
-	/*
-	 * When using the libgcrypt secure memory mechanism, all precautions
-	 * are taken to protect our state. If the user disables secmem during
-	 * runtime, it is their decision and we thus try not to overrule that
-	 * decision for less memory protection.
-	 */
-	/*
 	 * gcry_malloc_secure(), not gcry_xmalloc_secure(): the x-variant
 	 * invokes libgcrypt's fatal out-of-core handler when the secmem pool
 	 * is exhausted, terminating the host process from inside the library.
 	 * The NULL return is handled by all callers.
 	 */
 	tmp = gcry_malloc_secure(len);
+
+	/*
+	 * Check that the memory really came out of the pool. libgcrypt returns
+	 * NULL when the pool is absent or exhausted, so this is the belt to
+	 * the braces.
+	 */
+	if (tmp && !gcry_is_secure(tmp)) {
+		gcry_free(tmp);
+		tmp = NULL;
+	}
+
+	/*
+	 * No pool, or none left in it: fall back to ordinary memory, which is
+	 * what an application that did not configure secmem asks for by not
+	 * setting the flag. jent_memory_is_secure() reports the same
+	 * distinction to the caller, and jent_zfree() releases either kind.
+	 */
+	if (!tmp && !(flags & JENT_FORCE_SECURE_MEM))
+		tmp = gcry_malloc(len);
 
 #elif defined(AWSLC)
 
@@ -215,17 +306,14 @@ void *jent_zalloc(size_t len)
 #elif defined(OPENSSL)
 
 	/*
-	 * Initialize OpenSSL secure malloc here only if not already done.
-	 * The 2 MiB max reserved is sufficient for jitterentropy but probably
-	 * too small for a whole application doing crypto operations with
-	 * OpenSSL. Both min and max value must be a power of 2; min must be
-	 * smaller than max.
+	 * The secure heap is not initialized here: CRYPTO_secure_malloc_init()
+	 * reserves one arena for the whole process whose size cannot be
+	 * changed afterwards, so the size belongs to the application, which
+	 * knows what else in the process allocates from it - see
+	 * arch/jitterentropy-arch-memory.h. Only its presence is checked.
 	 */
-	JENT_IS_POWER_OF_2(JENT_SECURE_MEMORY_SIZE_MAX);
-	if (CRYPTO_secure_malloc_initialized() ||
-	    CRYPTO_secure_malloc_init(JENT_SECURE_MEMORY_SIZE_MAX, 32)) {
+	if (CRYPTO_secure_malloc_initialized())
 		tmp = OPENSSL_secure_malloc(len);
-	}
 	/*
 	 * If secure memory was not available, OpenSSL falls back to "normal"
 	 * memory. Double check.
@@ -235,68 +323,81 @@ void *jent_zalloc(size_t len)
 		tmp = NULL;
 	}
 
+	/*
+	 * No secure heap, or none left in it: fall back to ordinary memory,
+	 * which is what an application that did not configure the secure heap
+	 * asks for by not setting the flag. jent_memory_is_secure() reports the
+	 * same distinction to the caller, and jent_zfree() releases either kind
+	 * - OPENSSL_secure_free() forwards a pointer that is not in the arena
+	 * to the regular free().
+	 */
+	if (!tmp && !(flags & JENT_FORCE_SECURE_MEM))
+		tmp = OPENSSL_malloc(len);
+
 #elif defined(JENT_ARCH_MEM_WINDOWS)
 
-# ifndef JENT_CONF_RELAX_MLOCK
 	{
-		size_t minWS, maxWS;
-
-		JENT_BUILD_BUG_ON(JENT_SECURE_MEMORY_SIZE_MAX / 2 == 0);
 		/*
-		 * On query failure assume a zero working set so the raise
-		 * below always runs; the outputs are uninitialized otherwise.
+		 * Guard-page layout as on the POSIX path: commit the whole
+		 * region inaccessible and enable only the payload, leaving a
+		 * PAGE_NOACCESS guard page on each side that faults on any
+		 * accidental access beyond the state.
 		 */
-		if (!GetProcessWorkingSetSize(GetCurrentProcess(), &minWS,
-					      &maxWS))
-			minWS = maxWS = 0;
-		if (maxWS < JENT_SECURE_MEMORY_SIZE_MAX &&
-		    !SetProcessWorkingSetSizeEx(
-			GetCurrentProcess(),
-			JENT_SECURE_MEMORY_SIZE_MAX / 2,
-			JENT_SECURE_MEMORY_SIZE_MAX,
-			QUOTA_LIMITS_HARDWS_MIN_ENABLE))
+		size_t page_size = jent_pagesize();
+		size_t payload, total;
+		uint8_t *base;
+		DWORD oldprot;
+
+		if (len > (size_t)-1 - 3 * page_size)
 			return NULL;
+		payload = (len + page_size - 1) & ~(page_size - 1);
+		total = payload + 2 * page_size;
 
-		{
-			/*
-			 * Guard-page layout as on the POSIX path: commit the
-			 * whole region inaccessible and enable only the
-			 * payload, leaving a PAGE_NOACCESS guard page on each
-			 * side that faults on any accidental access beyond
-			 * the state.
-			 */
-			size_t page_size = jent_pagesize();
-			size_t payload, total;
-			uint8_t *base;
-			DWORD oldprot;
+		base = VirtualAlloc(NULL, total, MEM_COMMIT | MEM_RESERVE,
+				    PAGE_NOACCESS);
+		if (!base)
+			return NULL;
+		if (!VirtualProtect(base + page_size, payload, PAGE_READWRITE,
+				    &oldprot)) {
+			VirtualFree(base, 0, MEM_RELEASE);
+			return NULL;
+		}
 
-			if (len > (size_t)-1 - 3 * page_size)
-				return NULL;
-			payload = (len + page_size - 1) & ~(page_size - 1);
-			total = payload + 2 * page_size;
+		tmp = base + page_size;
 
-			base = VirtualAlloc(NULL, total,
-					    MEM_COMMIT | MEM_RESERVE,
-					    PAGE_NOACCESS);
-			if (!base)
-				return NULL;
-			if (!VirtualProtect(base + page_size, payload,
-					    PAGE_READWRITE, &oldprot)) {
-				VirtualFree(base, 0, MEM_RELEASE);
-				return NULL;
-			}
-
-			tmp = base + page_size;
-
-			if (!VirtualLock(tmp, payload)) {
-				VirtualFree(base, 0, MEM_RELEASE);
-				return NULL;
-			}
+		/*
+		 * A refused lock is only an error when the caller demanded
+		 * the lock. Either way the mapping and its guard pages are
+		 * the same, so jent_zfree() needs no knowledge of the flag.
+		 *
+		 * VirtualLock() charges its pages against the process
+		 * *minimum* working set - "the maximum number of pages a
+		 * process can lock is equal to the number of pages in its
+		 * minimum working set minus a small overhead" - and fails
+		 * with ERROR_WORKING_SET_QUOTA once that budget is exhausted.
+		 * The default minimum is smaller than the memory block of a
+		 * collector asking for a large size (most visibly a
+		 * JENT_CACHE_ALL one, which asks for the summed L1+L2+L3
+		 * size), so with JENT_FORCE_SECURE_MEM such an allocation
+		 * fails unless the quota has been raised beforehand.
+		 *
+		 * Raising it is deliberately not done here: the working set
+		 * limits are process-wide state, extending them evicts the
+		 * working set the host application has reserved for itself,
+		 * and they cannot be restored on free (another thread may
+		 * have locked memory against the raised quota in the
+		 * meantime). That is the application's decision to make, just
+		 * as RLIMIT_MEMLOCK is on the POSIX path below. The recording
+		 * tools - which own their process - raise both for the
+		 * compliance modes in
+		 * tests/raw-entropy/recording_userspace/jitterentropy-memlock.h.
+		 */
+		if (!VirtualLock(tmp, payload) &&
+		    (flags & JENT_FORCE_SECURE_MEM)) {
+			VirtualFree(base, 0, MEM_RELEASE);
+			return NULL;
 		}
 	}
-# else
-	tmp = malloc(len);
-# endif
 
 #elif defined(JENT_ARCH_MEM_POSIX_MLOCK)
 
@@ -304,29 +405,59 @@ void *jent_zalloc(size_t len)
 		/*
 		 * Layout: [guard page | payload (page-rounded) | guard page]
 		 *
-		 * The whole region is mapped PROT_NONE first and only the
-		 * payload is made accessible, leaving one inaccessible guard
-		 * page on each side: any accidental access beyond the state
-		 * faults immediately instead of silently reading or
-		 * corrupting adjacent data. The page-aligned payload is also
-		 * what allows the madvise() dump exclusion below.
+		 * One inaccessible guard page on each side of the payload, so
+		 * that any accidental access beyond the state faults
+		 * immediately instead of silently reading or corrupting
+		 * adjacent data. The page-aligned payload is also what allows
+		 * the madvise() dump exclusion below.
+		 *
+		 * The region is mapped readable and writable and the two guard
+		 * pages are then protected *down* to PROT_NONE. The reverse -
+		 * map the whole region PROT_NONE and raise the payload to
+		 * PROT_READ|PROT_WRITE - is the more common spelling of this
+		 * idiom and is what this code did until NetBSD rejected it:
+		 * mprotect() there returns EACCES, "the requested protection
+		 * would exceed the maximum protection allowed on the region",
+		 * because NetBSD clamps a mapping's maximum protection to the
+		 * protection mmap() was called with. A region mapped PROT_NONE
+		 * can then never be made accessible again, so jent_zalloc()
+		 * failed every allocation on that platform and every caller
+		 * reported it as an out-of-memory condition.
+		 *
+		 * Lowering protection is permitted everywhere, so this order
+		 * needs no platform conditional and reaches the same final
+		 * layout. The guard pages are briefly writable, which is not
+		 * observable: the mapping is fresh and its address has not
+		 * been handed out yet.
 		 */
 		size_t page_size = jent_pagesize();
 		size_t payload, total;
 		uint8_t *base;
+		/*
+		 * OpenBSD excludes a mapping from core dumps at mmap() time
+		 * rather than through madvise(); it has no MADV_DONTDUMP or
+		 * MADV_NOCORE. The flag is the OpenBSD counterpart of the
+		 * madvise() call below.
+		 */
+		int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+
+# ifdef MAP_CONCEAL
+		mmap_flags |= MAP_CONCEAL;
+# endif
 
 		if (len > SIZE_MAX - 3 * page_size)
 			return NULL;
 		payload = (len + page_size - 1) & ~(page_size - 1);
 		total = payload + 2 * page_size;
 
-		base = mmap(NULL, total, PROT_NONE,
-			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		base = mmap(NULL, total, PROT_READ | PROT_WRITE, mmap_flags,
+			    -1, 0);
 		if (base == MAP_FAILED)
 			return NULL;
 
-		if (mprotect(base + page_size, payload,
-			     PROT_READ | PROT_WRITE)) {
+		if (mprotect(base, page_size, PROT_NONE) ||
+		    mprotect(base + page_size + payload, page_size,
+			     PROT_NONE)) {
 			munmap(base, total);
 			return NULL;
 		}
@@ -339,6 +470,12 @@ void *jent_zalloc(size_t len)
 		 * (e.g. old kernels) does not fail the allocation. No revert
 		 * is needed on free: munmap() destroys the mapping including
 		 * its madvise state.
+		 *
+		 * macOS provides no equivalent - it has neither MADV_DONTDUMP
+		 * nor MADV_NOCORE nor MAP_CONCEAL - so on that platform the
+		 * state stays mlock()ed but is not excluded from a core dump.
+		 * The only lever there is process-wide (RLIMIT_CORE), which is
+		 * the application's decision to make, not a library's.
 		 */
 # if defined(MADV_DONTDUMP)
 		madvise(tmp, len, MADV_DONTDUMP);	/* Linux */
@@ -350,16 +487,30 @@ void *jent_zalloc(size_t len)
 		 * Prevent paging out of the memory state to swap space. If
 		 * this fails, check the current memory lock limits and
 		 * capabilities (e.g. RLIMIT_MEMLOCK and CAP_IPC_LOCK).
+		 *
+		 * With JENT_FORCE_SECURE_MEM the caller demanded the lock and
+		 * any failure fails the allocation. Without it the errors that
+		 * say the environment does not permit locking are tolerated,
+		 * but not one that indicates a malformed request (EINVAL),
+		 * which would be a bug here rather than a property of the
+		 * environment:
+		 *
+		 *  - EPERM:  no privilege, which is what Linux reports for a
+		 *            RLIMIT_MEMLOCK of 0 without CAP_IPC_LOCK.
+		 *  - ENOMEM: the limit would be exceeded - the case of a
+		 *            container with a small but non-zero
+		 *            RLIMIT_MEMLOCK on Linux and of the per-process
+		 *            and system limits on the BSDs. It cannot mean
+		 *            "range not mapped" here, the mapping was just
+		 *            established above.
+		 *  - EAGAIN: the same condition on macOS.
+		 *
+		 * The mapping itself is unaffected by the flag, so
+		 * jent_zfree() needs no knowledge of it.
 		 */
-# ifndef JENT_CONF_RELAX_MLOCK
-		if (mlock(tmp, len)) {
-# else
-		/*
-		 * Use this only for CI or restricted containers if not
-		 * possible otherwise.
-		 */
-		if (mlock(tmp, len) && errno != EPERM && errno != EAGAIN) {
-# endif
+		if (mlock(tmp, len) &&
+		    ((flags & JENT_FORCE_SECURE_MEM) ||
+		     (errno != EPERM && errno != ENOMEM && errno != EAGAIN))) {
 			munmap(base, total);
 			return NULL;
 		}
@@ -381,10 +532,13 @@ void jent_zfree(void *ptr, size_t len)
 #ifdef LIBGCRYPT
 
 	/*
-	 * gcry_free automatically wipes memory allocated with
-	 * gcry_(x)malloc_secure.
+	 * gcry_free() automatically wipes memory allocated with
+	 * gcry_(x)malloc_secure(), but not the ordinary memory jent_zalloc()
+	 * falls back to when the pool is unavailable - that is the one case
+	 * this has to wipe itself. gcry_free() releases either kind.
 	 */
-	(void)len;
+	if (!gcry_is_secure(ptr))
+		jent_memset_secure(ptr, len);
 	gcry_free(ptr);
 
 #elif defined(AWSLC)
@@ -398,17 +552,28 @@ void jent_zfree(void *ptr, size_t len)
 
 #elif defined(OPENSSL)
 
-	OPENSSL_cleanse(ptr, len);
+	/*
+	 * OPENSSL_secure_free() clears what it takes back into the secure
+	 * heap, so only the ordinary memory jent_zalloc() falls back to when
+	 * the heap is unavailable is wiped here - the same pointer that
+	 * OPENSSL_secure_free() forwards to the regular free().
+	 */
+	if (!CRYPTO_secure_allocated(ptr))
+		jent_memset_secure(ptr, len);
 	OPENSSL_secure_free(ptr);
 
 #elif defined(JENT_ARCH_MEM_WINDOWS)
 
 	SecureZeroMemory(ptr, len);
-# ifndef JENT_CONF_RELAX_MLOCK
 	{
 		/*
 		 * Mirror the guard-page layout of jent_zalloc(): the region
 		 * starts one page before the returned pointer.
+		 *
+		 * VirtualUnlock() on a region that was never locked (the
+		 * allocation was made without JENT_FORCE_SECURE_MEM and the
+		 * lock failed) reports ERROR_NOT_LOCKED and does nothing else,
+		 * which is why the free path does not need the flag.
 		 */
 		size_t page_size = jent_pagesize();
 		size_t payload = (len + page_size - 1) & ~(page_size - 1);
@@ -417,9 +582,6 @@ void jent_zfree(void *ptr, size_t len)
 		VirtualUnlock(ptr, payload);
 		VirtualFree(base, 0, MEM_RELEASE);
 	}
-# else
-	free(ptr);
-# endif
 
 #elif defined(JENT_ARCH_MEM_POSIX_MLOCK)
 
@@ -453,6 +615,3 @@ void jent_zfree(void *ptr, size_t len)
 }
 
 #endif /* JENT_ARCH_MEM_LINUX_KERNEL */
-
-#undef JENT_IS_POWER_OF_2
-#undef JENT_BUILD_BUG_ON

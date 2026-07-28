@@ -19,6 +19,11 @@
 
 #include "jitterentropy.h"
 #include "jitterentropy-internal.h"
+/*
+ * Before the <windows.h> below: the header selects the API level it needs,
+ * which has to precede the first inclusion of the Windows headers.
+ */
+#include "jitterentropy-memlock.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -30,6 +35,51 @@
 #include <float.h>
 #include <assert.h>
 #include <time.h>
+
+#if defined(_MSC_VER) || defined(__MINGW32__)
+# include <windows.h>
+#endif
+
+/*
+ * Monotonic timestamp in nanoseconds. Returns 0 on success.
+ *
+ * The measured interval feeds the search invariants below, so a wall-clock
+ * step (NTP, DST, manual adjustment) during a measurement must not be able to
+ * corrupt or even negate the runtime.
+ *
+ * Windows has no clock_gettime(): QueryPerformanceCounter() is the monotonic
+ * source there and its ticks are rescaled with the counter frequency.
+ */
+static int monotonic_nstime(uint64_t *out)
+{
+#if defined(_MSC_VER) || defined(__MINGW32__)
+	LARGE_INTEGER freq, ticks;
+
+	if (!QueryPerformanceFrequency(&freq) || freq.QuadPart <= 0)
+		return 1;
+	if (!QueryPerformanceCounter(&ticks) || ticks.QuadPart < 0)
+		return 1;
+
+	/*
+	 * Whole seconds and remainder are scaled separately: a single
+	 * ticks * 1000000000 overflows 64 bits after a few seconds of uptime
+	 * with the usual 10 MHz performance counter.
+	 */
+	*out = (uint64_t)(ticks.QuadPart / freq.QuadPart) *
+	       UINT64_C(1000000000) +
+	       (uint64_t)(ticks.QuadPart % freq.QuadPart) *
+	       UINT64_C(1000000000) / (uint64_t)freq.QuadPart;
+	return 0;
+#else
+	struct timespec time;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &time) != 0)
+		return 1;
+	*out = (uint64_t)time.tv_sec * UINT64_C(1000000000) +
+	       (uint64_t)time.tv_nsec;
+	return 0;
+#endif
+}
 
 /*
  * Parse a complete numeric option value. A plain strtoul(str, NULL, 10) turns
@@ -78,7 +128,7 @@ double linearInverse(double y, double x1, double y1, double x2, double y2) {
 uint64_t jent_output_time(uint64_t rounds, unsigned int osr, unsigned int flags)
 {
 	struct rand_data *ec_nostir;
-	struct timespec start, finish;
+	uint64_t start, finish;
 	uint64_t runtime;
 	int ret;
 
@@ -102,12 +152,7 @@ uint64_t jent_output_time(uint64_t rounds, unsigned int osr, unsigned int flags)
 		exit(1);
 	}
 
-	/*
-	 * Use a monotonic clock: the measured interval feeds the search
-	 * invariants, and a wall-clock step (NTP, DST, manual adjustment)
-	 * during a measurement would corrupt or even negate the runtime.
-	 */
-	if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+	if (monotonic_nstime(&start)) {
 		fprintf(stderr, "Unable to get start time\n");
 		exit(1);
 	}
@@ -121,11 +166,11 @@ uint64_t jent_output_time(uint64_t rounds, unsigned int osr, unsigned int flags)
 		}
 	}
 
-	if (clock_gettime(CLOCK_MONOTONIC, &finish) != 0) {
+	if (monotonic_nstime(&finish)) {
 		fprintf(stderr, "Unable to get finish time\n");
 		exit(1);
 	}
-	runtime = ((uint64_t)finish.tv_sec * UINT64_C(1000000000) + (uint64_t)finish.tv_nsec) - ((uint64_t)start.tv_sec * UINT64_C(1000000000) + (uint64_t)start.tv_nsec);
+	runtime = finish - start;
 
 	jent_entropy_collector_free(ec_nostir);
 
@@ -310,6 +355,24 @@ int main(int argc, char * argv[])
 		argc--;
 		argv++;
 	}
+
+	/*
+	 * The compliance modes require the collector memory to be locked into
+	 * RAM, which the operating system permits only within a per-process
+	 * limit. See jitterentropy-memlock.h.
+	 */
+	if (jent_raise_memlock_limit(flags))
+		fprintf(stderr,
+			"Cannot raise the memory lock limit, allocating the entropy collector may fail\n");
+
+	/*
+	 * Likewise the secure memory arena of the external crypto backends,
+	 * which is created once for the process and is what the library
+	 * allocates the collector from. See jitterentropy-memlock.h.
+	 */
+	if (jent_init_secure_memory(flags))
+		fprintf(stderr,
+			"Cannot create the secure memory arena, allocating the entropy collector will fail\n");
 
 	/* We don't start with a maxBound. */
 	maxBound = 0;

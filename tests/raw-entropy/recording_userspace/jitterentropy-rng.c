@@ -18,12 +18,18 @@
  */
 
 #include "jitterentropy.h"
+#include "jitterentropy-memlock.h"
 
 #include <errno.h>
 #include <stdlib.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+
+#if defined(_MSC_VER) || defined(__MINGW32__)
+# include <fcntl.h>
+# include <io.h>
+#endif
 
 /*
  * Parse a complete numeric option value. A plain strtoul(str, NULL, 10) turns
@@ -229,6 +235,28 @@ int main(int argc, char * argv[])
 		argv++;
 	}
 
+	/*
+	 * The compliance modes require the collector memory to be locked into
+	 * RAM, which the operating system permits only within a per-process
+	 * limit. See jitterentropy-memlock.h.
+	 */
+	if (jent_raise_memlock_limit(flags))
+		fprintf(stderr,
+			"Cannot raise the memory lock limit, allocating the entropy collector may fail\n");
+
+	/*
+	 * Likewise the secure memory arena of the external crypto backends,
+	 * which is created once for the process and is what the library
+	 * allocates the collector from. See jitterentropy-memlock.h.
+	 *
+	 * Both precede jent_entropy_init_ex(): the initialization creates a
+	 * collector of its own, with the very same flags, so it allocates from
+	 * the arena and locks its memory just like the instance below.
+	 */
+	if (jent_init_secure_memory(flags))
+		fprintf(stderr,
+			"Cannot create the secure memory arena, allocating the entropy collector will fail\n");
+
 	ret = jent_entropy_init_ex(osr, flags);
 	if (ret) {
 		printf("The initialization failed with error code %d\n", ret);
@@ -248,6 +276,21 @@ int main(int argc, char * argv[])
 	}
 
 	fprintf(stderr, "%s", status);
+
+	/*
+	 * Windows opens stdout in text mode: every 0x0A byte of the random
+	 * stream would be written out as 0x0D 0x0A, corrupting and inflating
+	 * the data as soon as it is redirected into a file or a pipe - which
+	 * is the only way this tool is used. The hex encoding below emits no
+	 * 0x0A at all and is therefore left alone.
+	 */
+#if defined(_MSC_VER) || defined(__MINGW32__)
+	if (!hex && _setmode(_fileno(stdout), _O_BINARY) == -1) {
+		fprintf(stderr, "Cannot switch stdout to binary mode\n");
+		ret = 1;
+		goto out;
+	}
+#endif
 
 	for (size = 0; size < rounds; size++) {
 		uint8_t tmp[32];

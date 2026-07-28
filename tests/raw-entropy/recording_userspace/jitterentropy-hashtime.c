@@ -51,7 +51,10 @@
 #include "jitterentropy-arch-ncpu.c"
 #include "jitterentropy-arch-sched.c"
 #include "jitterentropy-arch-thread.c"
+#include "jitterentropy-arch-timer.c"
 #include "jitterentropy-arch-uuid.c"
+
+#include "jitterentropy-memlock.h"
 
 #ifndef REPORT_COUNTER_TICKS
 #define REPORT_COUNTER_TICKS 1
@@ -121,7 +124,7 @@ static int jent_one_test(const char *pathname, unsigned long rounds,
 		goto out;
 	}
 #else
-	jent_entropy_init_common_pre();
+	jent_entropy_init_common_pre(flags);
 #endif
 
 	/*
@@ -168,7 +171,16 @@ static int jent_one_test(const char *pathname, unsigned long rounds,
 
 	printf("Processing %s\n", pathname);
 
+	/*
+	 * "wb" for the binary variant: Windows opens streams in text mode
+	 * otherwise and would expand every 0x0A byte of the recorded
+	 * timestamps to 0x0D 0x0A, corrupting the sample file.
+	 */
+#ifdef JENT_TEST_BINARY_OUTPUT
+	out = fopen(pathname, "wb");
+#else
 	out = fopen(pathname, "w");
+#endif
 	if (!out) {
 		ret = 1;
 		goto out;
@@ -497,6 +509,25 @@ int main(int argc, char * argv[])
 		argc--;
 		argv++;
 	}
+
+	/*
+	 * The compliance modes require the collector memory to be locked into
+	 * RAM, which the operating system permits only within a per-process
+	 * limit. Raised once here rather than per repeat below, as the limit is
+	 * process-wide state. See jitterentropy-memlock.h.
+	 */
+	if (jent_raise_memlock_limit(flags))
+		fprintf(stderr,
+			"Cannot raise the memory lock limit, allocating the entropy collector may fail\n");
+
+	/*
+	 * Likewise the secure memory arena of the external crypto backends,
+	 * which is created once for the process and is what the library
+	 * allocates the collector from. See jitterentropy-memlock.h.
+	 */
+	if (jent_init_secure_memory(flags))
+		fprintf(stderr,
+			"Cannot create the secure memory arena, allocating the entropy collector will fail\n");
 
 	for (i = 1; i <= repeats; i++) {
 		int len;

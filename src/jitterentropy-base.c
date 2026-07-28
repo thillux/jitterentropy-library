@@ -159,6 +159,15 @@ static inline unsigned int jent_update_memsize(unsigned int flags,
 		/* Adjust offset */
 		max = (max > JENT_MAX_MEMSIZE_OFFSET) ?
 			max - JENT_MAX_MEMSIZE_OFFSET : 0;
+
+		/*
+		 * Bound the automatically derived size. This is a no-op on
+		 * 64-bit targets; on 32-bit ones it keeps a large host cache
+		 * from deriving a working set that cannot be mapped and locked.
+		 * See JENT_MAX_AUTO_MEMSIZE.
+		 */
+		if (max > JENT_MAX_AUTO_MEMSIZE)
+			max = JENT_MAX_AUTO_MEMSIZE;
 	} else {
 		max += inc;
 	}
@@ -187,6 +196,28 @@ static inline unsigned int jent_update_hashloop(unsigned int flags,
 	flags &= ~(unsigned int)JENT_MAX_HASHLOOP_MASK;
 	/* Set the freshly calculated max size */
 	flags |= JENT_HASHLOOP_TO_FLAGS(max);
+
+	return flags;
+}
+
+/*
+ * The compliance modes claim a protected entropy collector state, so they turn
+ * secure memory from a best effort into a requirement: with them the
+ * allocation fails rather than leaving the state in memory that may be swapped
+ * out. Every other caller keeps the default, where memory the platform does
+ * not protect is tolerated.
+ *
+ * This normalization belongs to the caller-provided flags and therefore not
+ * into jent_entropy_collector_alloc_internal(): jent_time_entropy_init() ORs
+ * JENT_FORCE_FIPS into its test instance to get the health tests run, which is
+ * not a compliance statement, and deriving the requirement there would make
+ * every default allocation demand secure memory. Same reasoning as the
+ * JENT_DISABLE_MEMORY_ACCESS check in _jent_entropy_collector_alloc().
+ */
+static inline unsigned int jent_update_secure_mem(unsigned int flags)
+{
+	if (flags & (JENT_NTG1 | JENT_FORCE_FIPS))
+		flags |= JENT_FORCE_SECURE_MEM;
 
 	return flags;
 }
@@ -229,14 +260,21 @@ JENT_PRIVATE_STATIC
 ssize_t jent_read_entropy(struct rand_data *ec, char *data, size_t len)
 {
 	/*
-	 * Maximum value representable by ssize_t. Use a portable
-	 * definition in case SSIZE_MAX is not available under strict
-	 * C standard modes. It is nevertheless available on POSIX systems.
+	 * Maximum value representable by ssize_t. Use a portable definition
+	 * in case SSIZE_MAX is not available under strict C standard modes.
+	 * It is nevertheless available on POSIX systems.
+	 *
+	 * Clearing the sign bit of SIZE_MAX relies on ssize_t being the
+	 * signed counterpart of size_t, which the build assertion below
+	 * enforces. Deriving the shift count from sizeof(ssize_t) instead
+	 * would be undefined behavior as soon as ssize_t is the wider type.
 	 */
-	static const size_t ssize_max = (size_t)(((size_t)1 << (sizeof(ssize_t) * 8 - 1)) - 1);
+	static const size_t ssize_max = (size_t)-1 >> 1;
 	char *p = data;
 	size_t orig_len;
 	int ret = 0;
+
+	JENT_BUILD_BUG_ON(sizeof(ssize_t) != sizeof(size_t));
 
 	/* check obvious misuse of API */
 	if (!ec || (data == NULL && len > 0))
@@ -317,7 +355,7 @@ ssize_t jent_read_entropy(struct rand_data *ec, char *data, size_t len)
 	 * pros and cons considering that the SHA3 operation is not that
 	 * expensive.
 	 */
-	if (!jent_secure_memory_supported())
+	if (!jent_memory_is_secure(ec->flags))
 		jent_read_random_block(ec, NULL, 0);
 
 err:
@@ -435,14 +473,21 @@ JENT_PRIVATE_STATIC
 ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 {
 	/*
-	 * Maximum value representable by ssize_t. Use a portable
-	 * definition in case SSIZE_MAX is not available under strict
-	 * C standard modes. It is nevertheless available on POSIX systems.
+	 * Maximum value representable by ssize_t. Use a portable definition
+	 * in case SSIZE_MAX is not available under strict C standard modes.
+	 * It is nevertheless available on POSIX systems.
+	 *
+	 * Clearing the sign bit of SIZE_MAX relies on ssize_t being the
+	 * signed counterpart of size_t, which the build assertion below
+	 * enforces. Deriving the shift count from sizeof(ssize_t) instead
+	 * would be undefined behavior as soon as ssize_t is the wider type.
 	 */
-	static const size_t ssize_max = (size_t)(((size_t)1 << (sizeof(ssize_t) * 8 - 1)) - 1);
+	static const size_t ssize_max = (size_t)-1 >> 1;
 	char *p = data;
 	size_t orig_len;
 	ssize_t ret = 0;
+
+	JENT_BUILD_BUG_ON(sizeof(ssize_t) != sizeof(size_t));
 
 	/* check obvious misuse of API */
 	if (!ec || (data == NULL && len > 0))
@@ -565,8 +610,8 @@ static struct rand_data
 	 * health-test lookup tables are indexed with osr - 1, and an empty
 	 * [JENT_MIN_OSR, JENT_MAX_OSR] range would make every allocation fail.
 	 */
-	BUILD_BUG_ON(JENT_MIN_OSR < 1);
-	BUILD_BUG_ON(JENT_MIN_OSR > JENT_MAX_OSR);
+	JENT_BUILD_BUG_ON(JENT_MIN_OSR < 1);
+	JENT_BUILD_BUG_ON(JENT_MIN_OSR > JENT_MAX_OSR);
 
 	/*
 	 * Requesting disabling and forcing of internal timer
@@ -605,7 +650,7 @@ static struct rand_data
 	if (jent_notime_forced() && (flags & JENT_DISABLE_INTERNAL_TIMER))
 		return NULL;
 
-	entropy_collector = jent_zalloc(sizeof(struct rand_data));
+	entropy_collector = jent_zalloc(sizeof(struct rand_data), flags);
 	if (NULL == entropy_collector)
 		return NULL;
 
@@ -623,7 +668,8 @@ static struct rand_data
 		flags = jent_update_memsize(flags, 0);
 		memsize = jent_memsize(flags);
 		entropy_collector->mem =
-			(unsigned char *)jent_zalloc(memsize);
+			(unsigned char *)jent_zalloc(memsize, flags);
+
 		if (entropy_collector->mem == NULL)
 			goto err;
 
@@ -639,7 +685,7 @@ static struct rand_data
 	flags = jent_update_hashloop(flags, 0);
 	entropy_collector->hashloopcnt = jent_hashloop_cnt(flags);
 
-	if (jent_sha3_alloc(&entropy_collector->hash_state))
+	if (jent_sha3_alloc(&entropy_collector->hash_state, flags))
 		goto err;
 
 	/*
@@ -730,6 +776,8 @@ static struct rand_data *_jent_entropy_collector_alloc(unsigned int osr,
 	if ((flags & JENT_DISABLE_MEMORY_ACCESS) &&
 	    ((flags & (JENT_NTG1 | JENT_FORCE_FIPS)) || jent_fips_enabled()))
 		return NULL;
+
+	flags = jent_update_secure_mem(flags);
 
 	ec = jent_entropy_collector_alloc_internal(osr, flags);
 
@@ -875,7 +923,7 @@ int jent_time_entropy_init(unsigned int osr, unsigned int flags)
 	int i, time_backwards = 0, count_stuck = 0, ret = 0;
 	unsigned int health_test_result;
 
-	delta_history = jent_gcd_init(JENT_POWERUP_TESTLOOPCOUNT);
+	delta_history = jent_gcd_init(JENT_POWERUP_TESTLOOPCOUNT, flags);
 	if (!delta_history)
 		return EMEM;
 
@@ -968,10 +1016,11 @@ int jent_time_entropy_init(unsigned int osr, unsigned int flags)
 
 	/*
 	 * we allow up to three times the time running backwards.
-	 * CLOCK_REALTIME is affected by adjtime and NTP operations. Thus,
-	 * if such an operation just happens to interfere with our test, it
-	 * should not fail. The value of 3 should cover the NTP case being
-	 * performed during our test run.
+	 * All timer backends are monotonic by construction, but a counter read
+	 * can still appear to go backwards once in a while, e.g. when the
+	 * thread migrates between CPUs whose counters are not perfectly in
+	 * sync. Such an event must not fail the test outright; the value of 3
+	 * covers the occasional occurrence during our test run.
 	 */
 	if (time_backwards > 3) {
 		ret = ENOMONOTONIC;
@@ -1008,7 +1057,12 @@ out:
 	return ret;
 }
 
-static inline int jent_entropy_init_common_pre(void)
+/*
+ * The flags are only needed for the memory the GCD self test allocates:
+ * JENT_FORCE_SECURE_MEM must reach it as well, or the initialization would
+ * report success on memory the collector allocation is then going to reject.
+ */
+static inline int jent_entropy_init_common_pre(unsigned int flags)
 {
 	int ret;
 
@@ -1018,7 +1072,7 @@ static inline int jent_entropy_init_common_pre(void)
 	if (jent_sha3_tester())
 		return EHASH;
 
-	ret = jent_gcd_selftest();
+	ret = jent_gcd_selftest(flags);
 
 	jent_selftest_run = 1;
 
@@ -1044,7 +1098,7 @@ static inline int jent_entropy_init_common_post(int ret)
 JENT_PRIVATE_STATIC
 int jent_entropy_init(void)
 {
-	int ret = jent_entropy_init_common_pre();
+	int ret = jent_entropy_init_common_pre(0);
 
 	if (ret)
 		return ret;
@@ -1062,7 +1116,17 @@ int jent_entropy_init(void)
 JENT_PRIVATE_STATIC
 int jent_entropy_init_ex(unsigned int osr, unsigned int flags)
 {
-	int ret = jent_entropy_init_common_pre();
+	int ret;
+
+	/*
+	 * Apply the same requirement the collector allocation will apply, so
+	 * that a caller asking for a compliance mode is not told the
+	 * initialization succeeded on memory that the later allocation then
+	 * refuses to work with.
+	 */
+	flags = jent_update_secure_mem(flags);
+
+	ret = jent_entropy_init_common_pre(flags);
 
 	if (ret)
 		return ret;
