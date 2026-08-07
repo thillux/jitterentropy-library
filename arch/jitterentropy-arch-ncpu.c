@@ -239,3 +239,81 @@ long jent_ncpu(void)
 	return 1;
 #endif
 }
+
+#ifdef JENT_ARCH_NCPU_LINUX_AFFINITY
+/*
+ * The highest CPU number in the affinity mask of the calling thread, or a
+ * negative errno. The mask is a set, not a range - counting its members and
+ * naming the last of them are different questions, and only the latter yields
+ * a CPU a thread can be pinned to.
+ *
+ * The buffer grows on retry: sched_getaffinity(2) fails with EINVAL when it is
+ * smaller than the kernel CPU mask, as on a machine with more CPUs than
+ * CPU_SETSIZE - precisely where this distinction matters.
+ */
+static long jent_cpu_highest_affinity(void)
+{
+	unsigned int ncpu_set;
+
+	for (ncpu_set = CPU_SETSIZE; ncpu_set <= (1U << 16); ncpu_set *= 2) {
+		size_t size = CPU_ALLOC_SIZE(ncpu_set);
+		cpu_set_t *set = CPU_ALLOC(ncpu_set);
+		long highest = -1;
+		int ret;
+
+		if (!set)
+			return -ENOMEM;
+
+		ret = sched_getaffinity(0, size, set) ? errno : 0;
+		if (!ret) {
+			unsigned int i = ncpu_set;
+
+			while (i-- > 0) {
+				if (CPU_ISSET_S(i, size, set)) {
+					highest = (long)i;
+					break;
+				}
+			}
+		}
+
+		CPU_FREE(set);
+
+		if (ret == EINVAL)
+			continue;	/* buffer too small - try a larger one */
+		if (ret)
+			return -ret;
+
+		return (highest < 0) ? -EFAULT : highest;
+	}
+
+	return -EINVAL;
+}
+#endif /* JENT_ARCH_NCPU_LINUX_AFFINITY */
+
+long jent_cpu_highest(void)
+{
+#ifdef JENT_ARCH_NCPU_LINUX_AFFINITY
+	long highest = jent_cpu_highest_affinity();
+
+	if (highest >= 0)
+		return highest;
+	/* fall through to the count below */
+#endif
+
+	/*
+	 * Everywhere else the count is all there is, and the CPU numbers are
+	 * taken to be the dense range it describes - true for the flat Windows
+	 * numbering, which jent_thread_pin_to_cpu() resolves in the same order,
+	 * and unavoidable without an affinity API.
+	 */
+	{
+		long ncpu = jent_ncpu();
+
+		if (ncpu < 0)
+			return ncpu;
+		if (ncpu == 0)
+			return -EFAULT;
+
+		return ncpu - 1;
+	}
+}

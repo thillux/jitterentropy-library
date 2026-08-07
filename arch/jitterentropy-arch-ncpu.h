@@ -57,11 +57,18 @@
  *     Cygwin)
  *   - Linux Kernel                   -> 1 (we do not need a timer thread)
  *   - other (e.g. baremetal)         -> 1 (timer thread will be disabled)
+ *
+ * Provides jent_cpu_highest() returning the highest of those CPU numbers - the
+ * one a thread may be pinned to - or a negative errno. Not the count minus
+ * one: the CPUs a thread may run on are a set, and one confined to a cpuset
+ * need not hold the numbers the count would name. Only Linux can tell the two
+ * apart; elsewhere the count minus one is all there is.
  */
 
 #ifndef _JITTERENTROPY_ARCH_NCPU_H
 #define _JITTERENTROPY_ARCH_NCPU_H
 
 long jent_ncpu(void);
+long jent_cpu_highest(void);
 
 #endif /* _JITTERENTROPY_ARCH_NCPU_H */
