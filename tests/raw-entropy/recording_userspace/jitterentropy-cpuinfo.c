@@ -396,9 +396,9 @@ static unsigned long jent_brand_khz(const char *brand)
  * are nominal values the SDM does not promise to be exact, and on the hybrid
  * parts this was measured on only EBX follows the core the leaf is executed on
  * - EAX stays at one package-wide number while the P and the E cores have
- * markedly different base frequencies. The Linux backend therefore takes the
- * base frequency from cpufreq, which is per core, and reaches this leaf only
- * where that is unavailable.
+ * markedly different base frequencies. The Linux and the Windows backend
+ * therefore take the base frequency from cpufreq and from the registry, both
+ * of which are per CPU, and reach this leaf only where that is unavailable.
  *
  * Leaf 0x15 ("Time Stamp Counter and Nominal Core Crystal Clock Information")
  * gives the TSC rate as ECX (the crystal clock in Hz) * EBX / EAX. The Jitter
@@ -411,7 +411,8 @@ static unsigned long jent_brand_khz(const char *brand)
  *
  * AMD implements neither 0x15 nor 0x16 - jent_cpuid() reports the leaves as
  * unsupported and the values stay unknown. There the TSC runs at the base
- * frequency of the part, which on Linux comes from cpufreq instead.
+ * frequency of the part, which comes from cpufreq on Linux and from the
+ * registry on Windows instead.
  */
 static void jent_freq_x86(struct jent_cpu_info *info)
 {
@@ -1278,13 +1279,36 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 		if (read_cpu_val(info->cpu, "cpufreq/cpuinfo_max_freq",
 				 &info->max_khz))
 			info->max_khz = 0;
-		/*
-		 * Exported by the intel-pstate and amd-pstate drivers, and the
-		 * only source of the base frequency on AMD - CPUID has none.
-		 */
+		/* Exported by the intel-pstate driver, per CPU. */
 		if (read_cpu_val(info->cpu, "cpufreq/base_frequency",
 				 &info->base_khz))
 			info->base_khz = 0;
+
+		/*
+		 * AMD exports no base_frequency and CPUID carries none either,
+		 * which leaves the nominal frequency of the CPPC tables: the
+		 * highest sustained, non-boost performance level, in MHz -
+		 * the same quantity by another name.
+		 *
+		 * Second and not first, because it is a package-wide value
+		 * where base_frequency is a per-CPU one: on a hybrid Intel part
+		 * the two disagree, nominal_freq reporting the 1700 MHz of the
+		 * performance cores for the efficiency cores as well, whose
+		 * base_frequency is 1200 MHz.
+		 */
+		if (!info->base_khz) {
+			unsigned long nominal;
+
+			if (!read_cpu_val(info->cpu, "acpi_cppc/nominal_freq",
+					  &nominal) && nominal)
+				info->base_khz = nominal * 1000;
+		}
+
+		/* Likewise where amd-pstate is the driver but cpufreq is not. */
+		if (!info->max_khz &&
+		    read_cpu_val(info->cpu, "cpufreq/amd_pstate_max_freq",
+				 &info->max_khz))
+			info->max_khz = 0;
 
 		jent_caches_linux(info);
 		jent_ident_sysfs(info);
@@ -1739,7 +1763,7 @@ static void set_package(struct jent_cpu_info *info, void *arg)
 	info->pkg = *(const long *)arg;
 }
 
-/* Model, vendor and maximum frequency as published by the kernel per CPU. */
+/* Model, vendor and nominal frequency as published by the kernel per CPU. */
 static void jent_ident_windows(struct jent_cpu_info *info)
 {
 	/* Sized so that vendor, blank and model always fit into ident. */
@@ -1762,10 +1786,23 @@ static void jent_ident_windows(struct jent_cpu_info *info)
 
 	jent_set_ident(info, vendor, name);
 
+	/*
+	 * "~MHz" is the nominal frequency of the part - what Task Manager
+	 * shows as the base speed - and not a maximum: on an AMD Ryzen 9 5950X
+	 * it reads 3400 while the part boosts to 4900. Windows publishes no
+	 * boost figure anywhere, the MaxMhz of CallNtPowerInformation() being
+	 * this same nominal value, so the maximum stays unknown here unless
+	 * CPUID states one - which on an AMD part it never does.
+	 *
+	 * The registry key is per CPU, so as on Linux the value the operating
+	 * system publishes per CPU is preferred over the package-wide base
+	 * frequency of CPUID leaf 0x16; jent_freq_x86() fills in only what is
+	 * still unset.
+	 */
 	len = sizeof(mhz);
 	if (RegGetValueA(HKEY_LOCAL_MACHINE, key, "~MHz", RRF_RT_REG_DWORD,
 			 NULL, &mhz, &len) == ERROR_SUCCESS)
-		info->max_khz = mhz * 1000;
+		info->base_khz = mhz * 1000;
 }
 
 static int jent_get_cpus(struct jent_cpu_list *list)
@@ -2315,12 +2352,13 @@ static const char *jent_flag_str(int value)
 }
 
 /* Does any CPU report the scheduler capacity in place of a core type? */
-static int jent_have_capacity(const struct jent_cpu_list *list)
+static int jent_have_type(const struct jent_cpu_list *list, const char *prefix)
 {
+	size_t len = strlen(prefix);
 	long i;
 
 	for (i = 0; i < list->entries; i++) {
-		if (!strncmp(list->cpu[i].type, "cap ", 4))
+		if (!strncmp(list->cpu[i].type, prefix, len))
 			return 1;
 	}
 
@@ -2411,11 +2449,20 @@ static void print_cpus(const struct jent_cpu_list *list)
 	printf("  Pkg, Core  package and core ID - equal in both means SMT "
 	       "siblings of one core\n");
 	printf("  Type       core type as the system reports it\n");
-	/* ARM reports none, so the Type column holds the capacity there. */
-	if (jent_have_capacity(list))
+	/*
+	 * Neither ARM nor AMD reports a core type, and what stands in for it
+	 * there is a ranking whose scale the reader has no way of knowing -
+	 * least of all that on a uniform machine every core carries the
+	 * maximum and the value distinguishes nothing.
+	 */
+	if (jent_have_type(list, "cap "))
 		printf("             \"cap <N>\" is the compute capacity the "
 		       "scheduler works with,\n             1024 being the "
 		       "most capable core of the system\n");
+	if (jent_have_type(list, "perf "))
+		printf("             \"perf <N>\" is the performance ranking "
+		       "the firmware gives the\n             core, 255 being "
+		       "the maximum - AMD reports no core type\n");
 	printf("  BaseMHz    nominal base frequency, not the clock the CPU "
 	       "currently runs at\n");
 	printf("  TmrMHz     rate of the %s, which the Jitter RNG times "
@@ -2481,26 +2528,26 @@ static void print_cpus(const struct jent_cpu_list *list)
 			if (amd && known == 1)
 				print_note(&heading,
 					   "The counter rate is not enumerated "
-					   "by this CPU - AMD implements\n"
-					   "neither CPUID leaf carrying it - so "
-					   "only the operating system knows it.");
+					   "by this CPU: AMD implements neither\n"
+					   "CPUID leaf carrying it, so only the "
+					   "operating system knows it.");
 			else if (amd)
 				print_note(&heading,
 					   "The counter rate is not enumerated "
-					   "by this CPU: AMD implements\nneither "
+					   "by this CPU: AMD implements neither\n"
 					   "CPUID leaf carrying it, and the "
-					   "operating system determines it\non "
+					   "operating system determines it on "
 					   "its own.");
 			else if (known == 1)
 				print_note(&heading,
 					   "The counter rate is not enumerated "
-					   "by this CPU, so only the\noperating "
+					   "by this CPU, so only the operating\n"
 					   "system knows it.");
 			else
 				print_note(&heading,
 					   "The counter rate is not enumerated "
-					   "by this CPU, and the operating\n"
-					   "system determines it on its own.");
+					   "by this CPU, and the operating "
+					   "system\ndetermines it on its own.");
 		}
 
 		if (!have_freq)

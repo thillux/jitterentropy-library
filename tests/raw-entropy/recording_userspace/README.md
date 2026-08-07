@@ -135,8 +135,10 @@ from what the architecture guarantees for the generic timer.
 
 Where a value is unknown, the reason is given below the table rather than left
 to a dash. AMD enumerates neither its base frequency nor its counter rate in
-CPUID, so on an AMD system without cpufreq - a virtual machine, typically -
-both are unknown; and a recording taken under a hypervisor characterizes the
+CPUID: the base frequency is taken from the nominal frequency of the CPPC
+tables there, and the counter rate stays unknown. On a machine that has
+neither cpufreq nor those tables - a virtual machine, typically - no frequency
+is reported at all. A recording taken under a hypervisor characterizes the
 virtual CPU, which the tool says as well.
 
 With `--json` the same data is written as JSON, for scripts that drive one
