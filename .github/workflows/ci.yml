@@ -1409,6 +1409,20 @@ jobs:
       # reports. It is carried to the later steps in the environment, while
       # PATH and the loader variables keep using the bash form, which is the
       # one those need.
+      #
+      # CMAKE_BUILD_TYPE has to name the configuration the install below asks
+      # for, or the package installs without the half of it that says where the
+      # library is. install(EXPORT) writes the target definitions in two files:
+      # jitterentropyTargets.cmake, installed unconditionally, and a per-
+      # configuration jitterentropyTargets-<config>.cmake carrying
+      # IMPORTED_LOCATION, whose install rule is guarded on the configuration
+      # being installed. A single-config generator with no CMAKE_BUILD_TYPE
+      # builds the "noconfig" one, which "cmake --install --config Release" then
+      # does not match, leaving find_package() with an imported target that has
+      # no file behind it - "IMPORTED_LOCATION or IMPORTED_IMPLIB not set". The
+      # macOS and Linux runners default to such a generator; Windows uses the
+      # multi-config Visual Studio one, where the build type comes from --config
+      # and this variable is ignored.
       - name: Build and install the library
         run: |
           prefix="$PWD/prefix"
@@ -1418,6 +1432,7 @@ jobs:
           echo "JENT_PREFIX=$prefix" >> "$GITHUB_ENV"
           cmake -S . -B build \
             -DBUILD_SHARED_LIBS=${{ matrix.shared }} \
+            -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$prefix" \
             -DCMAKE_INSTALL_LIBDIR=lib
           cmake --build build --config Release --parallel 4
