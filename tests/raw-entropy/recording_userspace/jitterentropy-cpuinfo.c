@@ -111,8 +111,17 @@ struct jent_cpu_list {
 	 * output branches on, as it is what decides how complete the listing is.
 	 */
 	const char *backend;
-	/* The same in prose, for the table output. NULL if there is nothing to say. */
+	/*
+	 * The same in prose, printed as a note below the table. NULL if there
+	 * is nothing to say. Wrapped to fit the indentation of a note there.
+	 */
 	const char *note;
+	/*
+	 * How a recording is confined to one core type on a system without CPU
+	 * pinning, or NULL where there is no way to do so. Printed in place of
+	 * the --cpu line, and indented as that one is.
+	 */
+	const char *select;
 };
 
 /* Set the fields whose "unknown" value is not zero. */
@@ -520,6 +529,50 @@ static void jent_caches_x86(struct jent_cpu_info *info)
 #endif /* JENT_CPUINFO_X86 && JENT_CPUINFO_GENERIC */
 
 /***************************************************************************
+ * AArch64 timer
+ *
+ * Shared by the Linux and the macOS backend - the register is architected and
+ * the Jitter RNG reads its counterpart on either system. The BSDs are left out
+ * deliberately: nothing there has been verified to enable the EL0 access this
+ * needs, and a read that traps would take the tool down with SIGILL.
+ ***************************************************************************/
+
+#if defined(JENT_CPUINFO_ARM64) && \
+    (defined(JENT_CPUINFO_LINUX) || defined(JENT_CPUINFO_MACOS))
+
+/*
+ * The rate of the architected generic timer, CNTFRQ_EL0, which is the
+ * counterpart of the x86 timestamp counter: CNTVCT_EL0 is what the Jitter RNG
+ * reads for its timings on this architecture, and CNTFRQ_EL0 states its
+ * frequency. Both are readable at EL0.
+ *
+ * The counter is architecturally required to run at a constant frequency, to
+ * be independent of the CPU clock and not to stop while the core is in a low
+ * power state (Arm ARM (DDI 0487), "The system counter must be implemented in
+ * an always-on power domain"), so the three properties below are answered from
+ * the architecture rather than from a feature bit. The rate is commonly far
+ * lower than an x86 TSC - tens of MHz - which is the resolution the noise
+ * measurements are bounded by here.
+ */
+static void jent_timer_arm64(struct jent_cpu_info *info)
+{
+	uint64_t freq;
+
+	__asm__ __volatile__("mrs %0, cntfrq_el0" : "=r" (freq));
+
+	/* Firmware that leaves the register at zero has not set it up. */
+	if (!freq)
+		return;
+
+	info->tsc_khz = (unsigned long)(freq / 1000);
+	info->tsc_invariant = 1;
+	info->tsc_nonstop = 1;
+	info->tsc_known_freq = 1;
+}
+
+#endif /* JENT_CPUINFO_ARM64 && (JENT_CPUINFO_LINUX || JENT_CPUINFO_MACOS) */
+
+/***************************************************************************
  * Linux backend
  *
  * sysfs describes the caches and the topology of every CPU without any
@@ -732,36 +785,6 @@ static void jent_caches_linux(struct jent_cpu_info *info)
 }
 
 #ifdef JENT_CPUINFO_ARM64
-
-/*
- * The rate of the architected generic timer, CNTFRQ_EL0, which is the
- * counterpart of the x86 timestamp counter: CNTVCT_EL0 is what the Jitter RNG
- * reads for its timings on this architecture, and CNTFRQ_EL0 states its
- * frequency. Both are readable at EL0.
- *
- * The counter is architecturally required to run at a constant frequency, to
- * be independent of the CPU clock and not to stop while the core is in a low
- * power state (Arm ARM (DDI 0487), "The system counter must be implemented in
- * an always-on power domain"), so the three properties below are answered from
- * the architecture rather than from a feature bit. The rate is commonly far
- * lower than an x86 TSC - tens of MHz - which is the resolution the noise
- * measurements are bounded by here.
- */
-static void jent_timer_arm64(struct jent_cpu_info *info)
-{
-	uint64_t freq;
-
-	__asm__ __volatile__("mrs %0, cntfrq_el0" : "=r" (freq));
-
-	/* Firmware that leaves the register at zero has not set it up. */
-	if (!freq)
-		return;
-
-	info->tsc_khz = (unsigned long)(freq / 1000);
-	info->tsc_invariant = 1;
-	info->tsc_nonstop = 1;
-	info->tsc_known_freq = 1;
-}
 
 static const struct {
 	unsigned long id;
@@ -1268,9 +1291,48 @@ static int sysctl_level_num(int level, const char *attr,
 	return sysctl_num(name, val);
 }
 
+/*
+ * The counter the Jitter RNG takes its timings from. On Apple Silicon that is
+ * the architected generic timer, whose rate the register states directly - the
+ * same 24 MHz that hw.tbfrequency reports, as macOS drives mach_absolute_time()
+ * from that counter as well. On the Intel Macs it is the timestamp counter,
+ * whose rate the kernel publishes in Hz; how it arrived at the value is not
+ * stated there, so the properties of the counter are left unknown rather than
+ * assumed - the CPUID path that answers them elsewhere is not compiled here.
+ */
+static void jent_timer_macos(struct jent_cpu_info *info)
+{
+#ifdef JENT_CPUINFO_ARM64
+	jent_timer_arm64(info);
+#elif defined(JENT_CPUINFO_X86)
+	unsigned long long freq = 0;
+
+	if (!sysctl_num("machdep.tsc.frequency", &freq) && freq)
+		info->tsc_khz = (unsigned long)(freq / 1000);
+#else
+	(void)info;
+#endif
+}
+
+/*
+ * macOS states outright whether it runs under a hypervisor, which is the more
+ * reliable answer than the x86 CPUID bit and the only one available on Apple
+ * Silicon. The sysctl is present since macOS 11; on the releases before it the
+ * answer stays unknown.
+ */
+static int jent_hypervisor_macos(void)
+{
+	unsigned long long present = 0;
+
+	if (sysctl_num("kern.hv_vmm_present", &present))
+		return -1;
+
+	return present ? 1 : 0;
+}
+
 static int jent_get_cpus(struct jent_cpu_list *list)
 {
-	unsigned long long nlevels = 0, freq = 0, ncpu = 0;
+	unsigned long long nlevels = 0, freq = 0, ncpu = 0, packages = 0;
 	/* Sized so that vendor, blank and model always fit into ident. */
 	char ident[JENT_IDENT_LEN - 64] = "", vendor[63] = "";
 	int level, levels;
@@ -1288,16 +1350,38 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 	list->pinning = 0;
 	list->backend = "macos";
 	list->note =
-		"macOS describes the cores per performance level, not per CPU, "
-		"and offers no\nthread-to-CPU pinning: the CPU column holds "
-		"the position in this listing, which\nstarts with the fastest "
-		"level.";
+		"macOS describes the cores per performance level, not per "
+		"CPU: the CPU\ncolumn is the position in this listing, "
+		"fastest level first, and Core\ncounts within a level - equal "
+		"Core numbers of different Types are\ndifferent cores.";
+	/*
+	 * The efficiency cores are still reachable: macOS schedules the lowest
+	 * quality-of-service class on them alone, which is what --e-cores asks
+	 * for. There is no counterpart for the performance cores - they are
+	 * where a measurement runs when it asks for nothing.
+	 */
+	list->select =
+		"  jitterentropy-hashtime <rounds> <repeats> <file> --e-cores\n"
+		"  No thread-to-CPU pinning here: --e-cores selects the "
+		"efficiency cores and\n  --p-cores asks for the performance "
+		"ones, which a recording uses anyway\n  unless the process was "
+		"put in the background.";
+
+	list->hypervisor = jent_hypervisor_macos();
 
 	/* Present on Intel Macs only; Apple Silicon reports the model alone. */
 	sysctl_str("machdep.cpu.vendor", vendor, sizeof(vendor));
 	sysctl_str("machdep.cpu.brand_string", ident, sizeof(ident));
 	if (sysctl_num("hw.cpufrequency_max", &freq))
 		freq = 0;
+
+	/*
+	 * Which CPU sits in which package is not reported, so the package is
+	 * only known when there is a single one - which every Mac but the
+	 * two-socket Mac Pros is.
+	 */
+	if (sysctl_num("hw.packages", &packages) || packages != 1)
+		packages = 0;
 
 	if (sysctl_num("hw.nperflevels", &nlevels) || nlevels < 2)
 		nlevels = 0;
@@ -1308,7 +1392,7 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 		unsigned long long l2 = 0, l3 = 0, per_l2 = 0, i;
 		/* Negative selects the flat hw.* names for a uniform system. */
 		int sel = nlevels ? level : -1;
-		char name[64], type[64] = "";
+		char name[64], type[64] = "", core_type[JENT_TYPE_LEN] = "";
 
 		if (sysctl_level_num(sel, "logicalcpu", &logical) || !logical)
 			continue;
@@ -1326,11 +1410,32 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 		if (sysctl_num("hw.l3cachesize", &l3))
 			l3 = 0;
 
+		/*
+		 * A system with a single performance level has one core type,
+		 * so there is nothing to tell apart and the type stays empty -
+		 * which is what the other backends report for a CPU that
+		 * announces no core type as well.
+		 */
 		if (nlevels) {
 			snprintf(name, sizeof(name), "hw.perflevel%d.name",
 				 level);
 			if (sysctl_str(name, type, sizeof(type)))
 				type[0] = '\0';
+
+			/*
+			 * The level names are "Performance" and "Efficiency";
+			 * fall back to the level order, which Apple documents
+			 * as fastest first.
+			 */
+			if (type[0] == 'P' || (!type[0] && level == 0))
+				snprintf(core_type, sizeof(core_type),
+					 "P-core");
+			else if (type[0] == 'E' || !type[0])
+				snprintf(core_type, sizeof(core_type),
+					 "E-core");
+			else
+				snprintf(core_type, sizeof(core_type), "%s",
+					 type);
 		}
 
 		for (i = 0; i < logical && n < JENT_MAX_CPUS; i++, n++) {
@@ -1339,9 +1444,21 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 			jent_cpu_info_init(info);
 			info->cpu = (unsigned long)n;
 			info->cpu_valid = 1;
-			/* SMT siblings are consecutive on the Intel Macs. */
+			if (packages)
+				info->pkg = 0;
+			/*
+			 * SMT siblings are consecutive on the Intel Macs.
+			 *
+			 * The count is the one of the performance level and
+			 * starts at zero for each of them, as that is what
+			 * macOS describes - it has no numbering spanning the
+			 * levels to report. Two cores of different levels
+			 * therefore carry the same number without being the
+			 * same core, which the note below states.
+			 */
 			info->core = (long)(i / (logical / physical));
 			info->max_khz = (unsigned long)(freq / 1000);
+			jent_timer_macos(info);
 
 			info->l1d.size = (unsigned long)l1d;
 			info->l1d.shared = 1;
@@ -1356,20 +1473,8 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 				 vendor, (vendor[0] && ident[0]) ? " " : "",
 				 ident);
 
-			/*
-			 * The level names are "Performance" and "Efficiency";
-			 * fall back to the level order, which Apple documents
-			 * as fastest first.
-			 */
-			if (type[0] == 'P' || (!type[0] && level == 0))
-				snprintf(info->type, sizeof(info->type),
-					 "P-core");
-			else if (type[0] == 'E' || !type[0])
-				snprintf(info->type, sizeof(info->type),
-					 "E-core");
-			else
-				snprintf(info->type, sizeof(info->type), "%s",
-					 type);
+			snprintf(info->type, sizeof(info->type), "%s",
+				 core_type);
 		}
 	}
 
@@ -1899,10 +2004,9 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 		n = 1;
 
 		list->note =
-			"This system has no interface describing the individual "
-			"CPUs, so only the CPU\nthis tool runs on is reported - "
-			"on a hybrid CPU, run the tool repeatedly to see\nthe "
-			"other core types.";
+			"This system describes no CPU but the one this tool "
+			"runs on. On a\nhybrid CPU, run it repeatedly to see "
+			"the other core types.";
 	} else if (n < list->ncpu) {
 		list->note =
 			"Only the CPUs this tool could place itself on are "
@@ -2003,11 +2107,11 @@ static void format_num(long val, char *buf, size_t buflen)
 #define JENT_FLAG_NONE	(-1)	/* no CPU reports it */
 #define JENT_FLAG_MIXED	(-2)	/* the CPUs disagree */
 
-/* What the counter of this architecture is called. */
+/* What the counter of this architecture is called, named mid-sentence. */
 #ifdef JENT_CPUINFO_ARM64
-# define JENT_TIMER_NAME	"Generic timer"
+# define JENT_TIMER_NAME	"generic timer"
 #else
-# define JENT_TIMER_NAME	"Timestamp counter"
+# define JENT_TIMER_NAME	"timestamp counter"
 #endif
 
 enum jent_tsc_prop {
@@ -2078,6 +2182,44 @@ static const char *jent_flag_str(int value)
 	}
 }
 
+/* Does any CPU report the scheduler capacity in place of a core type? */
+static int jent_have_capacity(const struct jent_cpu_list *list)
+{
+	long i;
+
+	for (i = 0; i < list->entries; i++) {
+		if (!strncmp(list->cpu[i].type, "cap ", 4))
+			return 1;
+	}
+
+	return 0;
+}
+
+/*
+ * One entry of the notes below the table: what a dash in a column means, what
+ * the listing does not cover, and what the machine is. Printed as a bullet,
+ * with the lines the text is wrapped into indented to match, and the heading
+ * emitted before the first note there is - a system with nothing to report
+ * gets no empty section.
+ */
+static void print_note(int *heading, const char *text)
+{
+	const char *p;
+
+	if (!*heading) {
+		printf("\nNotes:\n");
+		*heading = 1;
+	}
+
+	printf("  - ");
+	for (p = text; *p; p++) {
+		putchar(*p);
+		if (*p == '\n')
+			printf("    ");
+	}
+	putchar('\n');
+}
+
 static void print_cpus(const struct jent_cpu_list *list)
 {
 	const char *idents[JENT_MAX_CPUS];
@@ -2133,45 +2275,56 @@ static void print_cpus(const struct jent_cpu_list *list)
 		       mhz, tsc, l1d, l1i, l2, l3, ident);
 	}
 
-	printf("\nCache sizes are given in KiB, followed by the number of CPUs "
-	       "sharing the cache.\n");
-	printf("Type is the core type the system reports. Where it reports "
-	       "none - on ARM - the\nrelative compute capacity the scheduler "
-	       "was given is shown instead: 1024 is the\nmost capable core of "
-	       "the system, and equal values mean equivalent cores.\n");
-	printf("CPUs with the same Pkg and Core are SMT siblings of one "
-	       "physical core and share\nits caches - measuring both of them "
-	       "measures the same core.\n");
-	printf("BaseMHz is the nominal base frequency, not what the CPU "
-	       "currently runs at. TmrMHz\nis the rate of the counter the "
-	       "Jitter RNG takes its timings from - the timestamp\ncounter on "
-	       "x86, the architected generic timer on ARM.\n");
+	printf("\nColumns:\n");
+	printf("  Pkg, Core  package and core ID - equal in both means SMT "
+	       "siblings of one core\n");
+	printf("  Type       core type as the system reports it\n");
+	/* ARM reports none, so the Type column holds the capacity there. */
+	if (jent_have_capacity(list))
+		printf("             \"cap <N>\" is the compute capacity the "
+		       "scheduler works with,\n             1024 being the "
+		       "most capable core of the system\n");
+	printf("  BaseMHz    nominal base frequency, not the clock the CPU "
+	       "currently runs at\n");
+	printf("  TmrMHz     rate of the %s, which the Jitter RNG times "
+	       "with\n", JENT_TIMER_NAME);
+	printf("  L1d - L3   cache size in KiB, followed by the number of "
+	       "CPUs sharing it\n");
 
 	/*
-	 * The properties of the timestamp counter, which is what the Jitter RNG
-	 * times its noise sources with on x86. They belong to the part rather
-	 * than to a core, so they are summarized here instead of taking three
-	 * more columns - and if the CPUs ever disagree, that is what is said.
+	 * The properties of that counter. They belong to the part rather than
+	 * to a core, so they are summarized here instead of taking three more
+	 * columns - and if the CPUs ever disagree, that is what is said.
 	 */
 	if (jent_tsc_flag(list, jent_tsc_invariant) != JENT_FLAG_NONE ||
 	    jent_tsc_flag(list, jent_tsc_nonstop) != JENT_FLAG_NONE ||
 	    jent_tsc_flag(list, jent_tsc_known_freq) != JENT_FLAG_NONE) {
-		printf("%s: invariant/constant %s, nonstop %s, "
-		       "known frequency %s\n", JENT_TIMER_NAME,
+		printf("\nTimer: invariant %s, nonstop %s, known rate %s\n",
 		       jent_flag_str(jent_tsc_flag(list, jent_tsc_invariant)),
 		       jent_flag_str(jent_tsc_flag(list, jent_tsc_nonstop)),
 		       jent_flag_str(jent_tsc_flag(list,
 						   jent_tsc_known_freq)));
 	}
 
-	/*
-	 * A dash in these columns has a reason, and next to a "known frequency
-	 * yes" the reader deserves to be told which: the value exists, it is
-	 * just not somewhere this tool can read it.
-	 */
 	{
-		int have_freq = 0, have_tsc = 0;
+		int have_freq = 0, have_tsc = 0, heading = 0;
 
+		/* What the listing covers comes before what it is missing. */
+		if (list->note)
+			print_note(&heading, list->note);
+
+		if (list->hypervisor == 1)
+			print_note(&heading,
+				   "Running under a hypervisor: the CPU "
+				   "described is the virtual one, and\na "
+				   "recording includes the timing behavior of "
+				   "the host.");
+
+		/*
+		 * A dash in these columns has a reason, and next to a "known
+		 * rate yes" the reader deserves to be told which: the value
+		 * exists, it is just not somewhere this tool can read it.
+		 */
 		for (i = 0; i < list->entries; i++) {
 			if (list->cpu[i].base_khz || list->cpu[i].max_khz)
 				have_freq = 1;
@@ -2181,31 +2334,27 @@ static void print_cpus(const struct jent_cpu_list *list)
 
 		if (!have_tsc &&
 		    jent_tsc_flag(list, jent_tsc_known_freq) == 1) {
-			printf("The counter rate is not enumerated by this "
-			       "CPU, so only the operating system\nknows it");
+			char buf[256];
+
 			/*
 			 * On AMD that is the normal case rather than a gap in
 			 * this tool, which is worth saying outright.
 			 */
-			if (jent_vendor_is(list, "AuthenticAMD"))
-				printf(" - AMD implements neither of the CPUID "
-				       "leaves carrying it");
-			printf(".\n");
+			snprintf(buf, sizeof(buf),
+				 "The counter rate is not enumerated by this "
+				 "CPU, so only the\noperating system knows "
+				 "it%s.",
+				 jent_vendor_is(list, "AuthenticAMD") ?
+				 " - AMD implements neither CPUID leaf "
+				 "carrying it" : "");
+			print_note(&heading, buf);
 		}
 
 		if (!have_freq)
-			printf("No frequency is reported: this CPU enumerates "
-			       "none and the operating system\nhas no cpufreq "
-			       "information for it either.\n");
+			print_note(&heading,
+				   "No frequency is reported: neither the CPU "
+				   "nor the operating system\nstates one.");
 	}
-
-	if (list->hypervisor == 1)
-		printf("Running under a hypervisor: the CPU described here is "
-		       "the virtual one, and the\ntiming behavior of a "
-		       "recording includes that of the host.\n");
-
-	if (list->note)
-		printf("\n%s\n", list->note);
 
 	if (nidents) {
 		printf("\nModels:\n");
@@ -2213,19 +2362,17 @@ static void print_cpus(const struct jent_cpu_list *list)
 			printf("  #%d: %s\n", j + 1, idents[j]);
 	}
 
+	printf("\nRecording:\n");
 	if (list->pinning)
-		printf("\nTo record the raw noise of one core, pin the "
-		       "measurement to it:\n"
-		       "  jitterentropy-hashtime <rounds> <repeats> <file> "
-		       "--cpu <CPU>\n"
-		       "The configuration a recording is made with is shown "
-		       "with:\n"
-		       "  jitterentropy-hashtime 1 1 unused --cpu <CPU> "
-		       "--status\n");
+		printf("  jitterentropy-hashtime <rounds> <repeats> <file> "
+		       "--cpu <CPU>\n");
+	else if (list->select)
+		printf("%s\n", list->select);
 	else
-		printf("\nThis system offers no thread-to-CPU pinning, so "
-		       "jitterentropy-hashtime cannot\nconfine a recording to "
-		       "one core with --cpu.\n");
+		printf("  This system offers no thread-to-CPU pinning, so a "
+		       "recording cannot be\n  confined to one core.\n");
+	printf("  Add --status to print the configuration a recording is made "
+	       "with.\n");
 }
 
 /*

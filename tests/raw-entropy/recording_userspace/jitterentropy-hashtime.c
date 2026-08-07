@@ -41,6 +41,12 @@
 #include <sched.h>	/* sched_setaffinity() for --cpu */
 #endif
 
+#ifdef __APPLE__
+#include <pthread.h>
+#include <sys/qos.h>		/* QoS classes for --e-cores and --p-cores */
+#include <sys/resource.h>	/* PRIO_DARWIN_PROCESS for --p-cores */
+#endif
+
 #include "jitterentropy-sha3.c"
 #include "jitterentropy-gcd.c"
 #include "jitterentropy-health.c"
@@ -129,8 +135,104 @@ static int jent_pin_cpu(unsigned long cpu)
 #endif
 }
 
+/*
+ * Whether the function above can place the measurement at all, which decides
+ * whether --cpu is offered. The conditions are the ones it is made of: the
+ * portable primitive of the library places a thread on the systems named here
+ * and on no other - macOS has only the affinity hint, which names no CPU,
+ * OpenBSD nothing at all, and the remaining systems have no backend there -
+ * while without that primitive only the Linux fallback above is left.
+ *
+ * The option is still parsed where it is not offered, so that passing it is
+ * answered with the reason the measurement cannot be placed rather than with
+ * "unknown option".
+ */
+#ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
+# if defined(_MSC_VER) || defined(__MINGW32__) || defined(__linux__) || \
+     defined(__FreeBSD__) || defined(__NetBSD__)
+#  define JENT_HAVE_CPU_PINNING
+# endif
+#elif defined(__linux__)
+# define JENT_HAVE_CPU_PINNING
+#endif
+
+#ifdef JENT_HAVE_CPU_PINNING
+# define JENT_USAGE_CPU		"|--cpu <NUM>"
+#else
+# define JENT_USAGE_CPU		""
+#endif
+
 /* Set when --cpu confined the measurement to a single CPU. */
 static int jent_cpu_pinned = 0;
+
+/*
+ * Ask for the core type the measurement is to run on.
+ *
+ * macOS offers no CPU pinning at all (see jent_pin_cpu() above), so on Apple
+ * Silicon a recording cannot be placed on a core of a chosen type the way it is
+ * elsewhere. What the system does offer is the quality-of-service class of a
+ * thread, which is what it schedules the core types by:
+ *
+ *   QOS_CLASS_BACKGROUND is run on the efficiency cores and on no other, so it
+ *   selects them - a confinement, as far as a recording is concerned.
+ *
+ *   QOS_CLASS_USER_INTERACTIVE is the highest class and the one the performance
+ *   cores are given first, but it is a preference rather than a confinement:
+ *   such a thread can still be moved to an efficiency core when the machine is
+ *   busy. It is also the class a command started from a shell already carries,
+ *   so asking for it changes nothing there.
+ *
+ * What does take a recording onto the efficiency cores unnoticed is a process
+ * placed in the background - "taskpolicy -b", a launchd job marked as such -
+ * and that is a policy of the task which the class of a thread does not lift:
+ * measured under taskpolicy -b, the same workload stays at 815 ms whether or
+ * not the class above is requested, against 240 ms in the foreground. Asking
+ * for the performance cores therefore clears that policy first, which brings it
+ * back to 244 ms. It is not a cure for every way a process can be held there -
+ * one started through posix_spawn() with a background QoS attribute stays on
+ * the efficiency cores regardless - so the option remains a request, and the
+ * recording is what says whether it was granted.
+ *
+ * The class is inherited by the threads created afterwards, so the counting
+ * thread of the internal timer follows the measurement onto the same cores.
+ *
+ * What jent_pin_cpu() says about the memory block holds here as well: its size
+ * comes from the largest cache in the system, not from the core the recording
+ * is made on, so --max-mem is what matches it to the efficiency cores.
+ *
+ * What --e-cores records is the efficiency cores as macOS runs background work
+ * on them, which includes the lower clock the system gives that class - it is
+ * not the same core running at its own maximum frequency, and no interface
+ * exposes that combination. Being the only way to reach these cores, it is what
+ * a recording of them looks like.
+ */
+static int jent_select_cores(int performance)
+{
+#ifdef __APPLE__
+	int ret;
+
+	/* Priority zero is what takes the process out of the background. */
+	if (performance && setpriority(PRIO_DARWIN_PROCESS, 0, 0))
+		return -errno;
+
+	ret = pthread_set_qos_class_self_np(performance ?
+					    QOS_CLASS_USER_INTERACTIVE :
+					    QOS_CLASS_BACKGROUND, 0);
+
+	/* The call reports the error directly rather than through errno. */
+	return ret ? -ret : 0;
+#else
+	(void)performance;
+	return -ENOSYS;
+#endif
+}
+
+/* Offered where they can be honored, parsed everywhere, as --cpu above. */
+#ifdef __APPLE__
+# define JENT_USAGE_CORES	"|--e-cores|--p-cores"
+#else
+# define JENT_USAGE_CORES	""
+#endif
 
 /***************************************************************************
  * Statistical test logic not compiled for regular operation
@@ -349,6 +451,15 @@ out:
  *	 record one core type at a time (see jitterentropy-cpuinfo). Note that
  *	 the internal timer cannot be used together with this option as its
  *	 counting thread requires a CPU of its own.
+ * --e-cores Confine the measurement to the efficiency cores. macOS only, where
+ *	 there is no CPU pinning and the quality-of-service class of the thread
+ *	 is what selects a core type instead.
+ * --p-cores Ask for the performance cores, which is a preference and not a
+ *	 confinement. macOS only, and only of use where the tool is started with
+ *	 a lower class than a command from a shell carries - that is what would
+ *	 otherwise take the recording onto the efficiency cores unnoticed.
+ *
+ * --cpu, --e-cores and --p-cores are mutually exclusive.
  */
 int main(int argc, char * argv[])
 {
@@ -356,12 +467,13 @@ int main(int argc, char * argv[])
 	unsigned long i, rounds, repeats, cpu = 0;
 	unsigned int flags = 0, osr = 0, loopcnt = 0;
 	unsigned int status = 0;
+	int e_cores = 0, p_cores = 0;
 	enum jent_es jent_es = jent_common;
 	int ret;
 	char pathname[4096];
 
 	if (argc < 4) {
-		printf("%s <rounds per repeat> <number of repeats> <filename> [--ntg1|--force-fips|--disable-memory-access|--disable-internal-timer|--force-internal-timer|--osr <OSR>|--loopcnt <NUM>|--max-mem <NUM>|--hashloop|--memaccess|--all-caches|--hloopcnt <NUM>|--cpu <NUM>|--status]\n", argv[0]);
+		printf("%s <rounds per repeat> <number of repeats> <filename> [--ntg1|--force-fips|--disable-memory-access|--disable-internal-timer|--force-internal-timer|--osr <OSR>|--loopcnt <NUM>|--max-mem <NUM>|--hashloop|--memaccess|--all-caches|--hloopcnt <NUM>" JENT_USAGE_CPU JENT_USAGE_CORES "|--status]\n", argv[0]);
 		return 1;
 	}
 
@@ -575,6 +687,10 @@ int main(int argc, char * argv[])
 				return 1;
 			cpu = val;
 			jent_cpu_pinned = 1;
+		} else if (!strncmp(argv[1], "--e-cores", 9)) {
+			e_cores = 1;
+		} else if (!strncmp(argv[1], "--p-cores", 9)) {
+			p_cores = 1;
 		} else if (!strncmp(argv[1], "--status", 8)) {
 			status = 1;
 		} else {
@@ -586,10 +702,16 @@ int main(int argc, char * argv[])
 		argv++;
 	}
 
+	/* Each names the core to measure on, in ways that cannot be combined. */
+	if (jent_cpu_pinned + e_cores + p_cores > 1) {
+		printf("--cpu, --e-cores and --p-cores are mutually exclusive\n");
+		return 1;
+	}
+
 	/*
-	 * Pin before the first initialization so that every part of the
-	 * measurement - the self tests, the allocation of the memory block and
-	 * the recording itself - is executed on the selected core.
+	 * Select the core before the first initialization so that every part of
+	 * the measurement - the self tests, the allocation of the memory block
+	 * and the recording itself - is executed on it.
 	 */
 	if (jent_cpu_pinned) {
 		ret = jent_pin_cpu(cpu);
@@ -599,6 +721,24 @@ int main(int argc, char * argv[])
 			return 1;
 		}
 		printf("Measurement pinned to CPU %lu\n", cpu);
+	}
+
+	if (e_cores || p_cores) {
+		ret = jent_select_cores(p_cores);
+		if (ret) {
+			printf("Cannot ask for the %s cores: %s\n",
+			       p_cores ? "performance" : "efficiency",
+			       strerror(-ret));
+			return 1;
+		}
+		/*
+		 * Only the efficiency cores are a confinement; the performance
+		 * ones are a preference the scheduler is free to leave.
+		 */
+		if (e_cores)
+			printf("Measurement confined to the efficiency cores\n");
+		else
+			printf("Measurement asked for the performance cores\n");
 	}
 
 	/*

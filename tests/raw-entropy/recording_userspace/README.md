@@ -125,10 +125,10 @@ bounded by. That counter is the timestamp counter on x86 and the architected
 generic timer on ARM, where it commonly runs at a far lower rate.
 
 Its properties are stated below the table, in the terms Linux uses for them:
-`invariant/constant` is a counter that ticks at a constant rate whatever the
-P-state, `nonstop` one that keeps ticking in the deep C-states, and
-`known frequency` says that the rate above was enumerated rather than
-calibrated by the operating system against another timer. On Linux these come
+`invariant` is a counter that ticks at a constant rate whatever the P-state,
+`nonstop` one that keeps ticking in the deep C-states, and `known rate` says
+that the rate above was enumerated rather than calibrated by the operating
+system against another timer. On Linux these come
 from what the kernel concluded (the `constant_tsc`, `nonstop_tsc` and
 `tsc_known_freq` flags of `/proc/cpuinfo`), elsewhere from CPUID or, on ARM,
 from what the architecture guarantees for the generic timer.
@@ -147,6 +147,9 @@ states whether the `--cpu` option below can be used at all:
 
 	./jitterentropy-cpuinfo --json |
 		jq -r '.processors[] | select(.coreType == "E-core") | .cpu'
+
+A `macos` backend reports `"pinning": false` although a core type can still be
+selected there - with `--e-cores` rather than with `--cpu`, as described below.
 
 The recording is confined to one of the listed CPUs with the `--cpu` option of
 `jitterentropy-hashtime`:
@@ -171,6 +174,43 @@ Note that the internal timer cannot be used together with `--cpu`: its
 counting thread requires a CPU of its own, whereas `--cpu` leaves a single CPU
 in the affinity mask. OpenBSD offers no thread affinity API at all, so `--cpu`
 is unavailable there; `jitterentropy-cpuinfo` says so in its output.
+
+`jitterentropy-hashtime` offers `--cpu` only where it can place the
+measurement, which is Linux, Windows, FreeBSD and NetBSD - and Linux alone when
+the library is built without its internal timer, whose pinning primitive the
+option uses. Passing it elsewhere is answered with the reason it cannot be
+honored rather than with an unknown-option error.
+
+### Selecting a core type on macOS
+
+macOS offers no thread-to-CPU pinning either, so `--cpu` cannot be used there.
+The efficiency cores can still be recorded on their own: macOS schedules the
+lowest quality-of-service class on them alone, which is what `--e-cores` asks
+for:
+
+	./jitterentropy-hashtime 1000000 1 jent-raw-noise --e-cores
+
+Without that option the recording is made on the performance cores, as that is
+where the system runs a thread that asks for nothing. `--cpu`, `--e-cores` and
+`--p-cores` are mutually exclusive, and the last two are rejected on every
+other system.
+
+The counterpart, `--p-cores`, asks for the performance cores. A command started
+from a shell already carries the class those are given first, so it changes
+nothing there. What it is for is a recording made from a process that was put
+in the background - `taskpolicy -b`, a launchd job marked as such - which macOS
+holds on the efficiency cores through a policy of the task that the class of a
+thread does not lift; `--p-cores` clears that policy. Measured on an M1 Pro, the
+same recording under `taskpolicy -b` takes 3.02 s of CPU time and shows a mean
+timing delta of 795 ticks - an efficiency-core recording, unasked for - and with
+`--p-cores` 0.54 s and 130 ticks, which are the values of a recording made in
+the foreground. It remains a request: a process started through `posix_spawn()`
+with a background QoS attribute is not brought back by it.
+
+The efficiency cores are recorded as macOS runs background work on them, which
+includes the lower clock it gives that class - not the same core at its own
+maximum frequency, a combination no interface exposes. The note on `--max-mem`
+above applies here as well.
 
 ## Recording of Raw Entropy Data
 
