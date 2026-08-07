@@ -124,6 +124,40 @@ struct jent_cpu_list {
 	const char *select;
 };
 
+/*
+ * Set the model of @info to "<vendor> <model>", with the padding removed.
+ *
+ * The brand string of a CPU is a fixed-width field, and the sources differ in
+ * how much of its padding they keep: the string CPUID returns for an AMD part
+ * carries trailing blanks that the same name from /proc/cpuinfo or from the
+ * Windows registry does not. Left in, the two spellings are different strings,
+ * and one machine is listed as two models - which on a system where only some
+ * of the CPUs can be visited is exactly what happens.
+ */
+static void jent_set_ident(struct jent_cpu_info *info, const char *vendor,
+			   const char *model)
+{
+	size_t len;
+
+	if (!vendor)
+		vendor = "";
+	if (!model)
+		model = "";
+
+	while (*vendor == ' ' || *vendor == '\t')
+		vendor++;
+	while (*model == ' ' || *model == '\t')
+		model++;
+
+	snprintf(info->ident, sizeof(info->ident), "%s%s%s", vendor,
+		 (*vendor && *model) ? " " : "", model);
+
+	len = strlen(info->ident);
+	while (len && (info->ident[len - 1] == ' ' ||
+		       info->ident[len - 1] == '\t'))
+		info->ident[--len] = '\0';
+}
+
 /* Set the fields whose "unknown" value is not zero. */
 static void jent_cpu_info_init(struct jent_cpu_info *info)
 {
@@ -278,8 +312,7 @@ static void jent_ident_x86(struct jent_cpu_info *info)
 		}
 	}
 
-	snprintf(info->ident, sizeof(info->ident), "%s%s%s", vendor,
-		 *model ? " " : "", model);
+	jent_set_ident(info, vendor, model);
 
 	if (jent_cpuid(0x1A, 0, r) && r[0]) {
 		switch (r[0] >> 24) {
@@ -840,18 +873,17 @@ static const char *arm_lookup(unsigned long id, int implementer)
  * number in bits[15:4] (Arm ARM (DDI 0487), MIDR_EL1). The part number is
  * what distinguishes the big from the LITTLE cores.
  */
-static void jent_ident_linux(struct jent_cpu_info *info)
+/* What has to be read on the CPU itself - see jent_ident_sysfs() below. */
+static void jent_ident_local(struct jent_cpu_info *info)
+{
+	jent_timer_arm64(info);
+}
+
+static void jent_ident_sysfs(struct jent_cpu_info *info)
 {
 	unsigned long midr, impl, part, variant, revision, capacity;
 	const char *impl_name, *part_name;
 	char part_buf[16];
-
-	/*
-	 * First, and not after the MIDR: the register is read here, where the
-	 * thread is pinned to the CPU being described, and a kernel that does
-	 * not expose the MIDR in sysfs must not cost the timer rate as well.
-	 */
-	jent_timer_arm64(info);
 
 	if (read_cpu_val(info->cpu, "regs/identification/midr_el1", &midr))
 		return;
@@ -892,12 +924,16 @@ static void jent_ident_linux(struct jent_cpu_info *info)
 
 #elif defined(JENT_CPUINFO_X86)
 
-static void jent_ident_linux(struct jent_cpu_info *info)
+/* CPUID answers for the core executing it, so this has to run on that core. */
+static void jent_ident_local(struct jent_cpu_info *info)
 {
-	unsigned long perf;
-
 	jent_ident_x86(info);
 	jent_freq_x86(info);
+}
+
+static void jent_ident_sysfs(struct jent_cpu_info *info)
+{
+	unsigned long perf;
 
 	/*
 	 * AMD reports no core type: its dense cores (Zen 4c/5c) are the same
@@ -906,6 +942,10 @@ static void jent_ident_linux(struct jent_cpu_info *info)
 	 * them. Where the amd-pstate driver is in use, the highest performance
 	 * level the firmware gives each core is the ranking that separates the
 	 * preferred cores from the rest.
+	 *
+	 * Read from sysfs and therefore also for the CPUs this tool cannot
+	 * place itself on - it is a ranking of the cores, which is exactly what
+	 * such a listing must not lose.
 	 */
 	if (!info->type[0] &&
 	    !read_cpu_val(info->cpu, "cpufreq/amd_pstate_highest_perf", &perf))
@@ -915,25 +955,53 @@ static void jent_ident_linux(struct jent_cpu_info *info)
 #else /* neither x86 nor AArch64 */
 
 /*
- * Generic identification from /proc/cpuinfo: the per-CPU block introduced by
- * "processor : <N>" is searched for the first key that names the CPU. Which
- * key that is differs per architecture (RISC-V uses "uarch", POWER "cpu",
- * s390 "machine"), and some architectures report nothing per CPU at all.
+ * Neither x86 nor AArch64: nothing is read from the CPU itself, and what names
+ * it comes from /proc/cpuinfo through jent_models_linux() below.
  */
-static void jent_ident_linux(struct jent_cpu_info *info)
+static void jent_ident_local(struct jent_cpu_info *info)
+{
+	(void)info;
+}
+
+static void jent_ident_sysfs(struct jent_cpu_info *info)
+{
+	(void)info;
+}
+
+#endif /* JENT_CPUINFO_ARM64 */
+
+/*
+ * Name the CPUs that are still unnamed, from /proc/cpuinfo.
+ *
+ * This is what describes the CPUs the tool could not place itself on - CPUID
+ * has to be executed on the core it is to describe, while the kernel publishes
+ * a name for every CPU here regardless. It is also the only identification on
+ * the architectures that have neither CPUID nor a MIDR in sysfs, where the key
+ * naming the CPU differs per architecture (RISC-V uses "uarch", POWER "cpu",
+ * s390 "machine").
+ *
+ * On x86 the vendor is prepended, so that a CPU named here and one named from
+ * CPUID yield the same string and the listing does not show one machine as two
+ * different models.
+ *
+ * The file holds a block per CPU and is walked once: reading it per CPU would
+ * be quadratic, which on the machines that have enough CPUs for this to matter
+ * is exactly the wrong behavior.
+ */
+static void jent_models_linux(struct jent_cpu_list *list)
 {
 	static const char *keys[] = { "model name", "uarch", "cpu model",
 				      "cpu", "machine" };
 	FILE *f = fopen("/proc/cpuinfo", "r");
-	char line[512];
-	long cur = -1;
+	char line[512], vendor[64] = "";
+	long cur = -1, i;
 
 	if (!f)
 		return;
 
 	while (fgets(line, sizeof(line), f)) {
 		char *val = strchr(line, ':');
-		size_t i, keylen;
+		size_t k, keylen;
 
 		if (!val)
 			continue;
@@ -950,25 +1018,39 @@ static void jent_ident_linux(struct jent_cpu_info *info)
 
 		if (!strcmp(line, "processor")) {
 			cur = strtol(val, NULL, 10);
+			vendor[0] = '\0';
+			continue;
+		}
+		if (cur < 0)
+			continue;
+
+		/* Precedes the model name in the block. */
+		if (!strcmp(line, "vendor_id")) {
+			snprintf(vendor, sizeof(vendor), "%s", val);
 			continue;
 		}
 
-		if (cur < 0 || (unsigned long)cur != info->cpu)
-			continue;
-
-		for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-			if (strcmp(line, keys[i]))
+		for (k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+			if (strcmp(line, keys[k]))
 				continue;
-			snprintf(info->ident, sizeof(info->ident), "%s", val);
-			fclose(f);
-			return;
+
+			for (i = 0; i < list->entries; i++) {
+				struct jent_cpu_info *info = &list->cpu[i];
+
+				if (!info->cpu_valid ||
+				    info->cpu != (unsigned long)cur ||
+				    info->ident[0])
+					continue;
+
+				jent_set_ident(info, vendor, val);
+				break;
+			}
+			break;
 		}
 	}
 
 	fclose(f);
 }
-
-#endif /* JENT_CPUINFO_ARM64 */
 
 #ifdef JENT_CPUINFO_X86
 
@@ -1128,9 +1210,12 @@ static int pin_to_cpu(unsigned long cpu)
 
 static int jent_get_cpus(struct jent_cpu_list *list)
 {
+	static char unreachable_note[512];
 	unsigned long cpu_ids[JENT_MAX_CPUS];
 	char online[1024];
-	long ncpu, i;
+	long ncpu, i, unreachable = 0;
+	cpu_set_t *previous;
+	size_t setsize;
 	int ret;
 
 	ret = read_file_str(JENT_SYSFS_CPU "/online", online, sizeof(online));
@@ -1150,10 +1235,32 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 	list->ncpu = ncpu;
 	list->pinning = 1;
 	list->backend = "linux";
+
+	/* Before cpu_ids is read below: only that many of them were stored. */
 	if (ncpu > JENT_MAX_CPUS) {
 		fprintf(stderr, "Only the first %d of %ld online CPUs are "
 			"reported\n", JENT_MAX_CPUS, ncpu);
 		ncpu = JENT_MAX_CPUS;
+	}
+
+	/*
+	 * The affinity of this thread, kept to be restored once every CPU has
+	 * been visited - the walk below moves the thread across the machine and
+	 * has no business leaving it somewhere else.
+	 *
+	 * Allocated for the highest CPU number seen, which on a large machine
+	 * exceeds the CPU_SETSIZE a plain cpu_set_t covers.
+	 */
+	{
+		unsigned int ncpu_set = (unsigned int)(cpu_ids[ncpu - 1] + 1);
+
+		previous = CPU_ALLOC(ncpu_set);
+		setsize = previous ? CPU_ALLOC_SIZE(ncpu_set) : 0;
+		if (previous && sched_getaffinity(0, setsize, previous)) {
+			CPU_FREE(previous);
+			previous = NULL;
+			setsize = 0;
+		}
 	}
 
 	for (i = 0; i < ncpu; i++) {
@@ -1180,25 +1287,53 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 			info->base_khz = 0;
 
 		jent_caches_linux(info);
+		jent_ident_sysfs(info);
 
 		/*
-		 * The identification must run on the CPU it describes. When
-		 * the tool is confined to a subset of the CPUs (taskset, a
-		 * cpuset or a container), the remaining ones are reported with
-		 * the data that sysfs provides for them.
+		 * The rest has to be read on the CPU it describes. Attempted
+		 * for every CPU rather than only for those of the current
+		 * affinity mask: a mask narrowed with taskset is one the thread
+		 * may widen again itself, and this is the tool that wants to
+		 * see the whole machine. What it cannot cross is a cpuset
+		 * cgroup - a container, a systemd slice - where the move is
+		 * refused and the CPU keeps what the kernel reports about it,
+		 * which is all of the table but the values that exist in the
+		 * CPU alone.
 		 */
-		ret = pin_to_cpu(info->cpu);
-		if (ret) {
-			fprintf(stderr,
-				"CPU %lu: cannot pin to it (%s) - no "
-				"identification\n", info->cpu, strerror(-ret));
+		if (pin_to_cpu(info->cpu)) {
+			unreachable++;
 			continue;
 		}
 
-		jent_ident_linux(info);
+		jent_ident_local(info);
+	}
+
+	if (previous) {
+		sched_setaffinity(0, setsize, previous);
+		CPU_FREE(previous);
 	}
 
 	list->entries = ncpu;
+
+	/* Names the CPUs the loop above could not visit, among others. */
+	jent_models_linux(list);
+
+	if (unreachable) {
+		/*
+		 * One note rather than a line per CPU: on a machine with a
+		 * hundred CPUs the message would otherwise bury the listing it
+		 * belongs to.
+		 */
+		snprintf(unreachable_note, sizeof(unreachable_note),
+			 "%ld of the %ld CPUs could not be visited: this "
+			 "process is confined to a cpuset\nthat does not "
+			 "include them - a container or a cgroup - so what only "
+			 "the CPU\nitself reports is missing for them, its "
+			 "core type on Intel among it. Run outside\nthat "
+			 "confinement to describe every CPU.",
+			 unreachable, ncpu);
+		list->note = unreachable_note;
+	}
 
 #ifdef JENT_CPUINFO_X86
 	jent_tsc_flags_linux(list);
@@ -1469,9 +1604,7 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 			info->l3.size = (unsigned long)l3;
 			info->l3.shared = (unsigned long)ncpu;
 
-			snprintf(info->ident, sizeof(info->ident), "%s%s%s",
-				 vendor, (vendor[0] && ident[0]) ? " " : "",
-				 ident);
+			jent_set_ident(info, vendor, ident);
 
 			snprintf(info->type, sizeof(info->type), "%s",
 				 core_type);
@@ -1627,8 +1760,7 @@ static void jent_ident_windows(struct jent_cpu_info *info)
 			 RRF_RT_REG_SZ, NULL, name, &len) != ERROR_SUCCESS)
 		name[0] = '\0';
 
-	snprintf(info->ident, sizeof(info->ident), "%s%s%s", vendor,
-		 (vendor[0] && name[0]) ? " " : "", name);
+	jent_set_ident(info, vendor, name);
 
 	len = sizeof(mhz);
 	if (RegGetValueA(HKEY_LOCAL_MACHINE, key, "~MHz", RRF_RT_REG_DWORD,
@@ -1948,7 +2080,7 @@ static void jent_describe_current(struct jent_cpu_info *info)
 	char model[JENT_IDENT_LEN] = "";
 
 	if (!sysctl_hw_str(HW_MODEL, model, sizeof(model)) && model[0])
-		snprintf(info->ident, sizeof(info->ident), "%s", model);
+		jent_set_ident(info, NULL, model);
 #endif
 
 	info->base_khz = jent_clockrate();
@@ -2332,22 +2464,43 @@ static void print_cpus(const struct jent_cpu_list *list)
 				have_tsc = 1;
 		}
 
-		if (!have_tsc &&
-		    jent_tsc_flag(list, jent_tsc_known_freq) == 1) {
-			char buf[256];
+		/*
+		 * A dash in that column has a reason, and it is not that the
+		 * rate went unread: on AMD no CPUID leaf carries it, which is
+		 * worth saying outright rather than leaving it to be taken for
+		 * a gap in this tool. Whether the operating system knows the
+		 * rate is worth adding as well - it says so with a flag of its
+		 * own - since that means the value exists, only not anywhere
+		 * this tool can reach. Spelled out per case rather than
+		 * assembled, so that each reads as one sentence.
+		 */
+		if (!have_tsc) {
+			int amd = jent_vendor_is(list, "AuthenticAMD");
+			int known = jent_tsc_flag(list, jent_tsc_known_freq);
 
-			/*
-			 * On AMD that is the normal case rather than a gap in
-			 * this tool, which is worth saying outright.
-			 */
-			snprintf(buf, sizeof(buf),
-				 "The counter rate is not enumerated by this "
-				 "CPU, so only the\noperating system knows "
-				 "it%s.",
-				 jent_vendor_is(list, "AuthenticAMD") ?
-				 " - AMD implements neither CPUID leaf "
-				 "carrying it" : "");
-			print_note(&heading, buf);
+			if (amd && known == 1)
+				print_note(&heading,
+					   "The counter rate is not enumerated "
+					   "by this CPU - AMD implements\n"
+					   "neither CPUID leaf carrying it - so "
+					   "only the operating system knows it.");
+			else if (amd)
+				print_note(&heading,
+					   "The counter rate is not enumerated "
+					   "by this CPU: AMD implements\nneither "
+					   "CPUID leaf carrying it, and the "
+					   "operating system determines it\non "
+					   "its own.");
+			else if (known == 1)
+				print_note(&heading,
+					   "The counter rate is not enumerated "
+					   "by this CPU, so only the\noperating "
+					   "system knows it.");
+			else
+				print_note(&heading,
+					   "The counter rate is not enumerated "
+					   "by this CPU, and the operating\n"
+					   "system determines it on its own.");
 		}
 
 		if (!have_freq)
