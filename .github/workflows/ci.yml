@@ -63,6 +63,8 @@ jobs:
           # is platform-independent, so one job checking it covers all of them;
           # the others only run it.
           "$cpuinfo" --json | python3 -c 'import json,sys; json.load(sys.stdin)'
+          # The summary of the same machine, which is a second table writer.
+          "$cpuinfo" --summary
           export LD_LIBRARY_PATH="$PWD/build:$LD_LIBRARY_PATH"
           for opt in "" "--all-caches" "--force-internal-timer"; do
             ./build/tests/raw-entropy/recording_userspace/jitterentropy-rng 256 $opt > /dev/null

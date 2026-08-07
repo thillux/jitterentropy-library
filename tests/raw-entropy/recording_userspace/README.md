@@ -141,8 +141,24 @@ neither cpufreq nor those tables - a virtual machine, typically - no frequency
 is reported at all. A recording taken under a hypervisor characterizes the
 virtual CPU, which the tool says as well.
 
-With `--json` the same data is written as JSON, for scripts that drive one
-recording per core type. Values the system does not report are `null`,
+With `--summary` the listing holds one row per kind of CPU rather than one per
+CPU, naming the CPUs of each kind. On a machine with a hundred CPUs that says
+in a few lines what the full listing repeats a hundred times, which is what
+the question "how many core types are there, and which CPU do I record for
+each" wants:
+
+	 CPUs Type      BaseMHz  MaxMHz  TmrMHz        L1d ...
+	    4 P-core       1700    5000    2611      48K/2 ...
+	      CPUs 0-3
+	    8 E-core       1200    3700    2611      32K/1 ...
+	      CPUs 4-11
+
+Two CPUs count as of one kind when everything a recording depends on matches:
+the core type, the frequencies, the counter and the caches. The package and
+core numbers are not part of that - they name a CPU rather than describe it.
+
+With `--json` the same data is written as JSON, one entry per CPU, for scripts
+that drive one recording per core type. Values the system does not report are `null`,
 `backend` names where the data comes from (`linux`, `windows`, `macos` or
 `generic`, which is what says how complete the listing is), and `pinning`
 states whether the `--cpu` option below can be used at all:

@@ -2390,21 +2390,70 @@ static void print_note(int *heading, const char *text)
 	putchar('\n');
 }
 
-static void print_cpus(const struct jent_cpu_list *list)
+/*
+ * The model of @info as "#<N>", numbering the distinct ones in the order they
+ * are met and collecting them in @idents for the list below the table. On a
+ * hybrid x86 CPU every core reports the same brand string and the cores are
+ * told apart by their type and caches instead, so one entry commonly stands
+ * for the whole machine.
+ */
+static void format_ident(const struct jent_cpu_info *info, const char **idents,
+			 int *nidents, char *buf, size_t buflen)
 {
-	const char *idents[JENT_MAX_CPUS];
-	int nidents = 0, j;
+	int j;
+
+	if (!info->ident[0]) {
+		snprintf(buf, buflen, "-");
+		return;
+	}
+
+	for (j = 0; j < *nidents; j++) {
+		if (!strcmp(idents[j], info->ident))
+			break;
+	}
+	if (j == *nidents && *nidents < JENT_MAX_CPUS)
+		idents[(*nidents)++] = info->ident;
+
+	snprintf(buf, buflen, "#%d", j + 1);
+}
+
+/* Everything of a CPU that is not the CPU, package and core number. */
+#define JENT_ROW_FMT	"%-9s %7s %7s %7s %10s %10s %10s %11s %6s\n"
+
+static void format_row(const struct jent_cpu_info *info, const char **idents,
+		       int *nidents, char *buf, size_t buflen)
+{
+	char base[16], mhz[16], tsc[16], ident[16];
+	char l1d[24], l1i[24], l2[24], l3[24];
+
+	format_num(info->base_khz ? (long)(info->base_khz / 1000) : -1,
+		   base, sizeof(base));
+	format_num(info->max_khz ? (long)(info->max_khz / 1000) : -1,
+		   mhz, sizeof(mhz));
+	format_num(info->tsc_khz ? (long)(info->tsc_khz / 1000) : -1,
+		   tsc, sizeof(tsc));
+	format_cache(&info->l1d, l1d, sizeof(l1d));
+	format_cache(&info->l1i, l1i, sizeof(l1i));
+	format_cache(&info->l2, l2, sizeof(l2));
+	format_cache(&info->l3, l3, sizeof(l3));
+	format_ident(info, idents, nidents, ident, sizeof(ident));
+
+	snprintf(buf, buflen, JENT_ROW_FMT, info->type[0] ? info->type : "-",
+		 base, mhz, tsc, l1d, l1i, l2, l3, ident);
+}
+
+static void print_table(const struct jent_cpu_list *list, const char **idents,
+			int *nidents)
+{
 	long i;
 
-	printf("%4s %4s %5s %-9s %7s %7s %7s %10s %10s %10s %11s %6s\n",
+	printf("%4s %4s %5s " JENT_ROW_FMT,
 	       "CPU", "Pkg", "Core", "Type", "BaseMHz", "MaxMHz", "TmrMHz",
 	       "L1d", "L1i", "L2", "L3", "Model");
 
 	for (i = 0; i < list->entries; i++) {
 		const struct jent_cpu_info *info = &list->cpu[i];
-		char cpu[16], pkg[16], core[16], ident[16];
-		char base[16], mhz[16], tsc[16];
-		char l1d[24], l1i[24], l2[24], l3[24];
+		char cpu[16], pkg[16], core[16], row[256];
 
 		if (info->cpu_valid)
 			snprintf(cpu, sizeof(cpu), "%lu", info->cpu);
@@ -2412,42 +2461,132 @@ static void print_cpus(const struct jent_cpu_list *list)
 			snprintf(cpu, sizeof(cpu), "?");
 		format_num(info->pkg, pkg, sizeof(pkg));
 		format_num(info->core, core, sizeof(core));
-		format_num(info->max_khz ? (long)(info->max_khz / 1000) : -1,
-			   mhz, sizeof(mhz));
-		format_num(info->base_khz ? (long)(info->base_khz / 1000) : -1,
-			   base, sizeof(base));
-		format_num(info->tsc_khz ? (long)(info->tsc_khz / 1000) : -1,
-			   tsc, sizeof(tsc));
-		format_cache(&info->l1d, l1d, sizeof(l1d));
-		format_cache(&info->l1i, l1i, sizeof(l1i));
-		format_cache(&info->l2, l2, sizeof(l2));
-		format_cache(&info->l3, l3, sizeof(l3));
+		format_row(info, idents, nidents, row, sizeof(row));
 
-		/*
-		 * Identical models are listed once below the table. On hybrid
-		 * x86 CPUs all cores report the same brand string and are told
-		 * apart by the core type and the caches instead.
-		 */
-		if (!info->ident[0]) {
-			snprintf(ident, sizeof(ident), "-");
-		} else {
-			for (j = 0; j < nidents; j++) {
-				if (!strcmp(idents[j], info->ident))
-					break;
-			}
-			if (j == nidents && nidents < JENT_MAX_CPUS)
-				idents[nidents++] = info->ident;
-			snprintf(ident, sizeof(ident), "#%d", j + 1);
+		printf("%4s %4s %5s %s", cpu, pkg, core, row);
+	}
+}
+
+/*
+ * Do two CPUs need to be measured separately? The package and core numbers are
+ * left out deliberately: they name a CPU rather than describe it, and every
+ * CPU has its own. What remains is what a recording depends on.
+ */
+static int same_kind(const struct jent_cpu_info *a,
+		     const struct jent_cpu_info *b)
+{
+	return !strcmp(a->type, b->type) && !strcmp(a->ident, b->ident) &&
+	       a->base_khz == b->base_khz && a->max_khz == b->max_khz &&
+	       a->tsc_khz == b->tsc_khz &&
+	       !memcmp(&a->l1d, &b->l1d, sizeof(a->l1d)) &&
+	       !memcmp(&a->l1i, &b->l1i, sizeof(a->l1i)) &&
+	       !memcmp(&a->l2, &b->l2, sizeof(a->l2)) &&
+	       !memcmp(&a->l3, &b->l3, sizeof(a->l3));
+}
+
+/* Append @cpu to a list of ranges, "0-3,8,10-11". */
+static void append_range(char *buf, size_t buflen, unsigned long first,
+			 unsigned long last)
+{
+	size_t len = strlen(buf);
+
+	if (len && len + 1 < buflen)
+		buf[len++] = ',';
+
+	if (first == last)
+		snprintf(buf + len, buflen - len, "%lu", first);
+	else
+		snprintf(buf + len, buflen - len, "%lu-%lu", first, last);
+}
+
+/*
+ * One row per kind of CPU instead of one per CPU. On a machine whose CPUs are
+ * all alike - a server with a hundred of them - the listing says the same
+ * thing a hundred times, and what the reader is after is how many kinds there
+ * are and which CPUs to pick from.
+ */
+static void print_summary(const struct jent_cpu_list *list, const char **idents,
+			  int *nidents)
+{
+	long i, j;
+	int printed = 0;
+
+	printf("%5s " JENT_ROW_FMT,
+	       "CPUs", "Type", "BaseMHz", "MaxMHz", "TmrMHz",
+	       "L1d", "L1i", "L2", "L3", "Model");
+
+	for (i = 0; i < list->entries; i++) {
+		const struct jent_cpu_info *info = &list->cpu[i];
+		char row[256], cpus[512] = "";
+		unsigned long first = 0, last = 0;
+		int open = 0;
+		long count = 0;
+
+		/* Already covered by a kind printed earlier. */
+		for (j = 0; j < i; j++) {
+			if (same_kind(&list->cpu[j], info))
+				break;
 		}
+		if (j < i)
+			continue;
 
-		printf("%4s %4s %5s %-9s %7s %7s %7s %10s %10s %10s %11s %6s\n",
-		       cpu, pkg, core, info->type[0] ? info->type : "-", base,
-		       mhz, tsc, l1d, l1i, l2, l3, ident);
+		for (j = i; j < list->entries; j++) {
+			const struct jent_cpu_info *other = &list->cpu[j];
+
+			if (!same_kind(other, info))
+				continue;
+			count++;
+			if (!other->cpu_valid)
+				continue;
+
+			if (open && other->cpu == last + 1) {
+				last = other->cpu;
+				continue;
+			}
+			if (open)
+				append_range(cpus, sizeof(cpus), first, last);
+			first = other->cpu;
+			last = other->cpu;
+			open = 1;
+		}
+		if (open)
+			append_range(cpus, sizeof(cpus), first, last);
+
+		format_row(info, idents, nidents, row, sizeof(row));
+		printf("%5ld %s", count, row);
+		if (cpus[0])
+			printf("      CPUs %s\n", cpus);
+		printed++;
 	}
 
+	/*
+	 * Only where the listing covers the machine. A backend that describes
+	 * the one CPU it runs on has every row alike by construction and knows
+	 * nothing of the others.
+	 */
+	if (printed == 1 && list->entries == list->ncpu)
+		printf("\nEvery CPU of this machine is of the same kind: any "
+		       "one of them can be\nrecorded for all.\n");
+}
+
+static void print_cpus(const struct jent_cpu_list *list, int summary)
+{
+	const char *idents[JENT_MAX_CPUS];
+	int nidents = 0, j;
+	long i;
+
+	if (summary)
+		print_summary(list, idents, &nidents);
+	else
+		print_table(list, idents, &nidents);
+
 	printf("\nColumns:\n");
-	printf("  Pkg, Core  package and core ID - equal in both means SMT "
-	       "siblings of one core\n");
+	if (!summary)
+		printf("  Pkg, Core  package and core ID - equal in both means "
+		       "SMT siblings of one core\n");
+	else
+		printf("  CPUs       how many CPUs are of this kind, and which "
+		       "ones they are\n");
 	printf("  Type       core type as the system reports it\n");
 	/*
 	 * Neither ARM nor AMD reports a core type, and what stands in for it
@@ -2724,20 +2863,23 @@ static void print_json(const struct jent_cpu_list *list)
 
 static void usage(const char *name)
 {
-	printf("%s [--json]\n", name);
+	printf("%s [--summary] [--json]\n", name);
 	printf("List the identification and the caches of all CPUs.\n\n");
-	printf("  --json  report the same data as JSON\n");
-	printf("  --help  print this text\n");
+	printf("  --summary  one row per kind of CPU instead of one per CPU\n");
+	printf("  --json     report the same data as JSON, one entry per CPU\n");
+	printf("  --help     print this text\n");
 }
 
 int main(int argc, char *argv[])
 {
 	static struct jent_cpu_list list;
-	int json = 0, i, ret;
+	int json = 0, summary = 0, i, ret;
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--json")) {
 			json = 1;
+		} else if (!strcmp(argv[i], "--summary")) {
+			summary = 1;
 		} else if (!strcmp(argv[i], "--help") ||
 			   !strcmp(argv[i], "-h")) {
 			usage(argv[0]);
@@ -2769,7 +2911,7 @@ int main(int argc, char *argv[])
 	}
 
 	printf("CPUs: %ld\n\n", list.ncpu);
-	print_cpus(&list);
+	print_cpus(&list, summary);
 
 	return 0;
 }
