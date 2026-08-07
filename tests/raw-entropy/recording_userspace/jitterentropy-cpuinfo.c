@@ -4,31 +4,22 @@
  *
  * Copyright (C) 2026, Stephan Mueller <smueller@chronox.de>
  *
- * On hybrid CPUs (Intel P/E cores, ARM big.LITTLE) the timing variations of
- * both noise sources depend on the micro-architecture and the caches of the
- * core the Jitter RNG runs on. A raw noise recording therefore only
- * characterizes the core type it was taken on.
- *
- * This tool prints the vendor, the model, the core type - where the system
- * reports one - and the data cache sizes of each CPU, so that the cores to be
- * measured individually can be identified. The measurement is then pinned to
+ * On hybrid CPUs (Intel P/E cores, ARM big.LITTLE) the timing of both noise
+ * sources depends on the micro-architecture and the caches of the core the
+ * Jitter RNG runs on, so a recording only characterizes that core type. This
+ * tool names the CPUs and their caches, and the measurement is then pinned to
  * one of them with "jitterentropy-hashtime --cpu <CPU>".
  *
- * How much can be reported depends on the operating system:
+ * Coverage per system:
  *
- *   Linux    Complete. sysfs describes the caches and the topology of every
- *            CPU, and the identification is read on each core in turn.
- *   Windows  Complete. GetLogicalProcessorInformationEx() reports the caches,
- *            the topology and the efficiency class of every CPU, the registry
- *            holds their model.
- *   macOS    Complete, but per core type rather than per CPU: the cores are
- *            described per performance level (hw.perflevel<N>.*), which is how
- *            Apple Silicon exposes its P and E cores.
- *   Others   Partial. The BSDs and the remaining systems have no interface
- *            enumerating the caches of each CPU, so only the CPU this tool
- *            runs on is described, and its caches only on x86.
+ *   Linux    Complete, from sysfs plus CPUID/MIDR read on each core.
+ *   Windows  Complete, from GetLogicalProcessorInformationEx() and the registry.
+ *   macOS    Complete, but per performance level (hw.perflevel<N>.*) rather
+ *            than per CPU - which is how Apple Silicon exposes P and E cores.
+ *   Others   Only the CPU this tool runs on, its caches only on x86: nothing
+ *            there enumerates the caches of the other CPUs.
  *
- * Usage: jitterentropy-cpuinfo [--json]
+ * Usage: jitterentropy-cpuinfo [--summary] [--json]
  */
 
 #ifdef __linux__
@@ -105,34 +96,21 @@ struct jent_cpu_list {
 	long entries;		/* number of CPUs described below */
 	long ncpu;		/* number of CPUs in the system */
 	int pinning;		/* does the system offer CPU pinning? */
-	int hypervisor;		/* 1 virtualized, 0 bare metal, -1 not known */
-	/*
-	 * Name of the backend the data comes from - what a consumer of the JSON
-	 * output branches on, as it is what decides how complete the listing is.
-	 */
+	/* Source of the data, and what a JSON consumer branches on. */
 	const char *backend;
-	/*
-	 * The same in prose, printed as a note below the table. NULL if there
-	 * is nothing to say. Wrapped to fit the indentation of a note there.
-	 */
+	/* The same in prose, printed as a note below the table; NULL if none. */
 	const char *note;
 	/*
-	 * How a recording is confined to one core type on a system without CPU
-	 * pinning, or NULL where there is no way to do so. Printed in place of
-	 * the --cpu line, and indented as that one is.
+	 * How a recording is confined to one core type without CPU pinning,
+	 * NULL where there is no way to. Printed in place of the --cpu line.
 	 */
 	const char *select;
 };
 
 /*
- * Set the model of @info to "<vendor> <model>", with the padding removed.
- *
- * The brand string of a CPU is a fixed-width field, and the sources differ in
- * how much of its padding they keep: the string CPUID returns for an AMD part
- * carries trailing blanks that the same name from /proc/cpuinfo or from the
- * Windows registry does not. Left in, the two spellings are different strings,
- * and one machine is listed as two models - which on a system where only some
- * of the CPUs can be visited is exactly what happens.
+ * Set the model of @info to "<vendor> <model>", padding removed: CPUID pads
+ * the AMD brand string with blanks that /proc/cpuinfo and the Windows registry
+ * do not, and left in, the two spellings list one machine as two models.
  */
 static void jent_set_ident(struct jent_cpu_info *info, const char *vendor,
 			   const char *model)
@@ -176,15 +154,13 @@ static int jent_get_cpus(struct jent_cpu_list *list);
  *
  * - leaf 0 holds the vendor string in EBX, EDX, ECX,
  * - leaves 0x80000002 - 0x80000004 hold the processor brand string,
- * - leaf 0x1A (Intel SDM Vol. 2A, "Hybrid Information") reports the type of
- *   the core executing it in EAX[31:24]: 0x20 marks an Atom (efficiency) and
- *   0x40 a Core (performance) core. The leaf reads as zero on non-hybrid CPUs.
- *   These two are the only core types it knows - the low-power efficiency
- *   cores are Atom cores as well and are reported as such, so telling them
- *   apart is left to jent_mark_lp_cores().
+ * - leaf 0x1A (Intel SDM Vol. 2A, "Hybrid Information") reports the core type
+ *   in EAX[31:24]: 0x20 Atom (efficiency), 0x40 Core (performance), zero on a
+ *   non-hybrid CPU. Those two are all it knows - the low-power E-cores are
+ *   Atoms as well, so jent_mark_lp_cores() tells them apart afterwards.
  *
- * CPUID describes the core it is executed on, so on a hybrid CPU the caller
- * has to pin itself to the CPU it wants to identify first.
+ * CPUID describes the core executing it, so the caller has to pin itself to
+ * the CPU it wants identified first.
  ***************************************************************************/
 
 #if defined(JENT_CPUINFO_X86) && !defined(JENT_CPUINFO_MACOS)
@@ -215,13 +191,11 @@ static void jent_cpuid_raw(unsigned int leaf, unsigned int subleaf,
 }
 
 /*
- * The hypervisor leaves, 0x40000000 and up, are covered by neither the standard
- * nor the extended maximum, so they are guarded by their own two checks: a
- * hypervisor has to be present - CPUID.1 ECX[31], which no physical CPU sets -
- * and it has to implement the leaf, which its own 0x40000000 EAX states. On
- * bare metal an unimplemented leaf answers with the contents of the highest
- * standard one instead of zeroes, so asking without the checks yields
- * plausible-looking nonsense.
+ * The leaves at 0x40000000 and up fall under neither the standard nor the
+ * extended maximum, so they need two checks of their own: CPUID.1 ECX[31],
+ * which only a hypervisor sets, and the leaf range its own 0x40000000 EAX
+ * states. Unchecked, an unimplemented leaf answers with the highest standard
+ * one instead of zeroes - plausible-looking nonsense.
  */
 static int jent_cpuid_hypervisor(unsigned int leaf, unsigned int subleaf,
 				 unsigned int regs[4])
@@ -258,10 +232,9 @@ static int jent_cpuid(unsigned int leaf, unsigned int subleaf,
 	}
 #else
 	/*
-	 * Not __get_cpuid_count(): that one only appeared in GCC 4.9, while
-	 * the distributions this is built on still carry 4.8. __get_cpuid_max()
-	 * and the __cpuid_count() macro are what it is made of and have been
-	 * there all along.
+	 * Not __get_cpuid_count(): it appeared in GCC 4.9, while the
+	 * distributions this is built on still carry 4.8. The two calls it is
+	 * made of have been there all along.
 	 */
 	max = __get_cpuid_max(leaf & 0x80000000U, NULL);
 #endif
@@ -272,14 +245,6 @@ static int jent_cpuid(unsigned int leaf, unsigned int subleaf,
 	jent_cpuid_raw(leaf, subleaf, regs);
 
 	return 1;
-}
-
-/* Is a hypervisor present? CPUID.1 ECX[31], which no physical CPU sets. */
-static int jent_hypervisor_present(void)
-{
-	unsigned int r[4];
-
-	return (jent_cpuid(1, 0, r) && (r[2] & (1U << 31))) ? 1 : 0;
 }
 
 /* Windows names its CPUs from the registry and needs none of this. */
@@ -334,9 +299,8 @@ static void jent_ident_x86(struct jent_cpu_info *info)
 
 /*
  * The nominal frequency some brand strings end in ("... CPU @ 2.40GHz"), in
- * kHz, or 0 when there is none. Only a trailing "@ <number><unit>Hz" is
- * accepted so that a model number containing a digit cannot be mistaken for a
- * frequency.
+ * kHz, or 0 when there is none. Only a trailing "@ <number><unit>Hz" is taken,
+ * so that a model number containing a digit cannot pass for a frequency.
  */
 static unsigned long jent_brand_khz(const char *brand)
 {
@@ -391,28 +355,19 @@ static unsigned long jent_brand_khz(const char *brand)
 /*
  * Frequencies and timestamp counter of the core this runs on.
  *
- * Leaf 0x16 (Intel SDM Vol. 2A, "Processor Frequency Information") reports
- * EAX[15:0] as the base and EBX[15:0] as the maximum frequency in MHz. Both
- * are nominal values the SDM does not promise to be exact, and on the hybrid
- * parts this was measured on only EBX follows the core the leaf is executed on
- * - EAX stays at one package-wide number while the P and the E cores have
- * markedly different base frequencies. The Linux and the Windows backend
- * therefore take the base frequency from cpufreq and from the registry, both
- * of which are per CPU, and reach this leaf only where that is unavailable.
+ * Leaf 0x16 (Intel SDM Vol. 2A, "Processor Frequency Information") gives the
+ * base in EAX[15:0] and the maximum in EBX[15:0], in MHz. Only EBX follows the
+ * core executing it; EAX stays package-wide even where the P and E cores differ
+ * - so Linux and Windows prefer their per-CPU base frequency and reach this
+ * leaf only where that is unavailable.
  *
- * Leaf 0x15 ("Time Stamp Counter and Nominal Core Crystal Clock Information")
- * gives the TSC rate as ECX (the crystal clock in Hz) * EBX / EAX. The Jitter
- * RNG times its noise sources with that counter on x86, so its rate is the
- * resolution every measurement is bounded by.
+ * Leaf 0x15 gives the TSC rate as ECX (crystal clock in Hz) * EBX / EAX. That
+ * counter is what the Jitter RNG times with, so its rate bounds the resolution
+ * of every measurement. 0x80000007 EDX[8] marks it invariant - constant across
+ * P-states, not stopping in deep C-states - which is what makes it usable.
  *
- * CPUID 0x80000007 EDX[8] marks an invariant TSC: one that ticks at a constant
- * rate across P-states and does not stop in deep C-states. Both vendors report
- * it, and it is what makes the counter usable as a time source at all.
- *
- * AMD implements neither 0x15 nor 0x16 - jent_cpuid() reports the leaves as
- * unsupported and the values stay unknown. There the TSC runs at the base
- * frequency of the part, which comes from cpufreq on Linux and from the
- * registry on Windows instead.
+ * AMD implements neither 0x15 nor 0x16, so there the values stay unknown and
+ * the rate comes from cpufreq or the registry instead.
  */
 static void jent_freq_x86(struct jent_cpu_info *info)
 {
@@ -426,10 +381,8 @@ static void jent_freq_x86(struct jent_cpu_info *info)
 	}
 
 	/*
-	 * The brand string ends in the nominal frequency on the parts that
-	 * state one ("... CPU @ 2.40GHz"), which is the base frequency. It is
-	 * the last resort: on a part enumerating no 0x16 and a system with no
-	 * cpufreq - a virtual machine, commonly - it is all there is.
+	 * Last resort: the frequency the brand string ends in is the base one.
+	 * Without 0x16 and without cpufreq, it is all there is.
 	 */
 	if (!info->base_khz)
 		info->base_khz = jent_brand_khz(info->ident);
@@ -439,32 +392,26 @@ static void jent_freq_x86(struct jent_cpu_info *info)
 						r[0] / 1000);
 
 	/*
-	 * Leaf 0x40000010, in kHz: the timing leaf VMware defined and several
-	 * hypervisors implement after it. It is one of the few places a guest
-	 * on an AMD host can learn the rate, as AMD enumerates neither of the
-	 * two leaves above. Not every hypervisor has it - a KVM guest caps its
-	 * leaf range below this one, and the check in jent_cpuid() then leaves
-	 * the rate unknown rather than reading whatever the CPU answers with.
+	 * Leaf 0x40000010, in kHz: the timing leaf VMware defined and others
+	 * adopted. On an AMD host it is one of the few places a guest can learn
+	 * the rate at all. Not every hypervisor has it, and the leaf-range check
+	 * in jent_cpuid() then leaves the rate unknown rather than guessing.
 	 */
 	if (!info->tsc_khz && jent_cpuid(0x40000010, 0, r) && r[0])
 		info->tsc_khz = r[0];
 
 	/*
-	 * A rate that one of the two leaves enumerates is a known one; without
-	 * them an operating system has to calibrate the counter against
-	 * another timer, and what it arrives at is not what the CPU states.
+	 * An enumerated rate is a known one; without it the operating system
+	 * calibrates against another timer and arrives at its own number.
 	 */
 	info->tsc_known_freq = info->tsc_khz ? 1 : 0;
 
 	if (jent_cpuid(0x80000007, 0, r)) {
 		/*
-		 * The invariant-TSC bit covers both properties: such a counter
-		 * ticks at a constant rate whatever the P-state and does not
-		 * stop in the deep C-states. Linux splits them into its
-		 * constant_tsc and nonstop_tsc flags, which it sets from this
-		 * one bit as well - and additionally from model checks for the
-		 * parts that predate it, which is why the Linux backend
-		 * overrides these with what the kernel concluded.
+		 * The one invariant-TSC bit covers both properties. Linux
+		 * splits them into constant_tsc and nonstop_tsc, which it also
+		 * sets from model checks on the parts predating the bit - hence
+		 * the Linux backend overriding these afterwards.
 		 */
 		info->tsc_invariant = (r[3] & (1U << 8)) ? 1 : 0;
 		info->tsc_nonstop = info->tsc_invariant;
@@ -489,11 +436,10 @@ static void jent_freq_x86(struct jent_cpu_info *info)
  *   ECX         number of sets - 1
  * Total size = (ways + 1) * (partitions + 1) * (line size + 1) * (sets + 1).
  *
- * The number of CPUs sharing a cache is deliberately not taken from EAX[25:14]:
- * that field is the number of addressable processor IDs, which is rounded up to
- * a power of two and describes what the encoding allows rather than what the
- * system has - on a 12-CPU part it reports 64 CPUs sharing the L3. The column
- * is left empty instead of filled with a number that is not the topology.
+ * The sharing count is deliberately not taken from EAX[25:14]: that field is
+ * rounded up to a power of two and describes what the encoding allows, not the
+ * topology - on a 12-CPU part it claims 64 CPUs share the L3. The column stays
+ * empty rather than carrying a wrong number.
  */
 #if defined(JENT_CPUINFO_X86) && defined(JENT_CPUINFO_GENERIC)
 
@@ -545,14 +491,10 @@ static int jent_caches_x86_leaf(struct jent_cpu_info *info, unsigned int leaf)
 static void jent_caches_x86(struct jent_cpu_info *info)
 {
 	/*
-	 * Leaf 4 is Intel's. AMD and Hygon parts leave it empty - it reports
-	 * cache type 0 in the first sub-leaf - and expose the identical
-	 * structure through the extended leaf instead, gated by the
-	 * TopologyExtensions feature; parts without it, and hypervisors hiding
-	 * it, again report cache type 0 and leave the sizes at zero. A guest
-	 * sees whichever leaf its host CPU implements, so both are probed
-	 * rather than dispatching on the vendor ID. This mirrors what the
-	 * library itself does in arch/jitterentropy-arch-cache.c.
+	 * Leaf 4 is Intel's; AMD and Hygon leave it empty (cache type 0) and
+	 * carry the identical structure in the extended leaf. Both are probed
+	 * rather than dispatching on the vendor ID, as the library itself does
+	 * in arch/jitterentropy-arch-cache.c.
 	 */
 	if (jent_caches_x86_leaf(info, 0x00000004))
 		return;
@@ -565,28 +507,21 @@ static void jent_caches_x86(struct jent_cpu_info *info)
 /***************************************************************************
  * AArch64 timer
  *
- * Shared by the Linux and the macOS backend - the register is architected and
- * the Jitter RNG reads its counterpart on either system. The BSDs are left out
- * deliberately: nothing there has been verified to enable the EL0 access this
- * needs, and a read that traps would take the tool down with SIGILL.
+ * Shared by the Linux and the macOS backend. The BSDs are left out
+ * deliberately: nothing there is verified to enable the EL0 access this needs,
+ * and a read that traps would take the tool down with SIGILL.
  ***************************************************************************/
 
 #if defined(JENT_CPUINFO_ARM64) && \
     (defined(JENT_CPUINFO_LINUX) || defined(JENT_CPUINFO_MACOS))
 
 /*
- * The rate of the architected generic timer, CNTFRQ_EL0, which is the
- * counterpart of the x86 timestamp counter: CNTVCT_EL0 is what the Jitter RNG
- * reads for its timings on this architecture, and CNTFRQ_EL0 states its
- * frequency. Both are readable at EL0.
- *
- * The counter is architecturally required to run at a constant frequency, to
- * be independent of the CPU clock and not to stop while the core is in a low
- * power state (Arm ARM (DDI 0487), "The system counter must be implemented in
- * an always-on power domain"), so the three properties below are answered from
- * the architecture rather than from a feature bit. The rate is commonly far
- * lower than an x86 TSC - tens of MHz - which is the resolution the noise
- * measurements are bounded by here.
+ * The rate of the architected generic timer: the Jitter RNG times with
+ * CNTVCT_EL0 here, and CNTFRQ_EL0 states its frequency. The architecture
+ * requires that counter to be constant, independent of the CPU clock and
+ * always on (Arm ARM (DDI 0487)), so the three properties below follow from
+ * the architecture rather than a feature bit. Rates are commonly tens of MHz -
+ * far coarser than an x86 TSC, and that is what bounds the measurements.
  */
 static void jent_timer_arm64(struct jent_cpu_info *info)
 {
@@ -654,11 +589,7 @@ static int read_cpu_str(unsigned long cpu, const char *attr,
 	return read_file_str(path, buf, buflen);
 }
 
-/*
- * Read a numeric sysfs attribute. Base 0 is used so that both the decimal
- * attributes (core_id, cpuinfo_max_freq) and the hexadecimal ones
- * (midr_el1, given as 0x...) are handled.
- */
+/* Numeric sysfs attribute. Base 0, as midr_el1 is given as 0x... */
 static int read_cpu_val(unsigned long cpu, const char *attr,
 			unsigned long *val)
 {
@@ -693,12 +624,9 @@ static int read_cpu_signed(unsigned long cpu, const char *attr, long *val)
 }
 
 /*
- * Parse a kernel CPU list like "0-3,8" as used by /sys/.../online and the
- * shared_cpu_list cache attribute. When @cpus is given, the CPU numbers are
- * stored there, at most @max of them. The number of CPUs in the list is
- * returned, or a negative errno. A list longer than @max is reported as such
- * by returning the full count - the caller decides whether the truncation
- * matters.
+ * Parse a kernel CPU list like "0-3,8" (/sys/.../online, shared_cpu_list) into
+ * @cpus, at most @max of them. Returns the length of the list or a negative
+ * errno - a count above @max reports the truncation to the caller.
  */
 static long parse_cpu_list(const char *str, unsigned long *cpus, size_t max)
 {
@@ -782,9 +710,8 @@ static void jent_caches_linux(struct jent_cpu_info *info)
 			continue;
 
 		/*
-		 * The Jitter RNG only accesses data, so instruction caches are
-		 * of no interest apart from documenting the L1 split. L2 and
-		 * L3 are commonly unified.
+		 * The Jitter RNG only accesses data; the L1i is kept just to
+		 * document the split. L2 and L3 are commonly unified.
 		 */
 		if (level == 1 && !strncmp(type, "Instruction", 11))
 			cache = &info->l1i;
@@ -803,10 +730,8 @@ static void jent_caches_linux(struct jent_cpu_info *info)
 		cache->size = parse_cache_size(size);
 
 		/*
-		 * The number of CPUs sharing a cache tells the P-core from the
-		 * E-core clusters: on hybrid Intel CPUs, each P-core owns its
-		 * L2 (shared with its SMT sibling at most) whereas a group of
-		 * E-cores shares one.
+		 * The sharing count separates P-cores from E-core clusters: a
+		 * P-core owns its L2, a group of E-cores shares one.
 		 */
 		snprintf(attr, sizeof(attr), "cache/index%u/shared_cpu_list",
 			 idx);
@@ -868,18 +793,17 @@ static const char *arm_lookup(unsigned long id, int implementer)
 	return name;
 }
 
-/*
- * AArch64 identification from MIDR_EL1, which the kernel exposes per CPU in
- * sysfs. The register holds the implementer in bits[31:24] and the part
- * number in bits[15:4] (Arm ARM (DDI 0487), MIDR_EL1). The part number is
- * what distinguishes the big from the LITTLE cores.
- */
 /* What has to be read on the CPU itself - see jent_ident_sysfs() below. */
 static void jent_ident_local(struct jent_cpu_info *info)
 {
 	jent_timer_arm64(info);
 }
 
+/*
+ * AArch64 identification from MIDR_EL1, which sysfs exposes per CPU: the
+ * implementer in bits[31:24] and the part number in bits[15:4] (Arm ARM
+ * (DDI 0487)). The part number is what tells big from LITTLE.
+ */
 static void jent_ident_sysfs(struct jent_cpu_info *info)
 {
 	unsigned long midr, impl, part, variant, revision, capacity;
@@ -911,13 +835,10 @@ static void jent_ident_sysfs(struct jent_cpu_info *info)
 			 variant, revision);
 
 	/*
-	 * ARM reports no core type. What stands in for it is the capacity the
-	 * scheduler works with, normalized so that the most capable core of the
-	 * system is 1024 - derived from the capacity-dmips-mhz property of the
-	 * device tree scaled by the maximum frequency, or from the CPPC
-	 * performance values on the ACPI systems. It is what separates the big
-	 * from the LITTLE cores; on a uniform system every core reports 1024
-	 * and the value says only that they are equivalent.
+	 * ARM reports no core type; what stands in for it is the scheduler's
+	 * capacity, normalized to 1024 for the most capable core. It separates
+	 * big from LITTLE - on a uniform system every core reports 1024 and the
+	 * value says only that they are equivalent.
 	 */
 	if (!read_cpu_val(info->cpu, "cpu_capacity", &capacity))
 		snprintf(info->type, sizeof(info->type), "cap %lu", capacity);
@@ -937,16 +858,10 @@ static void jent_ident_sysfs(struct jent_cpu_info *info)
 	unsigned long perf;
 
 	/*
-	 * AMD reports no core type: its dense cores (Zen 4c/5c) are the same
-	 * micro-architecture as the regular ones, with a smaller cache and a
-	 * lower clock, and CPUID has no equivalent of Intel's hybrid leaf for
-	 * them. Where the amd-pstate driver is in use, the highest performance
-	 * level the firmware gives each core is the ranking that separates the
-	 * preferred cores from the rest.
-	 *
-	 * Read from sysfs and therefore also for the CPUs this tool cannot
-	 * place itself on - it is a ranking of the cores, which is exactly what
-	 * such a listing must not lose.
+	 * AMD reports no core type - its dense cores are the same
+	 * micro-architecture, and CPUID has no hybrid leaf. Under amd-pstate
+	 * the firmware's highest performance level ranks the cores instead.
+	 * Read from sysfs, so it covers the CPUs this tool cannot visit too.
 	 */
 	if (!info->type[0] &&
 	    !read_cpu_val(info->cpu, "cpufreq/amd_pstate_highest_perf", &perf))
@@ -955,10 +870,7 @@ static void jent_ident_sysfs(struct jent_cpu_info *info)
 
 #else /* neither x86 nor AArch64 */
 
-/*
- * Neither x86 nor AArch64: nothing is read from the CPU itself, and what names
- * it comes from /proc/cpuinfo through jent_models_linux() below.
- */
+/* Nothing is read from the CPU itself; /proc/cpuinfo names it below. */
 static void jent_ident_local(struct jent_cpu_info *info)
 {
 	(void)info;
@@ -971,86 +883,23 @@ static void jent_ident_sysfs(struct jent_cpu_info *info)
 
 #endif /* JENT_CPUINFO_ARM64 */
 
-/*
- * Name the CPUs that are still unnamed, from /proc/cpuinfo.
- *
- * This is what describes the CPUs the tool could not place itself on - CPUID
- * has to be executed on the core it is to describe, while the kernel publishes
- * a name for every CPU here regardless. It is also the only identification on
- * the architectures that have neither CPUID nor a MIDR in sysfs, where the key
- * naming the CPU differs per architecture (RISC-V uses "uarch", POWER "cpu",
- * s390 "machine").
- *
- * On x86 the vendor is prepended, so that a CPU named here and one named from
- * CPUID yield the same string and the listing does not show one machine as two
- * different models.
- *
- * The file holds a block per CPU and is walked once: reading it per CPU would
- * be quadratic, which on the machines that have enough CPUs for this to matter
- * is exactly the wrong behavior.
- */
-static void jent_models_linux(struct jent_cpu_list *list)
+/* The CPU the kernel numbers @cpu, or NULL if the listing has no such entry. */
+static struct jent_cpu_info *jent_cpu_by_id(struct jent_cpu_list *list,
+					    long cpu)
 {
-	static const char *keys[] = { "model name", "uarch", "cpu model",
-				      "cpu", "machine" };
-	FILE *f = fopen("/proc/cpuinfo", "r");
-	char line[512], vendor[64] = "";
-	long cur = -1, i;
+	long i;
 
-	if (!f)
-		return;
+	if (cpu < 0)
+		return NULL;
 
-	while (fgets(line, sizeof(line), f)) {
-		char *val = strchr(line, ':');
-		size_t k, keylen;
+	for (i = 0; i < list->entries; i++) {
+		struct jent_cpu_info *info = &list->cpu[i];
 
-		if (!val)
-			continue;
-		*val++ = '\0';
-		while (*val == ' ' || *val == '\t')
-			val++;
-		val[strcspn(val, "\n")] = '\0';
-
-		/* Strip the padding the file uses between key and colon. */
-		keylen = strlen(line);
-		while (keylen && (line[keylen - 1] == ' ' ||
-				  line[keylen - 1] == '\t'))
-			line[--keylen] = '\0';
-
-		if (!strcmp(line, "processor")) {
-			cur = strtol(val, NULL, 10);
-			vendor[0] = '\0';
-			continue;
-		}
-		if (cur < 0)
-			continue;
-
-		/* Precedes the model name in the block. */
-		if (!strcmp(line, "vendor_id")) {
-			snprintf(vendor, sizeof(vendor), "%s", val);
-			continue;
-		}
-
-		for (k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
-			if (strcmp(line, keys[k]))
-				continue;
-
-			for (i = 0; i < list->entries; i++) {
-				struct jent_cpu_info *info = &list->cpu[i];
-
-				if (!info->cpu_valid ||
-				    info->cpu != (unsigned long)cur ||
-				    info->ident[0])
-					continue;
-
-				jent_set_ident(info, vendor, val);
-				break;
-			}
-			break;
-		}
+		if (info->cpu_valid && info->cpu == (unsigned long)cpu)
+			return info;
 	}
 
-	fclose(f);
+	return NULL;
 }
 
 #ifdef JENT_CPUINFO_X86
@@ -1071,30 +920,40 @@ static int has_flag(const char *flags, const char *name)
 	return 0;
 }
 
+#endif /* JENT_CPUINFO_X86 */
+
 /*
- * The kernel's own view of the timestamp counter, taken from the flags line of
- * /proc/cpuinfo. It says more than CPUID does: constant_tsc and nonstop_tsc
- * come from the invariant-TSC bit but are also set from model checks on the
- * parts that predate it, and tsc_known_freq states that the rate was
- * enumerated rather than calibrated against another timer - the conclusion
- * Linux reached for the counter it drives its clocksource with, which is the
- * same counter the Jitter RNG reads.
+ * What the kernel publishes per CPU in /proc/cpuinfo: names for the CPUs still
+ * unnamed, and on x86 its own view of the timestamp counter.
  *
- * The file is walked once and the flags are applied to the CPU each block
- * belongs to: it holds one block per CPU, so re-reading it for every CPU would
- * be quadratic on a large machine.
+ * The names cover the CPUs the tool could not visit, and are the only
+ * identification where there is neither CPUID nor a MIDR - the key differs per
+ * architecture (RISC-V "uarch", POWER "cpu", s390 "machine"). On x86 the vendor
+ * is prepended so that a name from here and one from CPUID match.
+ *
+ * The flags line says more about the counter than CPUID does: Linux sets
+ * constant_tsc and nonstop_tsc from model checks as well, and tsc_known_freq
+ * states that the rate was enumerated rather than calibrated.
+ *
+ * The file holds a block per CPU and is walked once for both - reading it per
+ * CPU would be quadratic on exactly the machines where that hurts.
  */
-static void jent_tsc_flags_linux(struct jent_cpu_list *list)
+static void jent_cpuinfo_linux(struct jent_cpu_list *list)
 {
+	static const char *keys[] = { "model name", "uarch", "cpu model",
+				      "cpu", "machine" };
 	FILE *f = fopen("/proc/cpuinfo", "r");
-	char line[4096];
-	long cur = -1, i;
+	/* Sized for the flags line, which is by far the longest one here. */
+	char line[4096], vendor[64] = "";
+	long cur = -1;
 
 	if (!f)
 		return;
 
 	while (fgets(line, sizeof(line), f)) {
+		struct jent_cpu_info *info;
 		char *val = strchr(line, ':');
+		size_t k, keylen;
 
 		if (!val)
 			continue;
@@ -1103,87 +962,56 @@ static void jent_tsc_flags_linux(struct jent_cpu_list *list)
 			val++;
 		val[strcspn(val, "\n")] = '\0';
 
-		if (!strncmp(line, "processor", 9)) {
+		/* Strip the padding the file uses between key and colon. */
+		keylen = strlen(line);
+		while (keylen && (line[keylen - 1] == ' ' ||
+				  line[keylen - 1] == '\t'))
+			line[--keylen] = '\0';
+
+		/* Opens the block of a CPU; everything below belongs to it. */
+		if (!strcmp(line, "processor")) {
 			cur = strtol(val, NULL, 10);
+			vendor[0] = '\0';
 			continue;
 		}
 
-		if (cur < 0 || strncmp(line, "flags", 5))
+		info = jent_cpu_by_id(list, cur);
+		if (!info)
 			continue;
 
-		for (i = 0; i < list->entries; i++) {
-			struct jent_cpu_info *info = &list->cpu[i];
+		/* Precedes the model name in the block. */
+		if (!strcmp(line, "vendor_id")) {
+			snprintf(vendor, sizeof(vendor), "%s", val);
+			continue;
+		}
 
-			if (!info->cpu_valid || info->cpu != (unsigned long)cur)
-				continue;
-
+#ifdef JENT_CPUINFO_X86
+		if (!strcmp(line, "flags")) {
 			info->tsc_invariant = has_flag(val, "constant_tsc");
 			info->tsc_nonstop = has_flag(val, "nonstop_tsc");
 			info->tsc_known_freq = has_flag(val, "tsc_known_freq");
-			break;
+			continue;
+		}
+#endif
+
+		/* A CPU named on the core itself keeps that name. */
+		if (info->ident[0])
+			continue;
+
+		for (k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+			if (!strcmp(line, keys[k])) {
+				jent_set_ident(info, vendor, val);
+				break;
+			}
 		}
 	}
 
 	fclose(f);
 }
 
-#endif /* JENT_CPUINFO_X86 */
-
 /*
- * Whether this is a virtual machine, for the architectures whose CPU says
- * nothing about it - ARM has no equivalent of the x86 hypervisor bit that EL0
- * could read. Linux publishes what the firmware states about the machine in
- * the DMI attributes, and the device-tree systems name the hypervisor outright.
- *
- * Only a match is conclusive: a machine whose firmware happens to say nothing
- * is not thereby bare metal, so the answer stays unknown instead of turning
- * into a "no". The vendor strings matched are the ones that no physical
- * machine carries - "Microsoft Corporation" is not among them, as that is also
- * the vendor of the Surface hardware; for it the product name has to say
- * "Virtual Machine".
- */
-static int jent_hypervisor_linux(void)
-{
-	static const char *vendors[] = {
-		"QEMU", "Xen", "VMware", "innotek GmbH", "Parallels",
-		"Amazon EC2", "Google", "Alibaba Cloud", "OpenStack",
-		"Bochs", "Apple Virtualization", "Nutanix",
-	};
-	static const char *products[] = {
-		"Virtual Machine", "VMware Virtual Platform", "VMware20,1",
-		"KVM", "QEMU", "VirtualBox", "HVM domU", "Standard PC",
-		"Google Compute Engine", "OpenStack", "Parallels",
-	};
-	char buf[128];
-	size_t i;
-
-	/* The device tree names it directly where there is one. */
-	if (!read_file_str("/proc/device-tree/hypervisor/compatible", buf,
-			   sizeof(buf)))
-		return 1;
-
-	if (!read_file_str("/sys/class/dmi/id/sys_vendor", buf, sizeof(buf))) {
-		for (i = 0; i < sizeof(vendors) / sizeof(vendors[0]); i++) {
-			if (!strncmp(buf, vendors[i], strlen(vendors[i])))
-				return 1;
-		}
-	}
-
-	if (!read_file_str("/sys/class/dmi/id/product_name", buf,
-			   sizeof(buf))) {
-		for (i = 0; i < sizeof(products) / sizeof(products[0]); i++) {
-			if (!strncmp(buf, products[i], strlen(products[i])))
-				return 1;
-		}
-	}
-
-	return -1;
-}
-
-/*
- * Move the calling thread to @cpu. The identification of a hybrid CPU is only
- * meaningful when it is obtained on the core in question - CPUID leaf 0x1A
- * reports the type of the core executing it.
+ * Move the calling thread to @cpu: on a hybrid CPU the identification is only
+ * meaningful when read on the core in question.
  */
 static int pin_to_cpu(unsigned long cpu)
 {
@@ -1198,10 +1026,9 @@ static int pin_to_cpu(unsigned long cpu)
 		return -errno;
 
 	/*
-	 * sched_setaffinity() migrates the calling thread before it returns,
-	 * but a CPU that went offline in the meantime leaves the thread
-	 * elsewhere - in which case the identification below would describe
-	 * the wrong core.
+	 * sched_setaffinity() migrates before it returns, but a CPU that went
+	 * offline meanwhile leaves the thread elsewhere - and the
+	 * identification would then describe the wrong core.
 	 */
 	if (sched_getcpu() != (int)cpu)
 		return -EAGAIN;
@@ -1245,12 +1072,9 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 	}
 
 	/*
-	 * The affinity of this thread, kept to be restored once every CPU has
-	 * been visited - the walk below moves the thread across the machine and
-	 * has no business leaving it somewhere else.
-	 *
-	 * Allocated for the highest CPU number seen, which on a large machine
-	 * exceeds the CPU_SETSIZE a plain cpu_set_t covers.
+	 * The affinity of this thread, restored once every CPU has been
+	 * visited. Allocated for the highest CPU number, which on a large
+	 * machine exceeds the CPU_SETSIZE a plain cpu_set_t covers.
 	 */
 	{
 		unsigned int ncpu_set = (unsigned int)(cpu_ids[ncpu - 1] + 1);
@@ -1285,16 +1109,11 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 			info->base_khz = 0;
 
 		/*
-		 * AMD exports no base_frequency and CPUID carries none either,
-		 * which leaves the nominal frequency of the CPPC tables: the
-		 * highest sustained, non-boost performance level, in MHz -
-		 * the same quantity by another name.
-		 *
-		 * Second and not first, because it is a package-wide value
-		 * where base_frequency is a per-CPU one: on a hybrid Intel part
-		 * the two disagree, nominal_freq reporting the 1700 MHz of the
-		 * performance cores for the efficiency cores as well, whose
-		 * base_frequency is 1200 MHz.
+		 * AMD exports no base_frequency and CPUID carries none, which
+		 * leaves the CPPC nominal frequency - the same quantity by
+		 * another name. Second, not first: it is package-wide, and on a
+		 * hybrid Intel part it reports the P-core value for the E-cores
+		 * as well.
 		 */
 		if (!info->base_khz) {
 			unsigned long nominal;
@@ -1314,15 +1133,10 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 		jent_ident_sysfs(info);
 
 		/*
-		 * The rest has to be read on the CPU it describes. Attempted
-		 * for every CPU rather than only for those of the current
-		 * affinity mask: a mask narrowed with taskset is one the thread
-		 * may widen again itself, and this is the tool that wants to
-		 * see the whole machine. What it cannot cross is a cpuset
-		 * cgroup - a container, a systemd slice - where the move is
-		 * refused and the CPU keeps what the kernel reports about it,
-		 * which is all of the table but the values that exist in the
-		 * CPU alone.
+		 * The rest has to be read on the CPU it describes. Tried for
+		 * every CPU, not just those of the current affinity mask: a
+		 * mask narrowed with taskset can be widened again. A cpuset
+		 * cgroup cannot, and those CPUs keep what sysfs reported alone.
 		 */
 		if (pin_to_cpu(info->cpu)) {
 			unreachable++;
@@ -1340,14 +1154,10 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 	list->entries = ncpu;
 
 	/* Names the CPUs the loop above could not visit, among others. */
-	jent_models_linux(list);
+	jent_cpuinfo_linux(list);
 
 	if (unreachable) {
-		/*
-		 * One note rather than a line per CPU: on a machine with a
-		 * hundred CPUs the message would otherwise bury the listing it
-		 * belongs to.
-		 */
+		/* One note, not a line per CPU - that would bury the listing. */
 		snprintf(unreachable_note, sizeof(unreachable_note),
 			 "%ld of the %ld CPUs could not be visited: this "
 			 "process is confined to a cpuset\nthat does not "
@@ -1359,17 +1169,6 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 		list->note = unreachable_note;
 	}
 
-#ifdef JENT_CPUINFO_X86
-	jent_tsc_flags_linux(list);
-#endif
-
-	/*
-	 * Only where the CPU itself has no answer: on x86 the hypervisor bit is
-	 * conclusive in both directions, and the firmware strings below are not.
-	 */
-	if (list->hypervisor < 0)
-		list->hypervisor = jent_hypervisor_linux();
-
 	return 0;
 }
 
@@ -1379,11 +1178,10 @@ static int jent_get_cpus(struct jent_cpu_list *list)
  * macOS backend
  *
  * macOS offers no thread-to-CPU pinning and no per-CPU description, but it
- * groups the cores into performance levels: hw.perflevel0 is the fastest one,
- * which on Apple Silicon are the P cores, hw.perflevel1 the E cores. The
- * caches are reported per level, which is exactly the distinction this tool
- * exists for. Systems with a single core type (the Intel Macs) report no
- * levels at all and are described by the flat hw.* names instead.
+ * groups the cores into performance levels - hw.perflevel0 the P cores,
+ * hw.perflevel1 the E cores - and reports the caches per level, which is
+ * exactly the distinction this tool exists for. Systems with a single core
+ * type report no levels and are described by the flat hw.* names.
  ***************************************************************************/
 
 #ifdef JENT_CPUINFO_MACOS
@@ -1402,11 +1200,7 @@ static int sysctl_str(const char *name, char *buf, size_t buflen)
 	return 0;
 }
 
-/*
- * Read a numeric sysctl of either width - macOS reports some of these as
- * 32 bit and others as 64 bit values, so the width is taken from the node
- * itself rather than assumed.
- */
+/* Numeric sysctl of either width - macOS reports both, so ask the node. */
 static int sysctl_num(const char *name, unsigned long long *val)
 {
 	size_t len = 0;
@@ -1451,13 +1245,9 @@ static int sysctl_level_num(int level, const char *attr,
 }
 
 /*
- * The counter the Jitter RNG takes its timings from. On Apple Silicon that is
- * the architected generic timer, whose rate the register states directly - the
- * same 24 MHz that hw.tbfrequency reports, as macOS drives mach_absolute_time()
- * from that counter as well. On the Intel Macs it is the timestamp counter,
- * whose rate the kernel publishes in Hz; how it arrived at the value is not
- * stated there, so the properties of the counter are left unknown rather than
- * assumed - the CPUID path that answers them elsewhere is not compiled here.
+ * The counter the Jitter RNG times with: the generic timer on Apple Silicon,
+ * the TSC on the Intel Macs. The kernel publishes the TSC rate but not how it
+ * arrived at it, so the counter properties stay unknown rather than assumed.
  */
 static void jent_timer_macos(struct jent_cpu_info *info)
 {
@@ -1473,22 +1263,6 @@ static void jent_timer_macos(struct jent_cpu_info *info)
 #endif
 }
 
-/*
- * macOS states outright whether it runs under a hypervisor, which is the more
- * reliable answer than the x86 CPUID bit and the only one available on Apple
- * Silicon. The sysctl is present since macOS 11; on the releases before it the
- * answer stays unknown.
- */
-static int jent_hypervisor_macos(void)
-{
-	unsigned long long present = 0;
-
-	if (sysctl_num("kern.hv_vmm_present", &present))
-		return -1;
-
-	return present ? 1 : 0;
-}
-
 static int jent_get_cpus(struct jent_cpu_list *list)
 {
 	unsigned long long nlevels = 0, freq = 0, ncpu = 0, packages = 0;
@@ -1502,9 +1276,8 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 	list->ncpu = (long)ncpu;
 
 	/*
-	 * The affinity tags macOS offers are a hint to keep threads together,
-	 * not a way to place one on a given core, and they are not implemented
-	 * at all on Apple Silicon.
+	 * The affinity tags macOS offers only hint that threads belong
+	 * together, and Apple Silicon does not implement them at all.
 	 */
 	list->pinning = 0;
 	list->backend = "macos";
@@ -1514,10 +1287,9 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 		"fastest level first, and Core\ncounts within a level - equal "
 		"Core numbers of different Types are\ndifferent cores.";
 	/*
-	 * The efficiency cores are still reachable: macOS schedules the lowest
+	 * The E-cores are still reachable: macOS schedules the lowest
 	 * quality-of-service class on them alone, which is what --e-cores asks
-	 * for. There is no counterpart for the performance cores - they are
-	 * where a measurement runs when it asks for nothing.
+	 * for. The P-cores are where a measurement runs by default anyway.
 	 */
 	list->select =
 		"  jitterentropy-hashtime <rounds> <repeats> <file> --e-cores\n"
@@ -1526,19 +1298,14 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 		"ones, which a recording uses anyway\n  unless the process was "
 		"put in the background.";
 
-	list->hypervisor = jent_hypervisor_macos();
-
 	/* Present on Intel Macs only; Apple Silicon reports the model alone. */
 	sysctl_str("machdep.cpu.vendor", vendor, sizeof(vendor));
 	sysctl_str("machdep.cpu.brand_string", ident, sizeof(ident));
 	if (sysctl_num("hw.cpufrequency_max", &freq))
 		freq = 0;
 
-	/*
-	 * Which CPU sits in which package is not reported, so the package is
-	 * only known when there is a single one - which every Mac but the
-	 * two-socket Mac Pros is.
-	 */
+	/* Which CPU sits in which package is not reported, so a single one
+	 * is all that can be known - every Mac but the two-socket Pros. */
 	if (sysctl_num("hw.packages", &packages) || packages != 1)
 		packages = 0;
 
@@ -1564,16 +1331,13 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 		sysctl_level_num(sel, "l2cachesize", &l2);
 		if (sysctl_level_num(sel, "cpusperl2", &per_l2))
 			per_l2 = 0;
-		/* No L3 is reported per level; the flat node covers the Macs
-		 * that have one. */
+		/* No L3 per level; the flat node covers the Macs with one. */
 		if (sysctl_num("hw.l3cachesize", &l3))
 			l3 = 0;
 
 		/*
-		 * A system with a single performance level has one core type,
-		 * so there is nothing to tell apart and the type stays empty -
-		 * which is what the other backends report for a CPU that
-		 * announces no core type as well.
+		 * One performance level means one core type, and the type
+		 * stays empty as it does in the other backends.
 		 */
 		if (nlevels) {
 			snprintf(name, sizeof(name), "hw.perflevel%d.name",
@@ -1583,8 +1347,7 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 
 			/*
 			 * The level names are "Performance" and "Efficiency";
-			 * fall back to the level order, which Apple documents
-			 * as fastest first.
+			 * fall back to the order, documented as fastest first.
 			 */
 			if (type[0] == 'P' || (!type[0] && level == 0))
 				snprintf(core_type, sizeof(core_type),
@@ -1606,14 +1369,11 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 			if (packages)
 				info->pkg = 0;
 			/*
-			 * SMT siblings are consecutive on the Intel Macs.
-			 *
-			 * The count is the one of the performance level and
-			 * starts at zero for each of them, as that is what
-			 * macOS describes - it has no numbering spanning the
-			 * levels to report. Two cores of different levels
-			 * therefore carry the same number without being the
-			 * same core, which the note below states.
+			 * SMT siblings are consecutive on the Intel Macs. The
+			 * count restarts per performance level, as macOS has
+			 * no numbering spanning them - so equal numbers in
+			 * different levels are different cores, as the note
+			 * below says.
 			 */
 			info->core = (long)(i / (logical / physical));
 			info->max_khz = (unsigned long)(freq / 1000);
@@ -1648,20 +1408,17 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 /***************************************************************************
  * Windows backend
  *
- * GetLogicalProcessorInformationEx() describes the caches, the cores and the
- * packages, each with the group affinity mask of the CPUs it covers, and
- * reports the efficiency class of every core - which is what Windows uses to
- * tell a P-core from an E-core. The model is not part of that interface and is
- * taken from the registry, where the kernel publishes it per CPU (and, unlike
- * CPUID, also on the ARM64 machines).
+ * GetLogicalProcessorInformationEx() describes the caches, cores and packages
+ * with the group affinity mask of the CPUs each covers, plus the efficiency
+ * class Windows tells a P-core from an E-core by. The model is not part of it
+ * and comes from the registry, which covers the ARM64 machines as well.
  ***************************************************************************/
 
 #ifdef JENT_CPUINFO_WINDOWS
 
 /*
- * GetLogicalProcessorInformationEx() is a Windows 7 API. Some toolchains still
- * default their target version to something older, which would hide it - the
- * same guard the library's own Win32 backends carry.
+ * A Windows 7 API, hidden by toolchains still defaulting to an older target -
+ * the same guard the library's own Win32 backends carry.
  */
 #if (defined(_MSC_VER) || defined(__MINGW32__)) && !defined(_WIN32_WINNT)
 # define _WIN32_WINNT 0x0601
@@ -1683,10 +1440,9 @@ static unsigned long affinity_count(KAFFINITY mask)
 }
 
 /*
- * Flat index of the CPU given by (group, bit). Windows numbers the CPUs per
- * processor group; the flat numbering used here counts the CPUs of the
- * preceding groups, which is the numbering jitterentropy-hashtime --cpu
- * expects as well.
+ * Flat index of the CPU (group, bit): Windows numbers per processor group,
+ * this counts the CPUs of the preceding groups - the numbering
+ * jitterentropy-hashtime --cpu expects too.
  */
 static long flat_cpu(const unsigned long *group_base, WORD groups,
 		     WORD group, unsigned long bit)
@@ -1787,17 +1543,10 @@ static void jent_ident_windows(struct jent_cpu_info *info)
 	jent_set_ident(info, vendor, name);
 
 	/*
-	 * "~MHz" is the nominal frequency of the part - what Task Manager
-	 * shows as the base speed - and not a maximum: on an AMD Ryzen 9 5950X
-	 * it reads 3400 while the part boosts to 4900. Windows publishes no
-	 * boost figure anywhere, the MaxMhz of CallNtPowerInformation() being
-	 * this same nominal value, so the maximum stays unknown here unless
-	 * CPUID states one - which on an AMD part it never does.
-	 *
-	 * The registry key is per CPU, so as on Linux the value the operating
-	 * system publishes per CPU is preferred over the package-wide base
-	 * frequency of CPUID leaf 0x16; jent_freq_x86() fills in only what is
-	 * still unset.
+	 * "~MHz" is the base speed, not a maximum, and Windows publishes no
+	 * boost figure anywhere - the MaxMhz of CallNtPowerInformation() is
+	 * this same value. The key is per CPU, so as on Linux it wins over the
+	 * package-wide CPUID leaf 0x16, which only fills in what is left.
 	 */
 	len = sizeof(mhz);
 	if (RegGetValueA(HKEY_LOCAL_MACHINE, key, "~MHz", RRF_RT_REG_DWORD,
@@ -1822,10 +1571,7 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 	if (groups > (WORD)(sizeof(group_base) / sizeof(group_base[0])))
 		groups = (WORD)(sizeof(group_base) / sizeof(group_base[0]));
 
-	/*
-	 * The CPUs of a group are numbered from zero, so the flat index of the
-	 * first CPU of a group is the number of CPUs in all groups before it.
-	 */
+	/* Groups number from zero, so a group starts at the count before it. */
 	for (group = 0; group < groups; group++) {
 		group_base[group] = (unsigned long)ncpu;
 		ncpu += (long)GetActiveProcessorCount(group);
@@ -1871,12 +1617,9 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 		ptr += p->Size;
 
 		/*
-		 * Not a switch: the relationship is an enumeration the build
-		 * compiles with -Wswitch-enum, which asks for every one of its
-		 * values to be listed even though only three matter here.
-		 *
-		 * Trace caches hold no data and are skipped along with the
-		 * relationships that are of no interest.
+		 * Not a switch: -Wswitch-enum would ask for every value of the
+		 * enumeration although only three matter. Trace caches hold no
+		 * data and are skipped as well.
 		 */
 		if (p->Relationship == RelationCache &&
 		    p->Cache.Type != CacheTrace) {
@@ -1913,13 +1656,10 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 	free(buf);
 
 	/*
-	 * The efficiency class is a relative ranking without a fixed scale, so
-	 * it only names a core type once the highest class in the system is
-	 * known: the performance cores hold the highest class and a uniform CPU
-	 * reports one class for all. Everything below the top class is an
-	 * efficiency core - there can be more than one such class, as on the
-	 * parts that carry low-power E-cores next to the regular ones, which
-	 * jent_mark_lp_cores() separates afterwards.
+	 * The efficiency class is a ranking without a fixed scale, so it names
+	 * a core type only once the highest class is known: that one is the
+	 * P-cores, everything below it an E-core. There can be several such
+	 * classes, which jent_mark_lp_cores() separates afterwards.
 	 */
 	for (i = 0; i < ncpu; i++) {
 		classes[i] = (BYTE)list->cpu[i].max_khz;
@@ -1938,10 +1678,9 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 
 #ifdef JENT_CPUINFO_X86
 	/*
-	 * The base frequency and the timestamp counter are only in CPUID, which
-	 * answers for the core executing it - so unlike everything above, this
-	 * has to visit each CPU. The affinity of this thread is restored
-	 * afterwards from what the first call reports.
+	 * The base frequency and the counter are only in CPUID, which answers
+	 * for the core executing it - so unlike everything above, this visits
+	 * each CPU. The first call reports the affinity restored afterwards.
 	 */
 	{
 		GROUP_AFFINITY previous;
@@ -1971,9 +1710,9 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 				}
 
 				/*
-				 * A CPU parked or taken offline in the meantime
-				 * leaves the thread where it was, and CPUID
-				 * would then describe the wrong core.
+				 * A parked or offline CPU leaves the thread
+				 * where it was, and CPUID would then describe
+				 * the wrong core.
 				 */
 				GetCurrentProcessorNumberEx(&current);
 				if (current.Group != group ||
@@ -1998,16 +1737,13 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 /***************************************************************************
  * Generic backend for the BSDs and everything else
  *
- * None of these systems enumerates the caches of the individual CPUs, and
- * OpenBSD deliberately offers no thread affinity API at all, so there is no
- * way to visit the cores in turn either. What is left is the CPU this tool
- * happens to run on: on x86 CPUID describes its caches and, on a hybrid CPU,
- * its core type, and on the BSDs hw.model names it.
+ * None of these enumerates the caches of the individual CPUs, and OpenBSD has
+ * no thread affinity API at all. What is left is the CPU this tool runs on:
+ * CPUID for its caches and core type on x86, hw.model for its name on the BSDs.
  *
- * The numeric sysctl MIB is used rather than sysctlbyname(), which OpenBSD
- * does not provide. Solaris, Haiku and Cygwin have no sysctl at all, hence the
- * separate JENT_CPUINFO_HAVE_SYSCTL - they are left with the CPU count and,
- * where the architecture allows it, CPUID.
+ * The numeric sysctl MIB is preferred over sysctlbyname(), which OpenBSD lacks.
+ * Solaris, Haiku and Cygwin have no sysctl at all - hence
+ * JENT_CPUINFO_HAVE_SYSCTL - and are left with the CPU count and CPUID.
  ***************************************************************************/
 
 #ifdef JENT_CPUINFO_GENERIC
@@ -2021,10 +1757,8 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 # include <sys/sysctl.h>
 # define JENT_CPUINFO_HAVE_SYSCTL
 /*
- * sysctlbyname() is on every BSD but OpenBSD, which offers the numeric MIB
- * alone. The MIB is used for what it covers - hw.model is CTL_HW/HW_MODEL
- * everywhere - and the name interface for the nodes that have no portable
- * MIB constant, such as the clock rate.
+ * Every BSD but OpenBSD has sysctlbyname(). The MIB is used where it covers
+ * the node, the name interface for those without a portable MIB constant.
  */
 # ifndef __OpenBSD__
 #  define JENT_CPUINFO_HAVE_SYSCTLBYNAME
@@ -2032,10 +1766,9 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 #endif
 
 /*
- * FreeBSD is the one system reached here that can place a thread on a chosen
- * CPU, so it is the one whose CPUs can be described individually rather than
- * only the one this tool happens to run on. The call is the same one the
- * library pins its counting thread with (arch/jitterentropy-arch-thread.c).
+ * FreeBSD is the one system here that can place a thread on a chosen CPU, so
+ * the one whose CPUs can be described individually. Same call the library
+ * pins its counting thread with (arch/jitterentropy-arch-thread.c).
  */
 #ifdef __FreeBSD__
 # include <sys/cpuset.h>
@@ -2138,10 +1871,7 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 	list->ncpu = (ncpu > 0) ? ncpu : 1;
 	list->backend = "generic";
 
-	/*
-	 * OpenBSD is the one platform without any thread affinity API, so
-	 * jitterentropy-hashtime --cpu is unavailable there.
-	 */
+	/* No affinity API on OpenBSD, so --cpu is unavailable there. */
 #ifdef __OpenBSD__
 	list->pinning = 0;
 #else
@@ -2205,21 +1935,14 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 #endif
 
 /*
- * Separate the low-power efficiency cores from the regular ones.
- *
- * Intel's LP E-cores (Meteor Lake and later) are Atom cores like the regular
- * efficiency cores and are reported as such: CPUID leaf 0x1A knows the two
- * core types Atom and Core and nothing else, and the efficiency class Windows
- * derives only ranks them. What sets them apart is where they sit - outside
- * the L3 domain, on the SoC tile or as the only E-cores of a part without an
- * L3 for them - so they are the efficiency cores that see no L3 on a system
+ * Separate the low-power E-cores from the regular ones. Neither CPUID nor the
+ * Windows efficiency class distinguishes them - what does is where they sit,
+ * outside the L3 domain, so they are the E-cores seeing no L3 on a system
  * whose other cores do.
  *
- * This is a derivation from the cache topology, not something the hardware
- * states, so it only ever refines an efficiency core that was identified as
- * one beforehand, and only when some other CPU does report an L3 - on a
- * machine that reports no L3 at all (a VM hiding it, a part without one)
- * nothing is renamed.
+ * A derivation from the cache topology rather than something the hardware
+ * states, so it only refines cores already identified as E-cores, and only
+ * where some CPU does report an L3.
  */
 static void jent_mark_lp_cores(struct jent_cpu_list *list)
 {
@@ -2351,7 +2074,7 @@ static const char *jent_flag_str(int value)
 	}
 }
 
-/* Does any CPU report the scheduler capacity in place of a core type? */
+/* Does any CPU report a type starting with @prefix - "cap ", "perf "? */
 static int jent_have_type(const struct jent_cpu_list *list, const char *prefix)
 {
 	size_t len = strlen(prefix);
@@ -2366,11 +2089,9 @@ static int jent_have_type(const struct jent_cpu_list *list, const char *prefix)
 }
 
 /*
- * One entry of the notes below the table: what a dash in a column means, what
- * the listing does not cover, and what the machine is. Printed as a bullet,
- * with the lines the text is wrapped into indented to match, and the heading
- * emitted before the first note there is - a system with nothing to report
- * gets no empty section.
+ * One note below the table, printed as a bullet with its wrapped lines
+ * indented to match. The heading is emitted before the first note, so a system
+ * with nothing to report gets no empty section.
  */
 static void print_note(int *heading, const char *text)
 {
@@ -2391,10 +2112,9 @@ static void print_note(int *heading, const char *text)
 }
 
 /*
- * The model of @info as "#<N>", numbering the distinct ones in the order they
- * are met and collecting them in @idents for the list below the table. On a
- * hybrid x86 CPU every core reports the same brand string and the cores are
- * told apart by their type and caches instead, so one entry commonly stands
+ * The model of @info as "#<N>", numbering the distinct ones in the order met
+ * and collecting them in @idents for the list below the table. On a hybrid x86
+ * CPU every core reports the same brand string, so one entry commonly stands
  * for the whole machine.
  */
 static void format_ident(const struct jent_cpu_info *info, const char **idents,
@@ -2468,9 +2188,9 @@ static void print_table(const struct jent_cpu_list *list, const char **idents,
 }
 
 /*
- * Do two CPUs need to be measured separately? The package and core numbers are
- * left out deliberately: they name a CPU rather than describe it, and every
- * CPU has its own. What remains is what a recording depends on.
+ * Do two CPUs need to be measured separately? Package and core numbers are
+ * left out: they name a CPU rather than describe it. What remains is what a
+ * recording depends on.
  */
 static int same_kind(const struct jent_cpu_info *a,
 		     const struct jent_cpu_info *b)
@@ -2500,10 +2220,8 @@ static void append_range(char *buf, size_t buflen, unsigned long first,
 }
 
 /*
- * One row per kind of CPU instead of one per CPU. On a machine whose CPUs are
- * all alike - a server with a hundred of them - the listing says the same
- * thing a hundred times, and what the reader is after is how many kinds there
- * are and which CPUs to pick from.
+ * One row per kind of CPU instead of one per CPU: on a server with a hundred
+ * alike, the full listing says the same thing a hundred times.
  */
 static void print_summary(const struct jent_cpu_list *list, const char **idents,
 			  int *nidents)
@@ -2560,9 +2278,8 @@ static void print_summary(const struct jent_cpu_list *list, const char **idents,
 	}
 
 	/*
-	 * Only where the listing covers the machine. A backend that describes
-	 * the one CPU it runs on has every row alike by construction and knows
-	 * nothing of the others.
+	 * Only where the listing covers the machine: a backend describing the
+	 * one CPU it runs on has every row alike by construction.
 	 */
 	if (printed == 1 && list->entries == list->ncpu)
 		printf("\nEvery CPU of this machine is of the same kind: any "
@@ -2589,10 +2306,8 @@ static void print_cpus(const struct jent_cpu_list *list, int summary)
 		       "ones they are\n");
 	printf("  Type       core type as the system reports it\n");
 	/*
-	 * Neither ARM nor AMD reports a core type, and what stands in for it
-	 * there is a ranking whose scale the reader has no way of knowing -
-	 * least of all that on a uniform machine every core carries the
-	 * maximum and the value distinguishes nothing.
+	 * Where a ranking stands in for the core type, its scale has to be
+	 * said - not least that a uniform machine has every core at the top.
 	 */
 	if (jent_have_type(list, "cap "))
 		printf("             \"cap <N>\" is the compute capacity the "
@@ -2610,9 +2325,8 @@ static void print_cpus(const struct jent_cpu_list *list, int summary)
 	       "CPUs sharing it\n");
 
 	/*
-	 * The properties of that counter. They belong to the part rather than
-	 * to a core, so they are summarized here instead of taking three more
-	 * columns - and if the CPUs ever disagree, that is what is said.
+	 * The properties of that counter belong to the part, not the core, so
+	 * they are summarized here rather than taking three more columns.
 	 */
 	if (jent_tsc_flag(list, jent_tsc_invariant) != JENT_FLAG_NONE ||
 	    jent_tsc_flag(list, jent_tsc_nonstop) != JENT_FLAG_NONE ||
@@ -2631,18 +2345,7 @@ static void print_cpus(const struct jent_cpu_list *list, int summary)
 		if (list->note)
 			print_note(&heading, list->note);
 
-		if (list->hypervisor == 1)
-			print_note(&heading,
-				   "Running under a hypervisor: the CPU "
-				   "described is the virtual one, and\na "
-				   "recording includes the timing behavior of "
-				   "the host.");
-
-		/*
-		 * A dash in these columns has a reason, and next to a "known
-		 * rate yes" the reader deserves to be told which: the value
-		 * exists, it is just not somewhere this tool can read it.
-		 */
+		/* Which of the two columns are a dash for every CPU. */
 		for (i = 0; i < list->entries; i++) {
 			if (list->cpu[i].base_khz || list->cpu[i].max_khz)
 				have_freq = 1;
@@ -2651,14 +2354,9 @@ static void print_cpus(const struct jent_cpu_list *list, int summary)
 		}
 
 		/*
-		 * A dash in that column has a reason, and it is not that the
-		 * rate went unread: on AMD no CPUID leaf carries it, which is
-		 * worth saying outright rather than leaving it to be taken for
-		 * a gap in this tool. Whether the operating system knows the
-		 * rate is worth adding as well - it says so with a flag of its
-		 * own - since that means the value exists, only not anywhere
-		 * this tool can reach. Spelled out per case rather than
-		 * assembled, so that each reads as one sentence.
+		 * A dash there is not an unread value: on AMD no CPUID leaf
+		 * carries the rate, and the operating system may still know
+		 * it. Spelled out per case so that each reads as one sentence.
 		 */
 		if (!have_tsc) {
 			int amd = jent_vendor_is(list, "AuthenticAMD");
@@ -2715,11 +2413,9 @@ static void print_cpus(const struct jent_cpu_list *list, int summary)
 }
 
 /*
- * JSON output
- *
- * Same data as the table above, for the scripts that drive a recording per
- * core type. Values the system does not report are null rather than absent, so
- * that every CPU has the same set of keys.
+ * JSON output: the same data as the table, for scripts driving a recording per
+ * core type. Unreported values are null rather than absent, so that every CPU
+ * carries the same set of keys.
  */
 static void print_json_string(const char *str)
 {
@@ -2785,7 +2481,6 @@ static void print_json(const struct jent_cpu_list *list)
 	printf("\t\"backend\": ");
 	print_json_string(list->backend ? list->backend : "none");
 	printf(",\n");
-	printf("\t\"hypervisor\": %s,\n", jent_json_flag(list->hypervisor));
 
 	printf("\t\"processors\": [\n");
 	for (i = 0; i < list->entries; i++) {
@@ -2890,11 +2585,6 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
-
-	list.hypervisor = -1;
-#if defined(JENT_CPUINFO_X86) && !defined(JENT_CPUINFO_MACOS)
-	list.hypervisor = jent_hypervisor_present();
-#endif
 
 	ret = jent_get_cpus(&list);
 	if (ret) {

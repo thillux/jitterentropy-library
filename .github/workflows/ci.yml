@@ -1267,10 +1267,10 @@ jobs:
       - name: Build
         run: make -j 4
 
-      # The recording tools have Makefiles of their own, one per tool, which no
-      # other job builds. jitterentropy-cpuinfo is the one that can also be run
-      # here: it links nothing and describes the runner rather than measuring
-      # it, so it needs neither the library nor a tolerated failure path.
+      # The recording tools have one Makefile each, which no other job builds.
+      # jitterentropy-cpuinfo can also be run here: it links nothing and
+      # describes the runner, so it needs neither the library nor a tolerated
+      # failure path.
       - name: Build and run the CPU information tool
         working-directory: tests/raw-entropy/recording_userspace
         run: |

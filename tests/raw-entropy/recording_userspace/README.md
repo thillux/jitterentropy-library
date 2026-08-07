@@ -138,8 +138,7 @@ to a dash. AMD enumerates neither its base frequency nor its counter rate in
 CPUID: the base frequency is taken from the nominal frequency of the CPPC
 tables there, and the counter rate stays unknown. On a machine that has
 neither cpufreq nor those tables - a virtual machine, typically - no frequency
-is reported at all. A recording taken under a hypervisor characterizes the
-virtual CPU, which the tool says as well.
+is reported at all.
 
 With `--summary` the listing holds one row per kind of CPU rather than one per
 CPU, naming the CPUs of each kind. On a machine with a hundred CPUs that says
