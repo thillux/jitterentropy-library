@@ -37,6 +37,10 @@
 #include <unistd.h>
 #endif
 
+#ifdef __linux__
+#include <sched.h>	/* sched_setaffinity() for --cpu */
+#endif
+
 #include "jitterentropy-sha3.c"
 #include "jitterentropy-gcd.c"
 #include "jitterentropy-health.c"
@@ -83,6 +87,50 @@ enum jent_es {
 	jent_hashloop,		/* SHA3 loop exclusively */
 	jent_memaccess_loop,	/* Memory access loop exclusively */
 };
+
+/*
+ * Pin the measuring thread to the given CPU.
+ *
+ * On hybrid CPUs (Intel P/E cores, ARM big.LITTLE) the timing behavior of the
+ * noise sources depends on the core the measurement runs on, so a recording is
+ * only meaningful for one core type at a time. Use jitterentropy-cpuinfo to see
+ * which core is which.
+ *
+ * The size of the memory block is not affected by this: the library derives it
+ * from the largest data cache found in the system - the one of the performance
+ * cores - and not from the core it runs on (see
+ * arch/jitterentropy-arch-cache.c). Use --max-mem to record an efficiency core
+ * with a memory size matching its own cache.
+ *
+ * The library compiles its portable pinning primitive as part of the internal
+ * timer support only. That feature is unrelated to the core a measurement
+ * runs on, so when it is disabled the native affinity call is used directly.
+ * Only Linux is covered by that fallback, which is where the raw entropy
+ * recording is performed; elsewhere the request is rejected rather than
+ * silently measuring an arbitrary core.
+ */
+static int jent_pin_cpu(unsigned long cpu)
+{
+#ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
+	return jent_thread_pin_to_cpu(cpu);
+#elif defined(__linux__)
+	cpu_set_t set;
+
+	if (cpu >= (unsigned long)CPU_SETSIZE)
+		return -EINVAL;
+	CPU_ZERO(&set);
+	CPU_SET((size_t)cpu, &set);
+	if (sched_setaffinity(0, sizeof(set), &set))
+		return -errno;
+	return 0;
+#else
+	(void)cpu;
+	return -ENOSYS;
+#endif
+}
+
+/* Set when --cpu confined the measurement to a single CPU. */
+static int jent_cpu_pinned = 0;
 
 /***************************************************************************
  * Statistical test logic not compiled for regular operation
@@ -133,6 +181,15 @@ static int jent_one_test(const char *pathname, unsigned long rounds,
 	 */
 	ec = jent_entropy_collector_alloc_internal(osr, flags);
 	if (!ec) {
+		printf("Allocation of the entropy collector failed\n");
+		/*
+		 * The counting thread of the internal timer needs a CPU of its
+		 * own - jent_notime_init() refuses to start when the affinity
+		 * mask of the caller holds a single CPU, which is exactly what
+		 * --cpu establishes.
+		 */
+		if (jent_cpu_pinned)
+			printf("Note: --cpu leaves one CPU in the affinity mask, which rules out the internal timer\n");
 		ret = 1;
 		goto out;
 	}
@@ -288,11 +345,15 @@ out:
  * --hashloop Perform the measurement of the hash loop only
  * --memaccess Perform the measurement of the memory access loop only
  * --hloopcnt Number of hashloop operations at runtime
+ * --cpu Pin the measurement to the given CPU - use this on hybrid CPUs to
+ *	 record one core type at a time (see jitterentropy-cpuinfo). Note that
+ *	 the internal timer cannot be used together with this option as its
+ *	 counting thread requires a CPU of its own.
  */
 int main(int argc, char * argv[])
 {
 	const char *file;
-	unsigned long i, rounds, repeats;
+	unsigned long i, rounds, repeats, cpu = 0;
 	unsigned int flags = 0, osr = 0, loopcnt = 0;
 	unsigned int status = 0;
 	enum jent_es jent_es = jent_common;
@@ -300,7 +361,7 @@ int main(int argc, char * argv[])
 	char pathname[4096];
 
 	if (argc < 4) {
-		printf("%s <rounds per repeat> <number of repeats> <filename> [--ntg1|--force-fips|--disable-memory-access|--disable-internal-timer|--force-internal-timer|--osr <OSR>|--loopcnt <NUM>|--max-mem <NUM>|--hashloop|--memaccess|--all-caches|--hloopcnt <NUM>|--status]\n", argv[0]);
+		printf("%s <rounds per repeat> <number of repeats> <filename> [--ntg1|--force-fips|--disable-memory-access|--disable-internal-timer|--force-internal-timer|--osr <OSR>|--loopcnt <NUM>|--max-mem <NUM>|--hashloop|--memaccess|--all-caches|--hloopcnt <NUM>|--cpu <NUM>|--status]\n", argv[0]);
 		return 1;
 	}
 
@@ -500,6 +561,20 @@ int main(int argc, char * argv[])
 				printf("Unknown hashloop value\n");
 				return 1;
 			}
+		} else if (!strncmp(argv[1], "--cpu", 5)) {
+			unsigned long val;
+
+			argc--;
+			argv++;
+			if (argc <= 1) {
+				printf("CPU value missing\n");
+				return 1;
+			}
+
+			if (parse_ulong(argv[1], &val))
+				return 1;
+			cpu = val;
+			jent_cpu_pinned = 1;
 		} else if (!strncmp(argv[1], "--status", 8)) {
 			status = 1;
 		} else {
@@ -509,6 +584,21 @@ int main(int argc, char * argv[])
 
 		argc--;
 		argv++;
+	}
+
+	/*
+	 * Pin before the first initialization so that every part of the
+	 * measurement - the self tests, the allocation of the memory block and
+	 * the recording itself - is executed on the selected core.
+	 */
+	if (jent_cpu_pinned) {
+		ret = jent_pin_cpu(cpu);
+		if (ret) {
+			printf("Cannot pin the measurement to CPU %lu: %s\n",
+			       cpu, strerror(-ret));
+			return 1;
+		}
+		printf("Measurement pinned to CPU %lu\n", cpu);
 	}
 
 	/*

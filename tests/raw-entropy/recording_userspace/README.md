@@ -70,6 +70,108 @@ still need the tool to be invoked as root, whereas the smaller ones now work as
 a normal user; where the limit is not sufficient, the tool reports that the
 Jitter RNG handle cannot be allocated.
 
+## Core Selection on Hybrid CPUs
+
+On hybrid CPUs - Intel P/E cores, ARM big.LITTLE - the core types differ in
+their micro-architecture and their caches. The Jitter RNG therefore shows a
+different timing behavior on each of them. A raw noise recording thus only
+characterizes the core type it was taken on, which means each core type has to
+be recorded and analyzed separately.
+
+The tool `jitterentropy-cpuinfo` lists the cores to choose from:
+
+	make -f Makefile.cpuinfo
+	./jitterentropy-cpuinfo
+
+For every CPU it reports the vendor and the model, the core type as reported
+by the system, the topology and the data cache sizes together with the number
+of CPUs sharing each cache. The sharing separates the core types as well - on
+hybrid Intel CPUs, each P-core has an L2 cache of its own whereas a cluster of
+E-cores shares one - and it is also what identifies the SMT siblings, which
+are two CPU numbers for one physical core rather than two cores to measure.
+
+The core type is whatever the system offers: the hybrid information of CPUID
+on Intel, the efficiency class on Windows and the performance level on macOS.
+ARM reports no core type at all; what is shown there instead is the compute
+capacity the scheduler works with, normalized so that the most capable core of
+the system is 1024 - it is what separates the big from the LITTLE cores, and on
+a uniform system every core reports 1024 and the value says only that they are
+equivalent.
+
+AMD reports no core type either - its dense cores are the same
+micro-architecture with a smaller cache and a lower clock, which the cache and
+frequency columns show - so where the amd-pstate driver is in use, the per-core
+performance ranking of the firmware is reported instead.
+
+Intel's low-power efficiency cores (Meteor Lake and later) are reported as
+`LP-E-core`. Note that this is derived rather than read: CPUID knows the two
+core types Atom and Core only, and an LP E-core is an Atom core like any other
+efficiency core. What identifies it is that it sits outside the L3 domain, so
+an efficiency core seeing no L3 on a system whose other cores do is taken to be
+one. All three types have to be recorded separately.
+
+How much of this is available differs per operating system. Linux, Windows and
+FreeBSD describe every CPU individually. macOS has no per-CPU interface and
+describes the cores per performance level, which is how Apple Silicon exposes
+its P and E cores. The remaining systems have neither that nor a way to place
+the tool on a chosen CPU, so only the CPU it happens to run on is described -
+run it repeatedly to see the other core types.
+
+The nominal base frequency and the rate of the counter the Jitter RNG takes
+its timings from are reported as well. The base frequency is the second value
+that separates the core types - on the hybrid parts it differs where the model
+name cannot - and the counter rate is the resolution every measurement is
+bounded by. That counter is the timestamp counter on x86 and the architected
+generic timer on ARM, where it commonly runs at a far lower rate.
+
+Its properties are stated below the table, in the terms Linux uses for them:
+`invariant/constant` is a counter that ticks at a constant rate whatever the
+P-state, `nonstop` one that keeps ticking in the deep C-states, and
+`known frequency` says that the rate above was enumerated rather than
+calibrated by the operating system against another timer. On Linux these come
+from what the kernel concluded (the `constant_tsc`, `nonstop_tsc` and
+`tsc_known_freq` flags of `/proc/cpuinfo`), elsewhere from CPUID or, on ARM,
+from what the architecture guarantees for the generic timer.
+
+Where a value is unknown, the reason is given below the table rather than left
+to a dash. AMD enumerates neither its base frequency nor its counter rate in
+CPUID, so on an AMD system without cpufreq - a virtual machine, typically -
+both are unknown; and a recording taken under a hypervisor characterizes the
+virtual CPU, which the tool says as well.
+
+With `--json` the same data is written as JSON, for scripts that drive one
+recording per core type. Values the system does not report are `null`,
+`backend` names where the data comes from (`linux`, `windows`, `macos` or
+`generic`, which is what says how complete the listing is), and `pinning`
+states whether the `--cpu` option below can be used at all:
+
+	./jitterentropy-cpuinfo --json |
+		jq -r '.processors[] | select(.coreType == "E-core") | .cpu'
+
+The recording is confined to one of the listed CPUs with the `--cpu` option of
+`jitterentropy-hashtime`:
+
+	./jitterentropy-hashtime 1000000 1 jent-raw-noise --cpu 4
+
+The configuration a recording is made with is shown with:
+
+	./jitterentropy-hashtime 1 1 unused --cpu 4 --status
+
+The same effect is achieved for the recording scripts listed above by invoking
+them under `taskset -c <CPU>`.
+
+The size of the memory block used for the memory access loop does not follow
+the selected core: the library derives it from the largest data cache found in
+the system, which is the one of the performance cores. To record an efficiency
+core with a memory size that matches its own cache instead, pass the size with
+`--max-mem` - the cache sizes of that core are reported by
+`jitterentropy-cpuinfo`.
+
+Note that the internal timer cannot be used together with `--cpu`: its
+counting thread requires a CPU of its own, whereas `--cpu` leaves a single CPU
+in the affinity mask. OpenBSD offers no thread affinity API at all, so `--cpu`
+is unavailable there; `jitterentropy-cpuinfo` says so in its output.
+
 ## Recording of Raw Entropy Data
 
 If the `invoke_testing.sh` is not helpful for performing the test, the following

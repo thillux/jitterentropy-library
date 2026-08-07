@@ -86,6 +86,20 @@ for shared in OFF ON; do
 
 	"$build/tests/gcd/gcd"
 
+	# The CPU information tool. These guests are what compiles its generic
+	# backend at all - the BSDs reach the sysctl half of it, Solaris, Haiku
+	# and Cygwin the half that has no sysctl and is left with the CPU count
+	# and CPUID. It describes the machine rather than testing it, so its
+	# output is shown; a failure here is a defect in that backend.
+	echo "==> jitterentropy-cpuinfo"
+	cpuinfo="$build/tests/raw-entropy/recording_userspace/jitterentropy-cpuinfo"
+	"$cpuinfo"
+	# The JSON form as well: these guests are the ones whose output carries
+	# the null values and the backend note that the writer has to escape.
+	# Only that it runs is checked here - no guest is guaranteed to have a
+	# JSON parser, so the Linux job is where the output is validated.
+	"$cpuinfo" --json > /dev/null
+
 	rng="$build/tests/raw-entropy/recording_userspace/jitterentropy-rng"
 	for opt in "" --all-caches --force-internal-timer; do
 		echo "==> jitterentropy-rng 256 $opt"
