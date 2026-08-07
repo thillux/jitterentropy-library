@@ -22,8 +22,19 @@
  * Usage: jitterentropy-cpuinfo [--summary] [--json]
  */
 
+/*
+ * Both of these must precede every system header, so they are stated here
+ * rather than next to the backend that needs them: _GNU_SOURCE exposes the
+ * CPU-affinity interfaces of glibc, and _WIN32_WINNT the Windows 7 APIs a
+ * toolchain targeting an older Windows hides - the same guard the library's
+ * own Win32 backends carry. An externally supplied, higher value is left
+ * alone.
+ */
 #ifdef __linux__
-#define _GNU_SOURCE
+# define _GNU_SOURCE
+#endif
+#if (defined(_MSC_VER) || defined(__MINGW32__)) && !defined(_WIN32_WINNT)
+# define _WIN32_WINNT 0x0601
 #endif
 
 /* Backend selection */
@@ -48,7 +59,7 @@
 #if defined(__x86_64__) || defined(__i386__) || \
     defined(_M_X64)     || defined(_M_IX86)
 # define JENT_CPUINFO_X86
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
 # define JENT_CPUINFO_ARM64
 #endif
 
@@ -1193,6 +1204,15 @@ static int sysctl_str(const char *name, char *buf, size_t buflen)
 {
 	size_t len = buflen;
 
+	if (!buflen)
+		return -EINVAL;
+
+	/*
+	 * Terminated before the call as well: a name the kernel does not know
+	 * leaves the buffer untouched, and the callers read it regardless of
+	 * what this returns.
+	 */
+	buf[0] = '\0';
 	if (sysctlbyname(name, buf, &len, NULL, 0))
 		return -errno;
 	buf[buflen - 1] = '\0';
@@ -1322,8 +1342,13 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 
 		if (sysctl_level_num(sel, "logicalcpu", &logical) || !logical)
 			continue;
+		/*
+		 * More cores than threads is not a machine that exists, and
+		 * the ratio below is a divisor: take the level as one thread
+		 * per core rather than divide by zero.
+		 */
 		if (sysctl_level_num(sel, "physicalcpu", &physical) ||
-		    !physical)
+		    !physical || physical > logical)
 			physical = logical;
 
 		sysctl_level_num(sel, "l1dcachesize", &l1d);
@@ -1416,15 +1441,10 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 
 #ifdef JENT_CPUINFO_WINDOWS
 
-/*
- * A Windows 7 API, hidden by toolchains still defaulting to an older target -
- * the same guard the library's own Win32 backends carry.
- */
-#if (defined(_MSC_VER) || defined(__MINGW32__)) && !defined(_WIN32_WINNT)
-# define _WIN32_WINNT 0x0601
-#endif
-
 #include <windows.h>
+
+/* Windows has never defined more than this many processor groups. */
+#define JENT_MAX_GROUPS		64
 
 /* Number of CPUs in a group affinity mask. */
 static unsigned long affinity_count(KAFFINITY mask)
@@ -1439,23 +1459,44 @@ static unsigned long affinity_count(KAFFINITY mask)
 	return count;
 }
 
+/* One processor group, and where its CPUs start in the flat numbering. */
+struct jent_group {
+	unsigned long base;	/* flat number of the first active CPU */
+	KAFFINITY active;	/* which bits of the group hold an active CPU */
+};
+
 /*
- * Flat index of the CPU (group, bit): Windows numbers per processor group,
- * this counts the CPUs of the preceding groups - the numbering
- * jitterentropy-hashtime --cpu expects too.
+ * Flat number of the CPU at bit @bit of group @group, or -1 where that bit
+ * holds no active CPU.
+ *
+ * The flat numbering is the one jitterentropy-hashtime --cpu takes, so it has
+ * to be the one jent_thread_pin_to_cpu() resolves: the CPUs of the preceding
+ * groups, then the n-th *set* bit of this group's ActiveProcessorMask. The bit
+ * position itself is not that number - it is only equal to it while the active
+ * CPUs of a group occupy its lowest bits without a gap, which stops holding as
+ * soon as one is parked or disabled. Numbering by bit position there would
+ * name a different CPU than --cpu pins to, leaving one row of the listing
+ * unwritten and another written twice.
  */
-static long flat_cpu(const unsigned long *group_base, WORD groups,
+static long flat_cpu(const struct jent_group *groups, WORD ngroups,
 		     WORD group, unsigned long bit)
 {
-	if (group >= groups)
+	KAFFINITY below;
+
+	if (group >= ngroups || bit >= sizeof(KAFFINITY) * 8)
+		return -1;
+	if (!((groups[group].active >> bit) & (KAFFINITY)1))
 		return -1;
 
-	return (long)(group_base[group] + bit);
+	/* The active CPUs of the group sitting below @bit. */
+	below = groups[group].active & (((KAFFINITY)1 << bit) - 1);
+
+	return (long)(groups[group].base + affinity_count(below));
 }
 
 /* Apply @fn to every CPU covered by @mask. */
 static void for_each_cpu(struct jent_cpu_list *list,
-			 const unsigned long *group_base, WORD groups,
+			 const struct jent_group *groups, WORD ngroups,
 			 const GROUP_AFFINITY *mask,
 			 void (*fn)(struct jent_cpu_info *, void *), void *ctx)
 {
@@ -1467,12 +1508,88 @@ static void for_each_cpu(struct jent_cpu_list *list,
 		if (!((mask->Mask >> bit) & 1))
 			continue;
 
-		cpu = flat_cpu(group_base, groups, mask->Group, bit);
+		cpu = flat_cpu(groups, ngroups, mask->Group, bit);
 		if (cpu < 0 || cpu >= list->entries)
 			continue;
 
 		fn(&list->cpu[cpu], ctx);
 	}
+}
+
+/*
+ * Describe the processor groups in @out, up to @max of them, and return the
+ * number of CPUs across those described or a negative errno.
+ *
+ * The groups are enumerated rather than counted with
+ * GetActiveProcessorGroupCount() / GetActiveProcessorCount(): those report how
+ * many CPUs are active, and only ActiveProcessorMask says which bit positions
+ * they are - what the flat numbering above is built from. This is the source
+ * jent_thread_pin_to_cpu() reads as well.
+ */
+static long jent_groups_windows(struct jent_group *out, WORD max,
+				WORD *ngroups)
+{
+	SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *rec;
+	const GROUP_RELATIONSHIP *rel;
+	/* Bytes that must be readable before Relationship and Size are read. */
+	const size_t hdr = offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+				    Group);
+	size_t need;
+	DWORD len = 0;
+	BYTE *buf;
+	long ncpu = 0;
+	WORD group;
+
+	if (GetLogicalProcessorInformationEx(RelationGroup, NULL, &len) ||
+	    GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+		return -EFAULT;
+
+	buf = (BYTE *)malloc(len);
+	if (!buf)
+		return -ENOMEM;
+
+	if (!GetLogicalProcessorInformationEx(
+			RelationGroup,
+			(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len)) {
+		free(buf);
+		return -EFAULT;
+	}
+
+	/*
+	 * RelationGroup is reported as a single record covering every group,
+	 * with the per-group entries as a trailing array. Validate the header,
+	 * then the array the announced ActiveGroupCount implies, before either
+	 * is dereferenced.
+	 */
+	rec = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf;
+	need = hdr + offsetof(GROUP_RELATIONSHIP, GroupInfo);
+	if ((size_t)len < hdr || (size_t)len < rec->Size ||
+	    rec->Relationship != RelationGroup || rec->Size < need) {
+		free(buf);
+		return -EFAULT;
+	}
+
+	rel = &rec->Group;
+	need += (size_t)rel->ActiveGroupCount * sizeof(PROCESSOR_GROUP_INFO);
+	if (rec->Size < need) {
+		free(buf);
+		return -EFAULT;
+	}
+
+	*ngroups = rel->ActiveGroupCount < max ? rel->ActiveGroupCount : max;
+
+	/* Groups number from zero, so one starts at the count before it. */
+	for (group = 0; group < *ngroups; group++) {
+		const PROCESSOR_GROUP_INFO *gi = &rel->GroupInfo[group];
+
+		out[group].base = (unsigned long)ncpu;
+		out[group].active = gi->ActiveProcessorMask;
+		ncpu += (long)gi->ActiveProcessorCount;
+	}
+
+	free(buf);
+
+	return ncpu;
 }
 
 struct cache_ctx {
@@ -1510,8 +1627,12 @@ static void set_core(struct jent_cpu_info *info, void *arg)
 	const struct core_ctx *ctx = (const struct core_ctx *)arg;
 
 	info->core = ctx->index;
-	/* Held here until the highest class in the system is known. */
-	info->max_khz = ctx->efficiency_class;
+	/*
+	 * Held here until the highest class in the system is known, one above
+	 * the class itself: zero then marks a CPU no core record covered, which
+	 * class 0 is otherwise indistinguishable from.
+	 */
+	info->max_khz = (unsigned long)ctx->efficiency_class + 1;
 }
 
 static void set_package(struct jent_cpu_info *info, void *arg)
@@ -1526,6 +1647,12 @@ static void jent_ident_windows(struct jent_cpu_info *info)
 	char key[128], name[JENT_IDENT_LEN - 64] = "", vendor[63] = "";
 	DWORD len, mhz = 0;
 
+	/*
+	 * The subkeys carry the numbering the system assigned the processors,
+	 * which is the flat numbering used here as long as all of them are
+	 * active. Where one is not, the model is read from a neighbouring CPU -
+	 * a different string only on a machine mixing models across packages.
+	 */
 	snprintf(key, sizeof(key),
 		 "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\%lu",
 		 info->cpu);
@@ -1554,28 +1681,53 @@ static void jent_ident_windows(struct jent_cpu_info *info)
 		info->base_khz = mhz * 1000;
 }
 
+/*
+ * Does @p hold the member its Relationship names, in the space it announces?
+ * The records are variable-length and the trailing GroupMask array is as long
+ * as GroupCount says, so the fixed part and that array both have to fit into
+ * Size before either is read. @hdr is what the walk has already checked.
+ */
+static int record_fits(const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *p,
+		       size_t hdr)
+{
+	size_t need;
+
+	if (p->Relationship == RelationCache)
+		return p->Size >= hdr + sizeof(CACHE_RELATIONSHIP);
+
+	if (p->Relationship != RelationProcessorCore &&
+	    p->Relationship != RelationProcessorPackage)
+		return 1;	/* not read below */
+
+	/* GroupCount sits before the array, so the fixed part comes first. */
+	need = hdr + offsetof(PROCESSOR_RELATIONSHIP, GroupMask);
+	if (p->Size < need)
+		return 0;
+
+	return (size_t)(p->Size - need) >=
+	       (size_t)p->Processor.GroupCount * sizeof(GROUP_AFFINITY);
+}
+
 static int jent_get_cpus(struct jent_cpu_list *list)
 {
 	SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *buf;
-	unsigned long group_base[64];
-	BYTE classes[JENT_MAX_CPUS];
-	BYTE max_class = 0;
-	WORD groups, group;
+	struct jent_group groups[JENT_MAX_GROUPS];
+	/* Efficiency class plus one, zero where no core record was seen. */
+	unsigned int classes[JENT_MAX_CPUS];
+	unsigned int max_class = 0;
+	/* Bytes that must be readable before Relationship and Size are read. */
+	const size_t hdr = offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+				    Processor);
+	WORD ngroups = 0;
 	DWORD len = 0;
-	BYTE *ptr;
-	long ncpu = 0, cores = 0, packages = 0, i;
+	BYTE *pos, *end;
+	long ncpu, cores = 0, packages = 0, i;
 
-	groups = GetActiveProcessorGroupCount();
-	if (!groups)
+	ncpu = jent_groups_windows(groups, JENT_MAX_GROUPS, &ngroups);
+	if (ncpu < 0)
+		return (int)ncpu;
+	if (!ngroups || !ncpu)
 		return -ENOENT;
-	if (groups > (WORD)(sizeof(group_base) / sizeof(group_base[0])))
-		groups = (WORD)(sizeof(group_base) / sizeof(group_base[0]));
-
-	/* Groups number from zero, so a group starts at the count before it. */
-	for (group = 0; group < groups; group++) {
-		group_base[group] = (unsigned long)ncpu;
-		ncpu += (long)GetActiveProcessorCount(group);
-	}
 
 	list->ncpu = ncpu;
 	list->pinning = 1;
@@ -1606,15 +1758,24 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 		return -EFAULT;
 	}
 
-	for (ptr = (BYTE *)buf; ptr < (BYTE *)buf + len;) {
+	pos = (BYTE *)buf;
+	end = pos + len;
+	while ((size_t)(end - pos) >= hdr) {
 		SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *p =
-			(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)ptr;
+			(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)pos;
 		WORD n;
 
-		/* A record of no length would spin here forever. */
-		if (!p->Size)
+		/*
+		 * A record shorter than the header would make the walk spin,
+		 * one longer than what is left would be read past the buffer,
+		 * and one too small for what it claims to describe would be
+		 * read past its own end. None of the data after such a record
+		 * can be located, so the walk stops rather than skipping it.
+		 */
+		if (p->Size < hdr || (size_t)(end - pos) < p->Size ||
+		    !record_fits(p, hdr))
 			break;
-		ptr += p->Size;
+		pos += p->Size;
 
 		/*
 		 * Not a switch: -Wswitch-enum would ask for every value of the
@@ -1630,7 +1791,7 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 			ctx.cache.size = (unsigned long)p->Cache.CacheSize;
 			ctx.cache.shared =
 				affinity_count(p->Cache.GroupMask.Mask);
-			for_each_cpu(list, group_base, groups,
+			for_each_cpu(list, groups, ngroups,
 				     &p->Cache.GroupMask, set_cache, &ctx);
 		} else if (p->Relationship == RelationProcessorCore) {
 			struct core_ctx ctx;
@@ -1640,14 +1801,14 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 			if (ctx.efficiency_class > max_class)
 				max_class = ctx.efficiency_class;
 			for (n = 0; n < p->Processor.GroupCount; n++)
-				for_each_cpu(list, group_base, groups,
+				for_each_cpu(list, groups, ngroups,
 					     &p->Processor.GroupMask[n],
 					     set_core, &ctx);
 		} else if (p->Relationship == RelationProcessorPackage) {
 			long pkg = packages++;
 
 			for (n = 0; n < p->Processor.GroupCount; n++)
-				for_each_cpu(list, group_base, groups,
+				for_each_cpu(list, groups, ngroups,
 					     &p->Processor.GroupMask[n],
 					     set_package, &pkg);
 		}
@@ -1662,16 +1823,22 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 	 * classes, which jent_mark_lp_cores() separates afterwards.
 	 */
 	for (i = 0; i < ncpu; i++) {
-		classes[i] = (BYTE)list->cpu[i].max_khz;
+		classes[i] = (unsigned int)list->cpu[i].max_khz;
 		list->cpu[i].max_khz = 0;
 	}
 
 	for (i = 0; i < ncpu; i++) {
 		struct jent_cpu_info *info = &list->cpu[i];
 
-		if (max_class)
+		/*
+		 * A CPU no core record covered - the CPU numbering and the
+		 * records disagreeing about which one exists, say - is left
+		 * without a type instead of taking the lower one by default.
+		 */
+		if (max_class && classes[i])
 			snprintf(info->type, sizeof(info->type), "%s",
-				 classes[i] == max_class ? "P-core" : "E-core");
+				 classes[i] - 1 == max_class ?
+					"P-core" : "E-core");
 
 		jent_ident_windows(info);
 	}
@@ -1685,14 +1852,15 @@ static int jent_get_cpus(struct jent_cpu_list *list)
 	{
 		GROUP_AFFINITY previous;
 		int restore = 0;
+		WORD group;
 
-		for (group = 0; group < groups; group++) {
+		for (group = 0; group < ngroups; group++) {
 			unsigned long bit;
 
 			for (bit = 0; bit < sizeof(KAFFINITY) * 8; bit++) {
 				GROUP_AFFINITY affinity, old;
 				PROCESSOR_NUMBER current;
-				long cpu = flat_cpu(group_base, groups, group,
+				long cpu = flat_cpu(groups, ngroups, group,
 						    bit);
 
 				if (cpu < 0 || cpu >= ncpu)
