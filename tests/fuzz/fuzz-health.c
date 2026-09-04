@@ -104,9 +104,13 @@
  * deterministic, which a fuzzing target has to be or its crashes do not
  * reproduce.
  */
-void jent_random_data(struct rand_data *ec)
+void jent_random_data_recovery(struct rand_data *ec, unsigned int loops)
 {
-	(void)ec;
+	(void)loops;
+
+	/* As tests/health does: leave the window counters as a block would. */
+	ec->rct_mem_ctr = ec->rct_mem_nosr;
+	ec->rct_mem_count = 0;
 }
 
 /* Time stamps per input: enough to cross the APT window several times. */
