@@ -36,18 +36,26 @@ extern "C"
 #define JENT_GCD_CLOCK_NOTIME	1	/* the internal timer's counting thread */
 #define JENT_GCD_CLOCKS		2
 
-/* @param[in] notime The clock measured, as enable_notime records it. */
-JENT_PRIVATE_STATIC
+/*
+ * Internal, and undecorated on purpose. JENT_PRIVATE_STATIC is the marker of
+ * the API in jitterentropy.h - it expands to default visibility, or to
+ * dllexport - so putting it on these overrode the -fvisibility=hidden the
+ * library is built with and exported them. version.lds took them back out of
+ * the export set, but only on the platforms whose linker takes a version
+ * script: CMakeLists.txt applies it for neither Windows nor macOS, and the
+ * shared library there exported all five. Nothing wanted that - tests/gcd and
+ * the unit tests absorb these sources rather than link them, as their build
+ * files say. Without the marker they are hidden everywhere and still linkable
+ * within the library, which is what they always needed to be.
+ *
+ * @param[in] notime The clock measured, as enable_notime records it.
+ */
 int jent_gcd_analyze(uint64_t *delta_history, size_t nelem, size_t osr,
 		     unsigned int notime);
-JENT_PRIVATE_STATIC
 uint64_t *jent_gcd_init(size_t nelem, unsigned int flags);
-JENT_PRIVATE_STATIC
 void jent_gcd_fini(uint64_t *delta_history, size_t nelem);
 /* @param[in] notime The clock whose divisor is wanted. */
-JENT_PRIVATE_STATIC
 int jent_gcd_get(uint64_t *value, unsigned int notime);
-JENT_PRIVATE_STATIC
 int jent_gcd_selftest(unsigned int flags);
 
 /* Watch for common adjacent GCD values */
