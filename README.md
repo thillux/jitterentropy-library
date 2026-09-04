@@ -94,8 +94,10 @@ ctest --test-dir build --output-on-failure
 ```
 
 The suite has two halves. The deterministic tests - the GCD self test, the unit
-tests for `src/` and `arch/`, and the induced failure tests of the health tests
-- compute over fixed inputs and answer the same everywhere. The entropy
+tests for `src/` and `arch/`, the induced failure tests of the health tests,
+and `exported-symbols`, which reads the built shared library and asserts that
+it exports the functions of `version.lds` and nothing else - compute over
+fixed inputs and answer the same everywhere. The entropy
 generation tests exercise the real noise source and can fail for reasons that
 are properties of the machine rather than defects in the code: a memory lock
 limit lower than the collector needs, or a startup whose health tests do not

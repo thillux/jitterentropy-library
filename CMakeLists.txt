@@ -601,6 +601,36 @@ if(BUILD_TESTING)
     add_subdirectory(tests/fuzz)
 endif()
 
+# Assert the export set of the built shared library against version.lds,
+# which configure already checked against jitterentropy.h. The version script
+# is not applied on macOS or Windows, where JENT_PRIVATE_STATIC on an internal
+# declaration would export it. nm needs -D for ELF and must not get it for
+# Mach-O. PE (Windows, Cygwin, MSYS) is skipped: it exports from the same
+# declarations, so a leak shows on macOS as well.
+if(BUILD_TESTING AND BUILD_SHARED_LIBS AND NOT WIN32 AND NOT CYGWIN AND NOT MSYS)
+    find_program(JENT_NM NAMES nm llvm-nm)
+    if(JENT_NM)
+        if(APPLE)
+            set(JENT_NM_ARGS -g)
+        else()
+            set(JENT_NM_ARGS -D -g)
+        endif()
+        add_test(NAME exported-symbols
+                 COMMAND ${CMAKE_COMMAND}
+                         -DJENT_LIB=$<TARGET_FILE:${PROJECT_NAME}>
+                         -DJENT_VERSION_SCRIPT=${JITTER_VERSION_SCRIPT}
+                         -DJENT_NM=${JENT_NM}
+                         "-DJENT_NM_ARGS=${JENT_NM_ARGS}"
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/JentCheckExports.cmake)
+        # An nm output format the check cannot read is a skip.
+        set_tests_properties(exported-symbols PROPERTIES
+            SKIP_REGULAR_EXPRESSION "the export check does not know the output format")
+    else()
+        message(STATUS
+            "no nm found, not checking the export set of the shared library")
+    endif()
+endif()
+
 # Tools only: nothing here is driven by the suite.
 if(ENABLE_TOOLS)
     add_subdirectory(tests/raw-entropy/validation-runtime)
