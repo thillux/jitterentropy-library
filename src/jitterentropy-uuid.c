@@ -53,12 +53,10 @@
 #include "jitterentropy-internal.h"
 
 #ifdef LINUX_KERNEL
-#include <linux/string.h>	/* memset() */
 #include <linux/types.h>
 #else
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 #endif
 
 static void jent_uuid_format(const uint8_t b[16], char *out)
@@ -79,13 +77,18 @@ void jent_uuid_generate(char *out)
 {
 	uint8_t b[16];
 
+	/*
+	 * No CSPRNG, no identifier: the empty string, which callers read as
+	 * "no identifier". A fixed value would be shared by every instance.
+	 */
 	if (jent_os_random_bytes(b, sizeof(b))) {
-		memset(b, 0, sizeof(b));
-	} else {
-		/* Force the version (4) and variant (10xx) bits. */
-		b[6] = (uint8_t)((b[6] & 0x0f) | 0x40);
-		b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);
+		out[0] = '\0';
+		return;
 	}
+
+	/* Force the version (4) and variant (10xx) bits. */
+	b[6] = (uint8_t)((b[6] & 0x0f) | 0x40);
+	b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);
 
 	jent_uuid_format(b, out);
 }
