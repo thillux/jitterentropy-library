@@ -601,6 +601,41 @@ if(BUILD_TESTING)
     add_subdirectory(tests/fuzz)
 endif()
 
+# The export set of a shared build, asserted against version.lds - which the
+# configure step above has already checked against jitterentropy.h, so this
+# closes the loop from the header to the library that ships.
+#
+# It reads the built file rather than the sources because that is where the
+# two mechanisms meet: -fvisibility=hidden is overridden by
+# JENT_PRIVATE_STATIC, and the version script that would have caught the
+# result is applied for neither Windows nor macOS. An internal function marked
+# with that macro was therefore exported on exactly the platforms that check
+# nothing.
+#
+# nm reads a Mach-O symbol table without -D and an ELF one only with it. PE is
+# left out rather than guessed at: the export set there follows from the same
+# declarations, so a leak reaches macOS too and is caught below.
+if(BUILD_TESTING AND BUILD_SHARED_LIBS AND NOT WIN32)
+    find_program(JENT_NM NAMES nm llvm-nm)
+    if(JENT_NM)
+        if(APPLE)
+            set(JENT_NM_ARGS -g)
+        else()
+            set(JENT_NM_ARGS -D -g)
+        endif()
+        add_test(NAME exported-symbols
+                 COMMAND ${CMAKE_COMMAND}
+                         -DJENT_LIB=$<TARGET_FILE:${PROJECT_NAME}>
+                         -DJENT_VERSION_SCRIPT=${JITTER_VERSION_SCRIPT}
+                         -DJENT_NM=${JENT_NM}
+                         "-DJENT_NM_ARGS=${JENT_NM_ARGS}"
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/JentCheckExports.cmake)
+    else()
+        message(STATUS
+            "no nm found, not checking the export set of the shared library")
+    endif()
+endif()
+
 # Tools only: nothing here is driven by the suite.
 if(ENABLE_TOOLS)
     add_subdirectory(tests/raw-entropy/validation-runtime)
