@@ -585,10 +585,11 @@ struct rand_data
 	unsigned int selftest_failed:1;
 
 	/*
-	 * The clock stopped advancing: a collection loop saw only zero deltas.
-	 * Outside health_failure for the reason selftest_failed is - that word
-	 * reports only under FIPS, and a noise source that stopped must stop
-	 * the output in every mode. Set by jent_random_data_one() alone.
+	 * A collection loop returned without collecting: the clock stopped
+	 * advancing, or the window it would have used is out of range. Outside
+	 * health_failure for the reason selftest_failed is - that word reports
+	 * only under FIPS, and a pool that was never fed must stop the output
+	 * in every mode. Set by jent_random_data_one() alone.
 	 */
 	unsigned int noise_stopped:1;
 

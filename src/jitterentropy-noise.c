@@ -586,7 +586,14 @@ static void jent_random_data_one(
 	nosr = JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR((uint64_t)ec->osr,
 						     safety_factor);
 	if (nosr > USHRT_MAX || nosr < DATA_SIZE_BITS) {
+		/*
+		 * ->noise_stopped as well as the health failure bit: this
+		 * returns having collected nothing, and the bit alone reports
+		 * only under FIPS - in every other mode jent_read_entropy()
+		 * would go on to emit a block from a pool this call never fed.
+		 */
 		ec->health_failure |= JENT_RCT_MEM_FAILURE_PERMANENT;
+		ec->noise_stopped = 1;
 		return;
 	}
 	ec->rct_mem_nosr = (unsigned short)nosr;
