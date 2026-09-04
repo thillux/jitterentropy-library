@@ -256,6 +256,70 @@ static int jent_health_failure_code(unsigned int health_test_result)
 	return JENT_ERR_LAG;
 }
 
+/*
+ * Clear the stack a noise source run left behind: time stamps, deltas, the
+ * memory loop's address selector and Keccak temporaries, in frames that are
+ * neither locked, guard-paged nor kept out of a core dump.
+ *
+ * Done by every entry point that runs the noise source, once at its end: a
+ * wipe between two time stamps would become part of what the next delta
+ * measures. A scrub also reaches copies the C source cannot name.
+ *
+ * 4 kB covers the deepest path, the first jent_entropy_init_ex() of a process
+ * (about 2.6 kB on x86_64 at -O0). The wiped paths have returned before this
+ * frame is allocated, so it is the library's peak stack demand on its own;
+ * unit-stack-residue fails if a path outgrows it.
+ *
+ * Hosted only - a kernel or baremetal stack is already secure.
+ */
+#define JENT_STACK_SCRUB_LEN	4096
+
+#if !defined(LINUX_KERNEL) && !defined(__KERNEL__) && !defined(JENT_BAREMETAL)
+
+/* The bulk of the wipe. */
+static void jent_stack_scrub_array(void)
+{
+	unsigned char scrub[JENT_STACK_SCRUB_LEN];
+
+	jent_memset_secure(scrub, sizeof(scrub));
+}
+
+/*
+ * The bytes above that array, which it cannot reach: the padding the compiler
+ * leaves between the array and the stack canary (8 bytes on x86_64 with gcc
+ * and clang), which nothing else overwrites.
+ *
+ * Scalars, not a buffer: a buffer would get a canary and padding of its own.
+ * Called from the same frame as the array wipe and after it, so its locals
+ * land on the frame that wipe left.
+ */
+static void jent_stack_scrub_frame(void)
+{
+	volatile unsigned long z0 = 0, z1 = 0, z2 = 0, z3 = 0;
+	volatile unsigned long z4 = 0, z5 = 0, z6 = 0, z7 = 0;
+
+	(void)z0; (void)z1; (void)z2; (void)z3;
+	(void)z4; (void)z5; (void)z6; (void)z7;
+}
+
+/*
+ * A macro, not a function: an intermediate frame would carry padding of its
+ * own that neither call clears (under -fstack-protector-all every frame gets
+ * a canary).
+ */
+#define jent_stack_scrub()						       \
+	do {								       \
+		jent_stack_scrub_array();				       \
+		/* Last: it clears what the call above leaves of its own. */   \
+		jent_stack_scrub_frame();				       \
+	} while (0)
+
+#else /* freestanding */
+
+#define jent_stack_scrub()	do { } while (0)
+
+#endif
+
 /**
  * Entry function: Obtain entropy for the caller.
  *
@@ -390,6 +454,9 @@ err:
 		ec->read_invocations++;
 		ec->bytes_output += orig_len;
 	}
+
+	/* Last: anything called after it writes into the frames it clears. */
+	jent_stack_scrub();
 
 	return ret ? ret : (ssize_t)orig_len;
 }
@@ -617,8 +684,15 @@ ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 			 * above).
 			 */
 			if (jent_health_failure_reset(
-				ec, _jent_entropy_collector_alloc))
+				ec, _jent_entropy_collector_alloc)) {
+				/*
+				 * The only exit not behind a wiping
+				 * jent_read_entropy(), after startups of
+				 * the reset's own.
+				 */
+				jent_stack_scrub();
 				return ret;
+			}
 
 			/*
 			 * We are not returning the intermittent errors here.
@@ -989,6 +1063,9 @@ struct rand_data *jent_entropy_collector_alloc(unsigned int osr,
 	if (ec)
 		jent_uuid_generate(ec->uuid);
 
+	/* Last: anything called after it writes into the frames it clears. */
+	jent_stack_scrub();
+
 	return ec;
 }
 
@@ -1317,7 +1394,12 @@ int jent_entropy_init(void)
 		ret = jent_time_entropy_init(0, JENT_FORCE_INTERNAL_TIMER);
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 
-	return jent_entropy_init_common_post(ret);
+	ret = jent_entropy_init_common_post(ret);
+
+	/* Last: anything called after it writes into the frames it clears. */
+	jent_stack_scrub();
+
+	return ret;
 }
 
 JENT_PRIVATE_STATIC
@@ -1375,7 +1457,12 @@ int jent_entropy_init_ex(unsigned int osr, unsigned int flags)
 					     flags | JENT_FORCE_INTERNAL_TIMER);
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 
-	return jent_entropy_init_common_post(ret);
+	ret = jent_entropy_init_common_post(ret);
+
+	/* Last: anything called after it writes into the frames it clears. */
+	jent_stack_scrub();
+
+	return ret;
 }
 
 JENT_PRIVATE_STATIC

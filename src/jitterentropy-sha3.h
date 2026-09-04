@@ -47,6 +47,21 @@ struct jent_sha_ctx {
 	uint8_t digestsize;
 	uint8_t padding;
 	uint8_t initially_seeded:1;
+
+	/*
+	 * Scratch for one XDRBG generate: the successor state V followed by
+	 * the bits returned to the caller. A member rather than a local of
+	 * jent_xdrbg256_generate_block() so that, for the collector's own
+	 * context, it lives in the memory jent_sha3_alloc() obtained - locked,
+	 * guard-paged and excluded from core dumps where the platform allows
+	 * it, which is what JENT_FORCE_SECURE_MEM asks of the state. On the
+	 * stack it was outside all of that.
+	 *
+	 * The stack contexts (HASH_CTX_ON_STACK) carry it unused; it is 96
+	 * bytes of frame they never read, and the wipe on release covers it
+	 * with the rest.
+	 */
+	uint8_t xdrbg_block[JENT_XDRBG_SIZE_STATE + JENT_SHA3_256_SIZE_DIGEST];
 };
 
 #define JENT_SHA_MAX_CTX_SIZE	(sizeof(struct jent_sha_ctx))
