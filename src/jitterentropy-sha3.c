@@ -420,9 +420,11 @@ static void jent_xdrbg256_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
 	/*
 	 * XDRBG:
 	 * 512 Bit for next state (internal memory) || 256 Bit output for user
+	 *
+	 * Taken from the context rather than the stack so it shares the
+	 * protection of the rest of the state - see struct jent_sha_ctx.
 	 */
-	uint8_t jent_block_next_state[JENT_XDRBG_SIZE_STATE +
-				      JENT_SHA3_256_SIZE_DIGEST];
+	uint8_t *jent_block_next_state = ctx->xdrbg_block;
 	uint8_t encode;
 
 	/* Checking the output size */
@@ -432,13 +434,13 @@ static void jent_xdrbg256_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
 	 * rate-size block. See the comments in the squeeze operation for
 	 * details
 	 */
-	JENT_BUILD_BUG_ON(JENT_SHA3_256_SIZE_BLOCK < sizeof(jent_block_next_state));
+	JENT_BUILD_BUG_ON(JENT_SHA3_256_SIZE_BLOCK < sizeof(ctx->xdrbg_block));
 	/*
 	 * The squeeze operation is limited to return multiples of uint64_t -
 	 * verify all set_digestsize values.
 	 */
 	JENT_BUILD_BUG_ON(JENT_XDRBG_SIZE_STATE % sizeof(uint64_t));
-	JENT_BUILD_BUG_ON(sizeof(jent_block_next_state) % sizeof(uint64_t));
+	JENT_BUILD_BUG_ON(sizeof(ctx->xdrbg_block) % sizeof(uint64_t));
 
 	/* The final operation automatically re-initializes the ->hash_state */
 
@@ -477,7 +479,7 @@ static void jent_xdrbg256_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
 	 * Request a full block irrespective of the output size due to
 	 * Keccak squeeze implementation limitation.
 	 */
-	jent_shake256_set_digestsize(ctx, sizeof(jent_block_next_state));
+	jent_shake256_set_digestsize(ctx, sizeof(ctx->xdrbg_block));
 	jent_sha3_final(ctx, jent_block_next_state);
 
 	/* Return Σ to the caller truncated to the requested size */
@@ -496,7 +498,7 @@ static void jent_xdrbg256_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
 	 */
 	jent_sha3_update(ctx, jent_block_next_state, JENT_XDRBG_SIZE_STATE);
 	jent_memset_secure(jent_block_next_state,
-			   sizeof(jent_block_next_state));
+			   sizeof(ctx->xdrbg_block));
 }
 
 void jent_drbg_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
