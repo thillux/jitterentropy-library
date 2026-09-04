@@ -201,11 +201,12 @@ the startup self test performed with
 .BR jent_entropy_init ()
 uses the hardware timer with precedence if it is identified to be appropriate
 for entropy collection. If the internal timer is not compiled, requesting
-this flag returns an error. Even though a separate thread is spawned
-to provide a high-resolution time stamp, this entire operation is completely
-thread-safe as all relevant data is maintained as part of the
+this flag returns an error. The counting thread and its state belong to the
 .IR entropy_collector
-data structure.
+it was spawned for, so instances do not interfere with one another; this does
+not make a single instance safe to use from two threads. See
+.B THREAD SAFETY
+below.
 .TP
 .B JENT_DISABLE_INTERNAL_TIMER
 This flag can be used to ensure that the internal timer is not used.
@@ -422,6 +423,54 @@ and
 It is recommended that the function
 .BR jent_read_entropy_safe ()
 API call is used for generating random numbers.
+.PP
+.SH THREAD SAFETY
+The library takes no locks. What is safe concurrently is stated here; anything
+not stated is the caller's to serialize.
+.TP
+.B An entropy collector belongs to one thread at a time
+.BR jent_read_entropy (),
+.BR jent_read_entropy_safe ()
+and
+.BR jent_status ()
+mutate or read the state of the
+.IR entropy_collector
+they are given - the conditioning state, the previous time stamp, the health
+test counters - without any synchronization of their own. Two threads using
+one collector at the same time corrupt that state, and the output is then
+neither unpredictable nor necessarily distinct. Give each thread its own
+collector, or hold a lock of your own across the call. Separate collectors are
+independent and need no lock between them.
+.TP
+.B Configure before any concurrent use
+.BR jent_entropy_set_notime_cpu (),
+.BR jent_entropy_switch_notime_impl ()
+and
+.BR jent_set_fips_failure_callback ()
+write process-wide state that the calls above only read. They must all be made
+before the first
+.BR jent_entropy_init ()
+or
+.BR jent_entropy_init_ex ()
+and before any thread generates. Once an initialization has run they return
+.IR -EAGAIN ,
+which reports that the window has closed - it does not synchronize with a
+thread already inside it.
+.TP
+.B Initialization may be called from several threads
+.BR jent_entropy_init ()
+and
+.BR jent_entropy_init_ex ()
+publish what they establish - the self test verdict, the common timer divisor,
+whether the internal timer had to be forced - through atomic stores, so
+several threads may run them at once and a thread told the state is
+established also sees what was established. Running one of them once, before
+any concurrent use, remains cheaper: each call measures the timer afresh.
+.TP
+.B jent_selftest() is reentrant
+It runs on stack-local state alone, allocates nothing and never blocks, so it
+may be called from any thread at any time, including in parallel with entropy
+collection on the very instance the verdict is bound to.
 .PP
 .SH NOTES
 In addition to use the generated random bit stream directly
