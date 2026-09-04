@@ -367,6 +367,21 @@ typedef int (*jent_notime_start_routine)(void *);
 /* Forward declaration of opaque value */
 struct rand_data;
 
+/*
+ * Thread safety - the library takes no locks. See jitterentropy(3).
+ *
+ * - One entropy collector belongs to one thread at a time: jent_read_entropy,
+ *   jent_read_entropy_safe and jent_status access its state unsynchronized.
+ *   Separate collectors are independent.
+ * - jent_entropy_set_notime_cpu, jent_entropy_switch_notime_impl and
+ *   jent_set_fips_failure_callback must be called before the first
+ *   jent_entropy_init* and before any thread generates; afterwards they
+ *   return -EAGAIN.
+ * - jent_entropy_init and jent_entropy_init_ex may run on several threads at
+ *   once.
+ * - jent_selftest is reentrant and may run in parallel with generation.
+ */
+
 /* Number of low bits of the time value that we want to consider */
 /* get raw entropy */
 JENT_PRIVATE_STATIC
