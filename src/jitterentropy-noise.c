@@ -542,6 +542,13 @@ unsigned int jent_measure_jitter(struct rand_data *ec,
 	((DATA_SIZE_BITS + (_safety_factor)) * (_osr))
 
 /*
+ * Consecutive zero time deltas after which the clock is taken to have stopped.
+ * Far above any run a working clock can produce, so it only ends a collection
+ * loop that would otherwise never end. See jent_random_data_one().
+ */
+#define JENT_NOISE_DEAD_THRESHOLD	(1U << 16)
+
+/*
  * The health test RCT with memory operates on multiples of three time deltas.
  * Therefore, round up the jitter loop counter to the nearest multiple of three.
  */
@@ -557,7 +564,7 @@ static void jent_random_data_one(
 			               uint64_t loop_cnt,
 				       uint64_t *ret_current_delta))
 {
-	unsigned int safety_factor = 0, ctr = 0;
+	unsigned int safety_factor = 0, ctr = 0, dead = 0;
 	uint64_t nosr;
 
 	if (ec->is_fips_enabled)
@@ -586,8 +593,32 @@ static void jent_random_data_one(
 
 	/* Entropy collection loop */
 	while (!jent_health_failure(ec)) {
+		uint64_t current_delta = 0;
+		unsigned int stuck = measure_jitter(ec, 0, &current_delta);
+
+		/*
+		 * Liveness bound. jent_health_failure() reports only under
+		 * FIPS, so outside a compliance mode nothing above ends this
+		 * loop - and a clock that stopped advancing after the startup
+		 * measured it (a suspended VM, a trapped counter, a frozen
+		 * clocksource) makes every delta zero and every measurement
+		 * stuck, spinning here forever.
+		 *
+		 * A working clock produces no run of zero deltas at all:
+		 * jent_entropy_init() rejects one that does with ECOARSETIME.
+		 * So this ends only a loop that would not end, and is not a
+		 * health test verdict - hence ->noise_stopped rather than a
+		 * health_failure bit.
+		 */
+		if (current_delta) {
+			dead = 0;
+		} else if (++dead >= JENT_NOISE_DEAD_THRESHOLD) {
+			ec->noise_stopped = 1;
+			return;
+		}
+
 		/* If a stuck measurement is received, repeat measurement */
-		if (measure_jitter(ec, 0, NULL))
+		if (stuck)
 			continue;
 
 		if (++ctr >= ec->rct_mem_nosr)

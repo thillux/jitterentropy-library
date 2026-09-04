@@ -313,6 +313,18 @@ ssize_t jent_read_entropy(struct rand_data *ec, char *data, size_t len)
 
 		jent_random_data(ec);
 
+		/*
+		 * The clock stopped advancing - see the loop bound in
+		 * jent_random_data_one(). Checked outside
+		 * jent_health_failure() for the reason the self test above is,
+		 * and reported as the permanent RCT failure it is, so every
+		 * caller already handles it.
+		 */
+		if (ec->noise_stopped) {
+			ret = JENT_ERR_RCT_PERMANENT;
+			goto err;
+		}
+
 		if ((health_test_result = jent_health_failure(ec))) {
 			if (health_test_result & JENT_RCT_FAILURE_PERMANENT)
 				ret = JENT_ERR_RCT_PERMANENT;
@@ -854,6 +866,16 @@ static struct rand_data *_jent_entropy_collector_alloc(unsigned int osr,
 	 */
 	do {
 		jent_random_data(ec);
+
+		/*
+		 * The clock stopped advancing under the startup. Not
+		 * something a higher oversampling rate can mend, so the reset
+		 * ladder below is skipped and the allocation fails.
+		 */
+		if (ec->noise_stopped) {
+			jent_entropy_collector_free(ec);
+			return NULL;
+		}
 
 		/*
 		 * Check for any kind of health error at this point including

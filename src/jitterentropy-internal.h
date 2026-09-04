@@ -584,6 +584,14 @@ struct rand_data
 	 */
 	unsigned int selftest_failed:1;
 
+	/*
+	 * The clock stopped advancing: a collection loop saw only zero deltas.
+	 * Outside health_failure for the reason selftest_failed is - that word
+	 * reports only under FIPS, and a noise source that stopped must stop
+	 * the output in every mode. Set by jent_random_data_one() alone.
+	 */
+	unsigned int noise_stopped:1;
+
 #ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
 	volatile uint8_t notime_interrupt;	/* indicator to interrupt ctr */
 	volatile uint64_t notime_timer;		/* high-res timer mock-up */

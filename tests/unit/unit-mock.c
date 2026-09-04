@@ -795,6 +795,61 @@ static void test_status_truncation(void)
 	jent_entropy_collector_free(ec);
 }
 
+/*
+ * A clock that stops advancing after the startup measured it - a suspended VM,
+ * a hypervisor trapping the counter to a constant. Every measurement is then
+ * stuck, and the collection loop repeats a stuck measurement, so without a
+ * bound of its own it never returns: the health tests that would end it report
+ * only under FIPS, and this instance is not in FIPS mode.
+ */
+static void test_clock_stops_after_startup(void)
+{
+	static uint64_t seq[4096];
+	struct fi_replay r;
+	struct rand_data *ec;
+	char buf[32];
+	unsigned int step = 7, i;
+	uint64_t t = 1;
+
+	jent_ut_group("a clock that stops after the startup");
+
+	for (i = 0; i < JENT_ARRAY_SIZE(seq); i++) {
+		step = (step * 1103515245u + 12345u);
+		t += 500 + (step >> 22);
+		seq[i] = t;
+	}
+
+	fi_replay_init(&r, seq, JENT_ARRAY_SIZE(seq));
+
+	jent_set_mock_timer(fi_replay_cb, &r);
+	ec = jent_entropy_collector_alloc(0, JENT_DISABLE_INTERNAL_TIMER);
+	if (!ec) {
+		jent_set_mock_timer(NULL, NULL);
+		JENT_UT_SKIP("a clock that stops after the startup",
+			     "the constructed clock does not pass the startup test");
+		return;
+	}
+
+	if (ec->is_fips_enabled) {
+		/* The bound below is what FIPS mode already provides. */
+		jent_entropy_collector_free(ec);
+		jent_set_mock_timer(NULL, NULL);
+		JENT_UT_SKIP("a clock that stops after the startup",
+			     "FIPS mode is enabled system-wide");
+		return;
+	}
+
+	/* Freeze it: every reading from here on is the last one. */
+	r.hold = 1;
+
+	JENT_UT_EQ(jent_read_entropy(ec, buf, sizeof(buf)),
+		   (ssize_t)JENT_ERR_RCT_PERMANENT,
+		   "a stopped clock is refused rather than spun on");
+
+	jent_entropy_collector_free(ec);
+	jent_set_mock_timer(NULL, NULL);
+}
+
 int main(void)
 {
 	jent_ut_setup();
@@ -807,6 +862,7 @@ int main(void)
 	test_generation_on_mocked_clock();
 	test_realloc_during_startup();
 	test_realloc_on_read_gives_up();
+	test_clock_stops_after_startup();
 
 	return jent_ut_report("unit-mock");
 }
