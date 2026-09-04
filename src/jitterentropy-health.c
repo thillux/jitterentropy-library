@@ -663,41 +663,32 @@ static void jent_rct_mem_insert(struct rand_data *ec, unsigned int stuck)
 		 * wasted.
 		 */
 		if (!ec->in_recovery) {
-			enum jent_startup_state saved_state = ec->startup_state;
-			unsigned int i;
-
 			/*
-			 * Clear the RCT with mem counter to generate fresh
-			 * data.
+			 * Each recovery block is a window of its own and
+			 * resets these, which belong to the outer window
+			 * still in progress. Left clobbered, ->rct_mem_ctr
+			 * ended at the last block's ->rct_mem_nosr, so
+			 * JENT_RCT_MEM_IN_WINDOW was false for the rest of
+			 * the outer block: the recovery switched the test off
+			 * for the block it was recovering.
 			 */
-			ec->rct_mem_count = 0;
+			unsigned short saved_ctr = ec->rct_mem_ctr;
+			unsigned short saved_nosr = ec->rct_mem_nosr;
+
 			ec->in_recovery = 1;
-
-			/*
-			 * The recovery loop may fire while an outer
-			 * jent_random_data() invocation is still inside a
-			 * FIPS/NTG.1 startup stage. Park the state machine in
-			 * the completed state for the recursive calls: they
-			 * would otherwise re-run the startup stages and
-			 * advance startup_state underneath the outer
-			 * invocation, whose subsequent stale-state decrement
-			 * would push startup_state below
-			 * jent_startup_completed - and the startup loop in
-			 * _jent_entropy_collector_alloc() would then never
-			 * terminate.
-			 */
-			ec->startup_state = jent_startup_completed;
-			for (i = 0; i < JENT_RCT_MEM_RECOVERY_LOOP_CNT; i++)
-				jent_random_data(ec);
-			ec->startup_state = saved_state;
+			jent_random_data_recovery(
+				ec, JENT_RCT_MEM_RECOVERY_LOOP_CNT);
 			ec->in_recovery = 0;
 
+			ec->rct_mem_ctr = saved_ctr;
+			ec->rct_mem_nosr = saved_nosr;
+
 			/*
-			 * We now leave the set health falures incurred from
-			 * the jent_random_data loop. If that loop did not
-			 * detect a failure, we have no failure at this point
-			 * either. Also, leave the rct_mem_count value as is.
+			 * Fresh count for the rest of the outer window: the
+			 * crossing is forgiven when the blocks above raised
+			 * no failure of their own. Any they did raise stands.
 			 */
+			ec->rct_mem_count = 0;
 		} else {
 			if (JENT_RCT_MEM_IN_WINDOW)
 				ec->health_failure |= JENT_RCT_MEM_FAILURE;

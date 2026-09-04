@@ -627,6 +627,42 @@ static void jent_random_data_one(
 }
 
 /**
+ * Generate the additional blocks of an RCT-with-memory recovery loop
+ *
+ * jent_random_data() cannot serve: it advances ->startup_state underneath the
+ * outer invocation. Parking that state at jent_startup_completed to stop it -
+ * what the recovery did before - took the dispatch to the last case, which
+ * samples both noise sources: the wrong one during the NTG.1 startup stages,
+ * which exist to sample the memory access and the SHA-3 loop separately.
+ * Dispatching without advancing keeps each block on the stage's own source.
+ *
+ * @param[in] ec Reference to entropy collector
+ * @param[in] loops Number of blocks to generate
+ */
+void jent_random_data_recovery(struct rand_data *ec, unsigned int loops)
+{
+	unsigned int i;
+
+	for (i = 0; i < loops; i++) {
+		switch (ec->startup_state) {
+		case jent_startup_memory:
+			jent_random_data_one(ec,
+					     jent_measure_jitter_ntg1_memaccess);
+			break;
+		case jent_startup_sha3:
+			jent_random_data_one(ec, jent_measure_jitter_ntg1_sha3);
+			break;
+		case jent_startup_completed:
+		default:
+			/* priming of the ->prev_time value */
+			jent_measure_jitter(ec, 0, NULL);
+			jent_random_data_one(ec, jent_measure_jitter);
+			break;
+		}
+	}
+}
+
+/**
  * Generator of one 256 bit random number
  * Function fills rand_data->hash_state
  *

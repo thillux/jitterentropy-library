@@ -64,10 +64,17 @@
  * recovery clears the counter and enters the loop instead of raising the
  * error - not what the noise source produces while it runs. A stub also keeps
  * the case deterministic.
+ *
+ * Not a no-op: the real function generates blocks that each reset the window
+ * counters, so clobbering them is what lets the test observe that the recovery
+ * puts the outer window back.
  */
-void jent_random_data(struct rand_data *ec)
+void jent_random_data_recovery(struct rand_data *ec, unsigned int loops)
 {
-	(void)ec;
+	(void)loops;
+
+	ec->rct_mem_ctr = ec->rct_mem_nosr;
+	ec->rct_mem_count = 0;
 }
 
 /*
@@ -232,6 +239,16 @@ static void jent_test_verify_clean(const char *name, struct rand_data *ec,
 	printf(" : %s\n", result);
 
 	if (mask)
+		failures++;
+}
+
+/* A case whose outcome is a state check rather than a reported error. */
+static void jent_test_check(const char *name, int ok, unsigned int samples)
+{
+	printf("  %-34s %6u samples -> %s\n", name, samples,
+	       ok ? "passed" : "FAILED");
+
+	if (!ok)
 		failures++;
 }
 
@@ -436,6 +453,16 @@ static void jent_test_rct_mem(unsigned int osr,
 		for (i = 0; i < samples; i++)
 			jent_rct_mem_insert(&ec, 1);
 		jent_test_verify_clean("RCT-mem recovery loop", &ec, samples);
+
+		/*
+		 * The recovery generates whole output blocks, each of which
+		 * resets the window counters, and has to put the outer window
+		 * back: left clobbered, the rest of the block it was
+		 * recovering falls outside its window and is not tested at
+		 * all. The stub above leaves them as a block would.
+		 */
+		jent_test_check("RCT-mem window after recovery",
+				ec.rct_mem_ctr == samples, samples);
 	}
 
 	/*
