@@ -217,7 +217,11 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	fd = open(argv[2], O_CREAT|O_WRONLY|O_EXCL|O_BINARY, 0777);
+	/*
+	 * 0644: this file is the input an SP800-90B assessment is computed
+	 * from, so it has no business being writable by anyone else.
+	 */
+	fd = open(argv[2], O_CREAT|O_WRONLY|O_EXCL|O_BINARY, 0644);
 	if (fd < 0) {
 		fprintf(stderr, "File %s cannot be opened for write: %s\n",
 			argv[2], strerror(errno));
