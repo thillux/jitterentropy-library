@@ -584,6 +584,14 @@ struct rand_data
 	 */
 	unsigned int selftest_failed:1;
 
+	/*
+	 * A collection loop returned without collecting: the clock stopped
+	 * advancing or the window is out of range. Kept apart from
+	 * health_failure, which reports only under FIPS: an unfed pool must
+	 * stop the output in every mode. Set by jent_random_data_one().
+	 */
+	unsigned int noise_stopped:1;
+
 #ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
 	volatile uint8_t notime_interrupt;	/* indicator to interrupt ctr */
 	volatile uint64_t notime_timer;		/* high-res timer mock-up */
