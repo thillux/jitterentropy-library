@@ -74,14 +74,19 @@ APPVERSION := $(APPMAJOR).$(APPMINOR).$(APPPATCH)
 C_SRCS := $(wildcard *.c) ../../src/jitterentropy-gcd.c \
 	  ../../arch/jitterentropy-arch-memory.c \
 	  ../../arch/jitterentropy-arch-atomic.c
-C_OBJS := ${C_SRCS:.c=.o}
-C_GCOV := ${C_SRCS:.c=.gcda}
-C_GCOV += ${C_SRCS:.c=.gcno}
-C_GCOV += ${C_SRCS:.c=.gcov}
+# Objects land here, not beside their sources: the root Makefile's VPATH
+# would pick up objects left in ../../src and ../../arch as its own.
+vpath %.c ../../src ../../arch
+
+C_OBJS := $(notdir ${C_SRCS:.c=.o})
+# gcov writes .gcno and .gcda beside the object.
+C_GCOV := ${C_OBJS:.o=.gcda}
+C_GCOV += ${C_OBJS:.o=.gcno}
+C_GCOV += ${C_OBJS:.o=.gcov}
 OBJS := $(C_OBJS)
 
 analyze_srcs = $(filter %.c, $(sort $(C_SRCS)))
-analyze_plists = $(analyze_srcs:%.c=%.plist)
+analyze_plists = $(notdir $(analyze_srcs:%.c=%.plist))
 
 .PHONY: all scan install clean cppcheck distclean debug asanaddress asanthread leak gcov
 
@@ -130,8 +135,11 @@ scan: $(analyze_plists)
 cppcheck:
 	cppcheck --force -q --enable=performance --enable=warning --enable=portability *.h *.c ../lib/*.c ../lib/*.h
 
+# Here as well - see the vpath above.
+C_ASM := $(notdir ${C_SRCS:.c=.s})
+
 asm:
-	$(foreach b, $(C_SRCS), $(CC) $(CFLAGS) -S -fverbose-asm -o ${b:.c=.s} $(b);)
+	$(foreach b, $(C_SRCS), $(CC) $(CFLAGS) -S -fverbose-asm -o $(notdir ${b:.c=.s}) $(b);)
 
 install:
 	install -m 0755 $(NAME) -D -t $(DESTDIR)$(BINDIR)/
@@ -148,6 +156,7 @@ clean:
 	@- $(RM) $(C_GCOV)
 	@- $(RM) *.gcov
 	@- $(RM) $(analyze_plists)
+	@- $(RM) $(C_ASM)
 
 distclean: clean
 

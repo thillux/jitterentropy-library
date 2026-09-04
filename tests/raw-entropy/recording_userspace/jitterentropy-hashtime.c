@@ -237,15 +237,7 @@ static int jent_one_test(const char *pathname, unsigned long rounds,
 	 * *want* to also know about insufficient entropy.
 	 * Thus, only perform the cryptographic self tests and go on.
 	 */
-#if 0
-	ret = jent_entropy_init_ex(osr, flags);
-	if (ret) {
-		printf("The initialization failed with error code %d\n", ret);
-		goto out;
-	}
-#else
 	jent_entropy_init_common_pre(flags);
-#endif
 
 	/*
 	 * Use the internal allocation to prevent checking and updating the

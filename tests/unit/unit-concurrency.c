@@ -676,6 +676,23 @@ static unsigned int ut_run(struct ut_worker *workers, unsigned int nthreads)
 }
 
 /*
+ * Whether a run raced anything. A short run still exercises the library, but
+ * one thread passes every check without overlapping anything, so it is a
+ * skip. Two suffices; arms needing more check for it themselves.
+ */
+static int ut_raced(unsigned int started, const char *what)
+{
+	if (started >= 2)
+		return 1;
+
+	JENT_UT_SKIP(what, started ?
+			   "only one thread could be created, so nothing ran "
+			   "concurrently" :
+			   "no thread could be created");
+	return 0;
+}
+
+/*
  * One configuration per thread, so that the collectors being built at the same
  * time differ in the state the library derives per instance - memory size and
  * hash loop count - rather than all taking the same path through the
@@ -729,11 +746,8 @@ static void test_concurrent_lifecycle(void)
 	ut_init_workers(workers, nthreads, ut_work_lifecycle, ut_flags);
 
 	started = ut_run(workers, nthreads);
-	if (!started) {
-		JENT_UT_SKIP("the concurrent life cycle",
-			     "no thread could be created");
+	if (!ut_raced(started, "the concurrent life cycle"))
 		return;
-	}
 	printf("  note: %u threads, %u rounds each\n", started, UT_ROUNDS);
 
 	/*
@@ -838,11 +852,8 @@ static void test_concurrent_registrations(void)
 			ut_fips_flags);
 
 	started = ut_run(workers, nthreads);
-	if (!started) {
-		JENT_UT_SKIP("the concurrent registration",
-			     "no thread could be created");
+	if (!ut_raced(started, "the concurrent registration"))
 		return;
-	}
 
 	for (i = 0; i < started; i++) {
 		allocs += (unsigned int)workers[i].allocs;
@@ -976,11 +987,8 @@ static void test_concurrent_notime(void)
 	for (i = 0; i < nthreads; i++)
 		jent_entropy_collector_free(workers[i].ec);
 
-	if (!started) {
-		JENT_UT_SKIP("the two clocks against each other",
-			     "no thread could be created");
+	if (!ut_raced(started, "the two clocks against each other"))
 		return;
-	}
 
 	/* What each clock established, substituting one as the library does. */
 	for (i = 0; i < 2; i++) {

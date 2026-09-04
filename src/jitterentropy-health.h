@@ -41,18 +41,6 @@ uint64_t jent_delta(uint64_t prev, uint64_t next)
 	return (next - prev);
 }
 
-#if 0
-static inline uint64_t jent_delta_abs(uint64_t prev, uint64_t next)
-{
-	/*
-	 * Return the absolute value of the delta when the values are not a
-	 * monotonic counter that may wrap.
-	 */
-	return (next > prev) ? (next - prev) : (prev - next);
-}
-#endif
-
-
 /*
 * The cutoff value is based on the following consideration:
 * alpha = 2^-30 or 2^-60 as recommended in SP800-90B.

@@ -89,13 +89,16 @@ LIBPATCH=$(shell grep -E "define\s+JENT_PATCHLEVEL" jitterentropy.h | awk '{prin
 LIBVERSION := $(LIBMAJOR).$(LIBMINOR).$(LIBPATCH)
 
 ARCHDIR := arch
-VPATH := $(SRCDIR):$(ARCHDIR)
+# No VPATH: it would also find the objects the kernel build leaves beside the
+# sources in src/ and arch/ and take them for this build's. The explicit rules
+# below look only at the sources.
 C_SRCS := $(notdir $(sort $(wildcard $(SRCDIR)/*.c) $(wildcard $(ARCHDIR)/*.c)))
 C_OBJS := ${C_SRCS:.c=.o}
 OBJS := $(C_OBJS)
 
-analyze_srcs = $(filter %.c, $(sort $(C_SRCS)))
-analyze_plists = $(analyze_srcs:%.c=%.plist)
+analyze_src_plists = $(patsubst $(SRCDIR)/%.c,%.plist,$(wildcard $(SRCDIR)/*.c))
+analyze_arch_plists = $(patsubst $(ARCHDIR)/%.c,%.plist,$(wildcard $(ARCHDIR)/*.c))
+analyze_plists = $(analyze_src_plists) $(analyze_arch_plists)
 
 INCLUDE_DIRS := . $(SRCDIR)
 LIBRARY_DIRS :=
@@ -165,7 +168,18 @@ $(SOFILE): $(OBJS) $(VERSION_SCRIPT)
 $(NAME)-static: lib$(NAME).a
 $(NAME): $(SOFILE)
 
-$(analyze_plists): %.plist: %.c
+# Compile rules naming the source directory; see the note at C_SRCS.
+%.o: $(SRCDIR)/%.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+%.o: $(ARCHDIR)/%.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(analyze_src_plists): %.plist: $(SRCDIR)/%.c
+	@echo "  CCSA  " $@
+	clang --analyze $(CFLAGS) $< -o $@
+
+$(analyze_arch_plists): %.plist: $(ARCHDIR)/%.c
 	@echo "  CCSA  " $@
 	clang --analyze $(CFLAGS) $< -o $@
 
