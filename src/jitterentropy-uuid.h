@@ -58,8 +58,10 @@
 
 /*
  * Generate an RFC 4122 version 4 UUID string into @out, which must hold at
- * least JENT_UUID_STRLEN bytes. Where the platform offers no CSPRNG the nil
- * UUID (all zeroes) is produced. Defined in src/jitterentropy-uuid.c.
+ * least JENT_UUID_STRLEN bytes. Where the platform offers no CSPRNG the empty
+ * string is produced - the instance has no identifier, which is what an empty
+ * ->uuid means everywhere else too, rather than an identifier every instance
+ * shares. Defined in src/jitterentropy-uuid.c.
  */
 void jent_uuid_generate(char *out);
 

@@ -63,7 +63,7 @@
 #include "jitterentropy-arch-random.c"
 #include "jitterentropy-uuid.c"
 
-/* What jent_uuid_generate() formats when it has no bytes to format. */
+/* What jent_uuid_generate() must never produce - see below. */
 #define JENT_UT_NIL_UUID "00000000-0000-0000-0000-000000000000"
 
 /*
@@ -81,6 +81,19 @@ static void test_uuid(void)
 	jent_uuid_generate(a);
 	jent_uuid_generate(b);
 	printf("  note: %s\n", a);
+
+	/*
+	 * Without a CSPRNG there are no bytes to format, so the instance has
+	 * no identifier and gets the empty string. Not the nil UUID this used
+	 * to emit: that is well formed, so nothing downstream could tell it
+	 * from a generated one, and every instance on such a platform shared
+	 * it.
+	 */
+	if (!jent_os_random_supported()) {
+		JENT_UT_TRUE(a[0] == '\0',
+			     "no identifier is generated where none exists");
+		return;
+	}
 
 	JENT_UT_EQ(strlen(a), JENT_UUID_STRLEN - 1, "the length is canonical");
 
@@ -101,20 +114,8 @@ static void test_uuid(void)
 	}
 	jent_ut_checks++;
 
-	/*
-	 * What the rest may assert depends on what the platform can answer.
-	 * Without a CSPRNG jent_uuid_generate() has no bytes to format and
-	 * says so with the nil UUID, which carries neither version nor variant
-	 * nibble and repeats.
-	 */
-	if (!jent_os_random_supported()) {
-		JENT_UT_TRUE(!strcmp(a, JENT_UT_NIL_UUID),
-			     "the nil UUID is generated where none exists");
-		return;
-	}
-
 	JENT_UT_TRUE(strcmp(a, JENT_UT_NIL_UUID),
-		     "a UUID is generated where a CSPRNG exists");
+		     "a generated UUID is never the nil UUID");
 
 	JENT_UT_EQ(a[14], '4', "the version nibble says version 4");
 	jent_ut_checks++;

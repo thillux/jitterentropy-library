@@ -53,12 +53,10 @@
 #include "jitterentropy-internal.h"
 
 #ifdef LINUX_KERNEL
-#include <linux/string.h>	/* memset() */
 #include <linux/types.h>
 #else
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 #endif
 
 static void jent_uuid_format(const uint8_t b[16], char *out)
@@ -79,13 +77,21 @@ void jent_uuid_generate(char *out)
 {
 	uint8_t b[16];
 
+	/*
+	 * No CSPRNG, so no identifier to be had. The nil UUID emitted before
+	 * was indistinguishable from a generated one and the same for every
+	 * instance, which collided the per-instance /proc files of the kernel
+	 * character device. The empty string is what callers already read as
+	 * "no identifier" (jent_ioctl_field_get() answers -ENODATA on it).
+	 */
 	if (jent_os_random_bytes(b, sizeof(b))) {
-		memset(b, 0, sizeof(b));
-	} else {
-		/* Force the version (4) and variant (10xx) bits. */
-		b[6] = (uint8_t)((b[6] & 0x0f) | 0x40);
-		b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);
+		out[0] = '\0';
+		return;
 	}
+
+	/* Force the version (4) and variant (10xx) bits. */
+	b[6] = (uint8_t)((b[6] & 0x0f) | 0x40);
+	b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);
 
 	jent_uuid_format(b, out);
 }
