@@ -91,6 +91,24 @@ jobs:
               echo "::warning::jitterentropy-rng $opt failed on this machine"
           done
 
+  # The only job building the stub half of jitterentropy-timer.c.
+  linux-no-internal-timer:
+    name: Linux / gcc / INTERNAL_TIMER=OFF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DINTERNAL_TIMER=OFF
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Run tests
+        run: |
+          ctest --test-dir build --output-on-failure -LE unreliable
+          ./build/tests/raw-entropy/recording_userspace/jitterentropy-rng 256 > /dev/null
+
   linux-raised-osr:
     name: Linux / gcc / JENT_MAX_OSR=64
     runs-on: ubuntu-latest
@@ -109,6 +127,40 @@ jobs:
         run: |
           ctest --test-dir build --output-on-failure -LE unreliable
           ./build/tests/health/jitterentropy-health 64
+
+  # acvpparser's jent backend, the CAVP test harness of the conditioner,
+  # #includes src/jitterentropy-sha3.c and builds it with -Werror. Unpinned:
+  # the current parser is the one that has to keep working.
+  linux-acvp-parser:
+    name: Linux / acvpparser / jent backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: smuellerDD/acvpparser
+          path: acvpparser
+
+      - name: Show the acvpparser revision
+        run: git -C acvpparser log -1 --format='%H %cd %s'
+
+      - name: Build the library
+        run: |
+          cmake -S . -B build -DBUILD_SHARED_LIBS=OFF
+          cmake --build build -j "$(nproc)" --target jitterentropy
+
+      # The archive supplies jent_memset_secure(), which sha3.c calls. LDFLAGS
+      # from the environment, as acvpparser's Makefile appends to it.
+      - name: Build acvpparser against this tree
+        run: |
+          LDFLAGS="$PWD/build/libjitterentropy.a" \
+            make -C acvpparser jent JENT_SRC="$PWD" -j "$(nproc)"
+
+      - name: Check its digests against hashlib
+        run: |
+          python3 .github/scripts/acvp-parser-check.py \
+            acvpparser/acvp-parser "$RUNNER_TEMP"
 
   linux-musl:
     name: Linux / musl-gcc / ${{ matrix.link }}
@@ -149,7 +201,7 @@ jobs:
           bin=build/tests/gcd/gcd
           file "$bin"
 
-          if strings "$bin" | grep -q GLIBC; then
+          if grep -q GLIBC < <(strings "$bin"); then
             echo "::error::GLIBC symbol versions present, this is not musl"
             exit 1
           fi
@@ -177,9 +229,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 7.9 is the last RHEL 7 minor release; the other entries float.
-          - name: RHEL 7
-            image: registry.access.redhat.com/ubi7/ubi:7.9
+          # The RHEL 7 generation (glibc 2.17, gcc 4.8), pinned at its last
+          # minor release; the other entries float. CentOS, as the public UBI 7
+          # content no longer carries a toolchain.
+          - name: CentOS 7
+            image: quay.io/centos/centos:centos7.9.2009
             # No distro CMake meets the 3.22 floor here.
             cmake: kitware
           - name: RHEL 8
@@ -215,6 +269,16 @@ jobs:
             bash -euxo pipefail -c '
               # No apostrophes anywhere in here: the whole script is a
               # single-quoted argument to bash -c, and one would end it.
+
+              # mirrorlist.centos.org is gone: point CentOS 7 at the vault.
+              # gpgcheck stays on with the key the image ships.
+              if [ -f /etc/yum.repos.d/CentOS-Base.repo ]; then
+                sed -i \
+                  -e "s|^mirrorlist=|#mirrorlist=|" \
+                  -e "s|^#baseurl=http://mirror.centos.org/centos/\$releasever|baseurl=https://vault.centos.org/7.9.2009|" \
+                  /etc/yum.repos.d/CentOS-Base.repo
+              fi
+
               if command -v dnf > /dev/null; then
                 install="dnf -y install"
               elif command -v zypper > /dev/null; then
@@ -229,11 +293,11 @@ jobs:
               if [ "$CMAKE_SOURCE" = distro ]; then
                 $install cmake
               else
-                # tar is not in the RHEL 7 base image and the tarball needs it.
+                # The tarball needs tar, which not every base image carries.
                 $install tar
                 url=https://github.com/Kitware/CMake/releases/download
-                # Retries only: RHEL 7 ships curl 7.29, which has neither
-                # --http1.1 nor --retry-all-errors, and no HTTP/2 either.
+                # Retries only: CentOS 7 ships curl 7.29, which has neither
+                # --http1.1 nor --retry-all-errors.
                 curl -fsSL --retry 5 --retry-delay 5 \
                   "$url/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-linux-x86_64.tar.gz" \
                   -o /tmp/cmake.tar.gz
@@ -820,7 +884,7 @@ jobs:
 
           syms=$(nix shell nixpkgs#binutils -c \
             nm $nmflags --defined-only "$OUT/$file")
-          grep -E ' [TtWw] jent_' <<<"$syms" | head -20
+          grep -m 20 -E ' [TtWw] jent_' <<<"$syms" || true
           grep -qE ' [TtWw] jent_entropy_init$' <<<"$syms" || {
             echo "::error::no jitterentropy symbols in $file"
             exit 1
