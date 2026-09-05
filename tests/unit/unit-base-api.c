@@ -234,6 +234,29 @@ static void test_status(void)
 	}
 
 	/*
+	 * An instance without a memory access region reports that it has
+	 * none, rather than the size the memory field of its flags decodes to
+	 * - that field is never normalized for such an instance.
+	 */
+	{
+		struct rand_data *nomem =
+			jent_entropy_collector_alloc(0,
+						     JENT_DISABLE_MEMORY_ACCESS);
+
+		if (!nomem) {
+			JENT_UT_SKIP("an instance without a memory region",
+				     "no collector: a FIPS host refuses the combination");
+		} else {
+			JENT_UT_EQ(jent_status(nomem, buf, sizeof(buf)), 0,
+				   "the status of an instance without a memory region renders");
+			JENT_UT_TRUE(strstr(buf,
+					    "\"memoryBlockSizeBytes\": 0,") != NULL,
+				     "and reports no region rather than a default size");
+			jent_entropy_collector_free(nomem);
+		}
+	}
+
+	/*
 	 * No entropy collector is not an error: it is the documented way to
 	 * ask for the version alone, and the result must still be a complete
 	 * JSON object.

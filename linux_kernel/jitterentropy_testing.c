@@ -627,4 +627,6 @@ int __init jent_testing_init(void)
 void jent_testing_exit(void)
 {
 	debugfs_remove_recursive(jent_raw_debugfs_root);
+	/* As the other interfaces clear theirs: a removed dentry is gone. */
+	jent_raw_debugfs_root = NULL;
 }

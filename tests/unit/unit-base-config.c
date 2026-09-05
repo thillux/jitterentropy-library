@@ -119,9 +119,9 @@ static void test_memsize(void)
 
 	/*
 	 * A size field larger than the table can reach: clamped rather than
-	 * shifted out of the uint32_t it is computed in. This is reachable
-	 * from jent_status() on a collector allocated with
-	 * JENT_DISABLE_MEMORY_ACCESS, whose flags are never normalized.
+	 * shifted out of the uint32_t it is computed in. Reachable with any
+	 * caller-provided flags, which is what the API fuzzer drives it with -
+	 * the allocation normalizes them only after this runs.
 	 */
 	JENT_UT_EQ(jent_memsize(JENT_MAX_MEMSIZE_MASK),
 		   jent_memsize(JENT_MAX_MEMSIZE_MAX),

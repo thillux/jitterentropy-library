@@ -790,6 +790,17 @@ static void test_status_truncation(void)
 	JENT_UT_EQ(overflows, 0, "no length writes outside the buffer");
 	JENT_UT_EQ(misreported, 0,
 		   "success is never reported for a truncated document");
+
+	/*
+	 * Nor is failure reported for a complete one. A buffer that holds the
+	 * document and its NUL exactly is the length at which a check against
+	 * the finished length cannot tell the two apart.
+	 */
+	memset(&area, 0x5a, sizeof(area));
+	JENT_UT_EQ(jent_status(ec, area.buf, full + 1), 0,
+		   "a buffer that holds the document exactly is no error");
+	JENT_UT_EQ(strlen(area.buf), full, "and receives all of it");
+
 	printf("  note: swept %zu buffer lengths\n", full + 1);
 
 	jent_entropy_collector_free(ec);

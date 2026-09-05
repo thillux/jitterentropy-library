@@ -64,7 +64,6 @@
 #ifdef LINUX_KERNEL
 
 #include <linux/random.h>	/* get_random_bytes() */
-#include <linux/string.h>	/* memset() */
 #include <linux/types.h>
 # define JENT_RANDOM_LINUX_KERNEL
 
@@ -77,9 +76,9 @@
 /*
  * No CSPRNG to ask on a baremetal target: none of the branches is selected and
  * jent_os_random_supported() reports so. That is not a shortfall in the noise
- * source - the OS random pool is used for the instance identifier and for the
- * startup work-scale plan, both of which fall back to what the collector
- * itself has measured.
+ * source - the only thing the OS random pool is asked for is the instance
+ * identifier, and an instance on such a target simply has none (see
+ * jent_uuid_generate()).
  */
 #if defined(JENT_BAREMETAL)
 #elif defined(_MSC_VER) || defined(__MINGW32__)
@@ -236,4 +235,3 @@ int jent_os_random_bytes(uint8_t *buf, size_t len)
 #endif
 }
 
-/* Write the canonical hex representation of @b (16 bytes) into @out. */
