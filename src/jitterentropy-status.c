@@ -44,6 +44,7 @@
 int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 {
 	size_t used;
+	int written, truncated = 0;
 
 	if (!buf || buflen == 0)
 		return -1;
@@ -57,16 +58,28 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 	 * below, walking the rest of the document one useless snprintf() at a
 	 * time. The output is the same either way - an snprintf() with a size
 	 * of one writes only the NUL that is already there.
+	 *
+	 * Truncation is taken from the snprintf() return value: the finished
+	 * length cannot tell a document that exactly fills the buffer from one
+	 * cut short to the same length.
 	 */
 	#define jent_add_to_status(...)					\
 	{								\
 		used = strlen(buf);					\
-		if (used + 1 < buflen)					\
-			snprintf(buf + used, buflen - used, __VA_ARGS__);\
+		if (used + 1 < buflen) {				\
+			written = snprintf(buf + used, buflen - used,	\
+					   __VA_ARGS__);		\
+			if (written < 0 ||				\
+			    (size_t)written >= buflen - used)		\
+				truncated = 1;				\
+		} else {						\
+			truncated = 1;					\
+		}							\
 	}
 
-	/* needed as plain snprintf to make jent_add_to_status len calculation usable */
-	snprintf(buf, buflen, "{\n");
+	/* The document starts here, whatever the buffer held before. */
+	buf[0] = '\0';
+	jent_add_to_status("{\n")
 
 	jent_add_to_status("\t\"version\": \"%d.%d.%d\"",
 			   JENT_MAJVERSION, JENT_MINVERSION, JENT_PATCHLEVEL)
@@ -158,7 +171,12 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 	jent_add_to_status( "\t\"configuration\": {\n");
 
 	jent_add_to_status( "\t\t\"osr\": %u,\n", ec->osr);
-	jent_add_to_status( "\t\t\"memoryBlockSizeBytes\": %u,\n", jent_memsize(ec->flags));
+	/*
+	 * The region actually allocated: with JENT_DISABLE_MEMORY_ACCESS there
+	 * is none, while the memory size field of ->flags is not normalized.
+	 */
+	jent_add_to_status( "\t\t\"memoryBlockSizeBytes\": %u,\n",
+			   ec->memmask ? (unsigned int)(ec->memmask + 1) : 0);
 
 	jent_add_to_status("\t\t\"hashLoopCount\": {\n");
 	jent_add_to_status("\t\t\t\"runtime\": %u,\n", jent_hashloop_cnt(ec->flags));
@@ -209,8 +227,7 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 out:
 	jent_add_to_status("}\n");
 
-	used = strlen(buf);
-	return (used >= buflen - 1) ? -1 : 0;
+	return truncated ? -1 : 0;
 #undef jent_add_to_status
 }
 
