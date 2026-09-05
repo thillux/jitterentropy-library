@@ -14,6 +14,7 @@
 
 #include <linux/init.h>
 #include <linux/proc_fs.h>
+#include <linux/types.h>
 
 /* Name of the shared /proc directory. */
 #define JENT_PROC_DIRNAME "jitterentropy"
@@ -36,9 +37,11 @@ void jent_proc_exit(void);
 
 /*
  * Account for character-device instances (one Jitter RNG entropy collector per
- * open file description). Reflected in /proc/jitterentropy/statistics.
+ * open file description). Reflected in /proc/jitterentropy/statistics. The
+ * increment refuses beyond @max concurrent instances (0 = unlimited) and
+ * returns whether the slot was taken.
  */
-void jent_proc_instance_inc(void);
+bool jent_proc_instance_inc(unsigned int max);
 void jent_proc_instance_dec(void);
 
 #endif /* _JITTERENTROPY_PROC_H */

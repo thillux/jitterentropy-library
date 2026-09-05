@@ -177,10 +177,28 @@ static int jent_proc_version_show(struct seq_file *m, void *v)
 static atomic_t jent_open_instances = ATOMIC_INIT(0);
 static atomic64_t jent_cumulative_opens = ATOMIC64_INIT(0);
 
-void jent_proc_instance_inc(void)
+/*
+ * Take a slot for a new instance, refusing beyond @max (0 = unlimited). The
+ * cap is what keeps an unprivileged caller from allocating collectors without
+ * bound through opens of the character device. Taken before the collector is
+ * allocated, so cumulativeOpens counts the opens admitted rather than the ones
+ * that went on to succeed.
+ */
+bool jent_proc_instance_inc(unsigned int max)
 {
-	atomic_inc(&jent_open_instances);
+	int now = atomic_inc_return(&jent_open_instances);
+
+	/*
+	 * Compared as unsigned: @max comes from a module parameter and a value
+	 * above INT_MAX would make a signed comparison refuse every open.
+	 */
+	if (max && (now < 0 || (unsigned int)now > max)) {
+		atomic_dec(&jent_open_instances);
+		return false;
+	}
+
 	atomic64_inc(&jent_cumulative_opens);
+	return true;
 }
 
 void jent_proc_instance_dec(void)
@@ -252,7 +270,13 @@ int __init jent_proc_init(void)
 		return -ENOMEM;
 	}
 
-	if (!proc_create_single("statistics", 0444, jent_proc_dir,
+	/*
+	 * Root only: the open and cumulative instance counts are the activity
+	 * of whoever is using the character device, as the per-instance
+	 * documents below instances/ are. The files describing the module's
+	 * own configuration below stay world readable.
+	 */
+	if (!proc_create_single("statistics", 0400, jent_proc_dir,
 				jent_proc_statistics_show)) {
 		pr_warn("jitterentropy: failed to create /proc/%s/statistics\n",
 			JENT_PROC_DIRNAME);

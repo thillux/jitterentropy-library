@@ -276,7 +276,16 @@ void *jent_zalloc(size_t len, unsigned int flags)
 {
 	/* Kernel memory is not paged out, so there is nothing to relax. */
 	(void)flags;
-	return kvzalloc(len, GFP_KERNEL);
+
+	/*
+	 * GFP_KERNEL_ACCOUNT: every open of the character device allocates a
+	 * collector, and the memory region of one is hundreds of kB (up to
+	 * 512 MB with JENT_CACHE_ALL). Unaccounted, an unprivileged caller
+	 * could exhaust kernel memory through opens alone, contained by no
+	 * cgroup. Charging it makes the memory controller the bound, as it is
+	 * for the other per-open kernel allocations.
+	 */
+	return kvzalloc(len, GFP_KERNEL_ACCOUNT);
 }
 
 void jent_zfree(void *ptr, size_t len)

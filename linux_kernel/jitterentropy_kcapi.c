@@ -72,7 +72,8 @@ static int jent_kcapi_log(struct jitterentropy *rng)
 		return 0;
 
 #define JENT_STATUS_BUF_SIZE 4096
-	buf = kvzalloc(JENT_STATUS_BUF_SIZE, GFP_KERNEL);
+	/* Accounted, as every other allocation made for a caller. */
+	buf = kvzalloc(JENT_STATUS_BUF_SIZE, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		return -ENOMEM;
 

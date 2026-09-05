@@ -20,6 +20,7 @@
 #endif
 #include <linux/fips.h>
 #include <linux/kernel.h>
+#include <linux/log2.h>
 #include <linux/module.h>
 
 #include "jitterentropy.h"
@@ -53,6 +54,26 @@ static bool ntg1 = false;
 static bool force_fips = false;
 static bool cache_all = false;
 
+/*
+ * Size of the memory access region of every instance, in kB: a power of two
+ * up to 524288 (512 MB), 0 (the default) leaving it to the library.
+ *
+ * Two things the size otherwise grows through, neither of which
+ * max_instances bounds - that caps the number of instances, not the memory
+ * one of them ends up with. The library derives the size from the CPU cache
+ * size, so cache_all alone takes it into the hundreds of MB. And every
+ * reallocation on health-test recovery doubles it, which takes an instance to
+ * the 512 MB ceiling from any starting size in a dozen recoveries, cache_all
+ * or not; that path exists in a compliance mode only (fips=1, force_fips or
+ * ntg1), the only one whose health tests report a failure to recover from.
+ *
+ * Setting this pins the size against both: the cache-size derivation is
+ * skipped and the recovery keeps the size it finds, raising only the
+ * oversampling rate and the hash loop count. It takes precedence over a size
+ * given through the flags parameter.
+ */
+static unsigned int max_memsize;
+
 module_param(osr, uint, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(osr, "Jitter RNG OSR parameter");
 module_param(flags, uint, S_IRUSR | S_IRGRP | S_IROTH);
@@ -65,6 +86,9 @@ module_param(force_fips, bool, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(force_fips, "Force FIPS compliant operation (shortcut for the JENT_FORCE_FIPS bit in flags)");
 module_param(cache_all, bool, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(cache_all, "Derive the memory access region from the size of all caches instead of L1 only (shortcut for the JENT_CACHE_ALL bit in flags)");
+module_param(max_memsize, uint, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(max_memsize,
+		 "Memory access region of an instance in kB, a power of two up to 524288 (shortcut for the JENT_MAX_MEMSIZE_* bits in flags; 0: derived from the cache size and grown by health-test recovery)");
 
 static int __init jent_mod_init(void)
 {
@@ -82,6 +106,27 @@ static int __init jent_mod_init(void)
 		flags |= JENT_FORCE_FIPS;
 	if (cache_all)
 		flags |= JENT_CACHE_ALL;
+
+	if (max_memsize) {
+		/*
+		 * The field encodes 1 kB << (field - 1), so the size has to be
+		 * a power of two the field can hold. One that is not is a
+		 * configuration error and refuses the load: rounding it would
+		 * hand out a memory region of a size nobody asked for, and
+		 * this parameter exists to bound exactly that.
+		 */
+		unsigned int max_kb = 1U <<
+			(JENT_FLAGS_TO_MAX_MEMSIZE(JENT_MAX_MEMSIZE_MAX) - 1);
+
+		if (!is_power_of_2(max_memsize) || max_memsize > max_kb) {
+			pr_err("jitterentropy: max_memsize %u kB is not a power of two of at most %u kB\n",
+			       max_memsize, max_kb);
+			return -EINVAL;
+		}
+
+		flags &= ~(unsigned int)JENT_MAX_MEMSIZE_MASK;
+		flags |= JENT_MAX_MEMSIZE_TO_FLAGS(ilog2(max_memsize) + 1);
+	}
 
 	ret = jent_entropy_init_ex(osr, flags);
 	if (ret) {

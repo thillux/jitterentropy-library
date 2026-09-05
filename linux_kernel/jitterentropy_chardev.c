@@ -16,6 +16,7 @@
  * Copyright (C) 2026, Stephan Mueller <smueller@chronox.de>
  */
 
+#include <linux/capability.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -54,6 +55,49 @@ extern unsigned int flags;
 #define JENT_CHARDEV_READ_BUF_SIZE 32
 
 /*
+ * Concurrent open instances allowed an unprivileged caller, 0 for unlimited.
+ * The device is world readable and every open allocates a collector whose
+ * memory region is hundreds of kB (up to 512 MB with the JENT_CACHE_ALL
+ * flag), so without a bound an unprivileged caller can exhaust kernel memory
+ * through opens alone. The allocations are also charged to the caller's
+ * memory cgroup - see jent_zalloc() - which contains a containerized caller;
+ * this bounds the rest.
+ *
+ * The bound is global rather than per user: one unprivileged caller holding
+ * every slot keeps the next one out of the device (with ENFILE). That is the
+ * trade of a memory bound for an availability one, and it is why the cap does
+ * not apply to a privileged caller below - so a full device stays
+ * administrable and diagnosable. Where local users must not be able to lock
+ * each other out at all, restrict the device to a group instead (udev), or
+ * set max_instances to 0 and let the memory cgroup of each caller be the
+ * bound.
+ */
+static unsigned int max_instances = 256;
+module_param(max_instances, uint, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(max_instances,
+		 "Maximum concurrent unprivileged /dev/jitterentropy instances (0: unlimited)");
+
+static bool jent_chardev_instance_get(void)
+{
+	/*
+	 * CAP_SYS_RESOURCE overrides resource limits, and this is one: the cap
+	 * exists to bound what an unprivileged caller can allocate, while a
+	 * privileged one can raise or remove it through the module parameter
+	 * anyway. Without the exemption, an unprivileged caller filling the
+	 * slots would lock the administrator out of the device as well.
+	 */
+	if (capable(CAP_SYS_RESOURCE))
+		return jent_proc_instance_inc(0);
+
+	return jent_proc_instance_inc(max_instances);
+}
+
+static void jent_chardev_instance_put(void)
+{
+	jent_proc_instance_dec();
+}
+
+/*
  * Subdirectory /proc/jitterentropy/instances holding one status file per open
  * character-device instance. NULL if procfs is unavailable.
  */
@@ -82,7 +126,8 @@ static int jent_chardev_instance_status_show(struct seq_file *m, void *v)
 	char *buf;
 	int ret;
 
-	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL);
+	/* Accounted, as every other allocation made for a caller. */
+	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		return -ENOMEM;
 
@@ -123,7 +168,7 @@ static void jent_chardev_instance_proc_create(struct jent_chardev_ctx *ctx)
 	if (jent_uuid(ctx->entropy_collector, name, sizeof(name)) || !name[0])
 		return;
 
-	ctx->proc = proc_create_single_data(name, 0444, jent_chardev_proc_dir,
+	ctx->proc = proc_create_single_data(name, 0400, jent_chardev_proc_dir,
 					    jent_chardev_instance_status_show,
 					    ctx);
 	if (!ctx->proc)
@@ -135,9 +180,15 @@ static int jent_chardev_open(struct inode *inode, struct file *file)
 {
 	struct jent_chardev_ctx *ctx;
 
-	ctx = kvzalloc(sizeof(*ctx), GFP_KERNEL);
-	if (!ctx)
+	if (!jent_chardev_instance_get())
+		return -ENFILE;
+
+	/* Accounted, as every other per-open allocation - see jent_zalloc(). */
+	ctx = kvzalloc(sizeof(*ctx), GFP_KERNEL_ACCOUNT);
+	if (!ctx) {
+		jent_chardev_instance_put();
 		return -ENOMEM;
+	}
 
 	mutex_init(&ctx->lock);
 
@@ -145,6 +196,7 @@ static int jent_chardev_open(struct inode *inode, struct file *file)
 	if (!ctx->entropy_collector) {
 		mutex_destroy(&ctx->lock);
 		kvfree(ctx);
+		jent_chardev_instance_put();
 		return -ENOMEM;
 	}
 
@@ -153,11 +205,7 @@ static int jent_chardev_open(struct inode *inode, struct file *file)
 	jent_selftest_instance_init(&ctx->selftest, &ctx->lock,
 				    &ctx->entropy_collector);
 
-	/*
-	 * Account for this instance in /proc/jitterentropy/statistics and
-	 * publish its status under /proc/jitterentropy/instances/<uuid>.
-	 */
-	jent_proc_instance_inc();
+	/* Publish its status under /proc/jitterentropy/instances/<uuid>. */
 	jent_chardev_instance_proc_create(ctx);
 
 	return 0;
@@ -186,7 +234,7 @@ static int jent_chardev_release(struct inode *inode, struct file *file)
 	kvfree(ctx);
 	file->private_data = NULL;
 
-	jent_proc_instance_dec();
+	jent_chardev_instance_put();
 
 	return 0;
 }
@@ -204,7 +252,7 @@ static ssize_t jent_chardev_read(struct file *file, char __user *buf,
 	if (!nbytes)
 		return 0;
 
-	tmp = kvmalloc(JENT_CHARDEV_READ_BUF_SIZE, GFP_KERNEL);
+	tmp = kvmalloc(JENT_CHARDEV_READ_BUF_SIZE, GFP_KERNEL_ACCOUNT);
 	if (!tmp)
 		return -ENOMEM;
 
@@ -317,7 +365,8 @@ static long jent_chardev_ioctl_status(struct jent_chardev_ctx *ctx,
 	if (copy_from_user(&status, arg, sizeof(status)))
 		return -EFAULT;
 
-	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL);
+	/* Accounted, as every other allocation made for a caller. */
+	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		return -ENOMEM;
 
@@ -453,8 +502,13 @@ int __init jent_chardev_init(void)
 	 * (and jent_proc_dir is NULL without CONFIG_PROC_FS).
 	 */
 	if (jent_proc_dir) {
-		jent_chardev_proc_dir = proc_mkdir(JENT_CHARDEV_PROC_DIRNAME,
-						   jent_proc_dir);
+		/*
+		 * Root only, as the status documents below it: the names are
+		 * the UUIDs of the open instances, so a listing alone reports
+		 * how many there are and who to look at.
+		 */
+		jent_chardev_proc_dir = proc_mkdir_mode(JENT_CHARDEV_PROC_DIRNAME,
+							0500, jent_proc_dir);
 		if (!jent_chardev_proc_dir)
 			pr_warn("jitterentropy: failed to create /proc/%s/%s\n",
 				JENT_PROC_DIRNAME, JENT_CHARDEV_PROC_DIRNAME);

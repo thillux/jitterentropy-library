@@ -149,7 +149,8 @@ static int jent_hwrng_proc_status_show(struct seq_file *m, void *v)
 	char *buf;
 	int ret;
 
-	buf = kvzalloc(JENT_HWRNG_STATUS_BUF_SIZE, GFP_KERNEL);
+	/* Accounted, as every other allocation made for a caller. */
+	buf = kvzalloc(JENT_HWRNG_STATUS_BUF_SIZE, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		return -ENOMEM;
 
@@ -232,7 +233,12 @@ int __init jent_hwrng_init(void)
 	 * where jent_proc_dir is NULL) must not abort registration.
 	 */
 	if (jent_proc_dir) {
-		jent_hwrng_proc = proc_create_single(JENT_HWRNG_PROC_NAME, 0444,
+		/*
+		 * Root only: the document reports the instance's health state
+		 * and how many bytes it has delivered, which is activity of
+		 * other users of /dev/hwrng.
+		 */
+		jent_hwrng_proc = proc_create_single(JENT_HWRNG_PROC_NAME, 0400,
 						     jent_proc_dir,
 						     jent_hwrng_proc_status_show);
 		if (!jent_hwrng_proc)

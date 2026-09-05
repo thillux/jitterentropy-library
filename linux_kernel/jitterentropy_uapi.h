@@ -53,10 +53,29 @@ struct jent_status_ioctl {
  * configured with; any other value is passed as the loop_cnt parameter of
  * every subsequent raw noise measurement (see the jent_measure_jitter*()
  * functions), overriding the configured hash and memory access loop counts.
- * Values above UINT_MAX are rejected with -EINVAL, mirroring the bound of the
- * userspace recording tools.
+ * Values above JENT_LOOPCNT_MAX are rejected with -EINVAL.
  */
 #define JENT_IOCLOOPCNT _IOW(JENT_IOC_MAGIC, 0x02, __u64)
+
+/*
+ * Largest loop count JENT_IOCLOOPCNT accepts.
+ *
+ * The count drives both the memory access and the hash loop of one
+ * measurement, and neither carries a reschedule point: one measurement is a
+ * single uninterruptible stretch of CPU, and it is the whole measurement that
+ * a signal delivered to the recording thread waits for. The count is therefore
+ * what bounds that stretch - at the UINT_MAX this once accepted, one
+ * measurement occupies a CPU for hours, far past the softlockup watchdog.
+ *
+ * 1 << 18 is four times the largest loop count the library itself uses
+ * (JENT_TEST_MEMACCLOOP) and measures around 2.3 seconds per measurement on
+ * contemporary x86 - the noise core compiles at -O0, so a measurement in the
+ * kernel costs several times what the same count costs the userspace tools.
+ * It bounds the loop count, not the time: a slower machine takes
+ * proportionally longer, and the bound leaves an order of magnitude before
+ * one measurement reaches the softlockup watchdog.
+ */
+#define JENT_LOOPCNT_MAX (1U << 18)
 
 /*
  * The single fields of the status document, for callers that want one value
