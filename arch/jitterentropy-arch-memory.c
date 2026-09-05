@@ -276,7 +276,12 @@ void *jent_zalloc(size_t len, unsigned int flags)
 {
 	/* Kernel memory is not paged out, so there is nothing to relax. */
 	(void)flags;
-	return kvzalloc(len, GFP_KERNEL);
+
+	/*
+	 * Charged to the caller's memory cgroup: every open of the character
+	 * device allocates a collector of up to 512 MB.
+	 */
+	return kvzalloc(len, GFP_KERNEL_ACCOUNT);
 }
 
 void jent_zfree(void *ptr, size_t len)

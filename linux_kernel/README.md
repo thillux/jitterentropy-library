@@ -81,6 +81,39 @@ The module offers the following load-time parameters:
   [Periodic Cryptographic Self Test](#linux-kernel-jitter-rng-periodic-cryptographic-self-test)
   below.
 
+* `max_instances`: maximum number of concurrently open `/dev/jitterentropy`
+  instances an unprivileged caller is allowed (default `256`, `0` for
+  unlimited). The device is world readable and every `open()` allocates a
+  Jitter RNG instance whose memory access region is hundreds of kB - up to
+  512 MB with `cache_all=1` - so the cap bounds what an unprivileged caller
+  can allocate through opens alone. An `open()` beyond it fails with `ENFILE`.
+  The kernel allocations are also charged to the caller's memory cgroup.
+
+  It bounds the number of instances, not the memory one of them ends up with:
+  a reallocation on health-test recovery doubles the memory access region, so
+  a dozen recoveries take an instance to the 512 MB ceiling whatever it
+  started at and with `cache_all` unset. Recovery runs in a compliance mode
+  only (`fips=1`, `force_fips=1` or `ntg1=1`), the only one whose health tests
+  report a failure to recover from. Use `max_memsize` below to bound it.
+
+  A caller with `CAP_SYS_RESOURCE` is not held to the cap, which keeps a full
+  device administrable and diagnosable. The cap is global rather than per
+  user, so one unprivileged caller holding every slot does keep the next one
+  out: that trades a memory bound for an availability one. Where local users
+  must not be able to lock each other out at all, restrict the device to a
+  group with a udev rule, or set `max_instances=0` and let each caller's
+  memory cgroup be the bound.
+
+* `max_memsize`: size of the memory access region of every instance, in kB - a
+  power of two up to `524288` (512 MB). The default `0` leaves the size to the
+  library, which derives it from the CPU cache size and doubles it on every
+  health-test recovery. Setting it pins the size against both: the derivation
+  is skipped and a recovery keeps the size it finds, raising only the
+  oversampling rate and the hash loop count. A value that is not a power of
+  two the field can hold refuses the module load. It takes precedence over a
+  size given through `flags`, and the effective size is reported by
+  `/proc/jitterentropy/config/flags`.
+
 * `verbose`: enable verbose logging.
 
 The shortcut parameters are folded into `flags` during module initialization,
@@ -429,11 +462,22 @@ When the kernel provides `CONFIG_PROC_FS`, the module creates the directory
   Files appear on `open()` of `/dev/jitterentropy` and disappear on `close()`
   (only present when the character device interface is enabled).
 
+`statistics`, `hwrng_status` and the `instances/` directory with the files
+below it are readable by root only: they report how the device is being used -
+a specific instance's health state and how many bytes it has delivered, the
+number of instances open, and, through the file names, the UUIDs of those
+instances. The remaining files describe the module's own configuration and are
+world readable.
+
 Every Jitter RNG instance is assigned a stable RFC 4122 version 4 UUID at
 allocation. It is reported in the JSON status output as the `uuid` field and,
 for the character device, used as the `instances/<uuid>` file name. The UUID is
 preserved when an instance's collector is reallocated (e.g. on health-test
 recovery), so it identifies the instance for its whole lifetime.
+
+Where the platform offers no CSPRNG to draw the UUID from, the instance has no
+identifier at all: its `uuid` field is empty, `JENT_IOCUUID` gives `ENODATA`
+and no `instances/` file is created for it.
 
 Example usage:
 
@@ -528,6 +572,13 @@ measurements of the open instance: 0 (the default) selects the loop count the
 instance was configured with, any other value overrides the hash and memory
 access loop counts of every subsequent measurement (`getrawentropy --loopcnt
 <NUM>` uses it). See `jitterentropy_uapi.h` for the ABI of both ioctls.
+
+The loop count is bounded by `JENT_LOOPCNT_MAX` (`1 << 18`); above it the
+ioctl fails with `EINVAL`. One measurement carries no reschedule point, so it
+is a single uninterruptible stretch of kernel CPU whose length this count
+drives - a recording yields and takes signals per measurement, and one
+measurement is what a signal waits for. At the ceiling that is around 2.3
+seconds on contemporary x86, proportionally longer on a slower machine.
 
 ## Test Execution
 

@@ -297,8 +297,12 @@
           ];
           boot.kernelModules = [ "jitter_rng" ];
           # Per-instance JSON status to the kernel log; test systems only.
+          #
+          # max_memsize pins the region so health-test recoveries cannot
+          # grow the hundreds of instances the tests open past the VM's
+          # memory (panic_on_oom is set).
           boot.extraModprobeConfig = ''
-            options jitter_rng verbose=1 ntg1=1 cache_all=1 selftest_interval=15
+            options jitter_rng verbose=1 ntg1=1 cache_all=1 selftest_interval=15 max_memsize=32768
           '';
           environment.systemPackages = [
             (toolsFor pkgs)
@@ -346,6 +350,97 @@
                   time.sleep(0.01)
               print("OK")
           '';
+          # max_instances: opens beyond it fail with ENFILE and take no slot
+          # or count, a close frees one, root is exempt.
+          environment.etc."jitterentropy-maxinstances-test.py".text = ''
+              import errno
+              import json
+              import os
+              import sys
+
+              # The module's max_instances; if 0, argv[2] is the open count.
+              limit = int(sys.argv[1])
+              opens = limit if limit else int(sys.argv[2])
+              privileged = os.geteuid() == 0
+
+
+              def chardev():
+                  """The counters, or None where the caller may not read them."""
+                  try:
+                      with open("/proc/jitterentropy/statistics") as f:
+                          return json.load(f)["charDevice"]
+                  except PermissionError:
+                      return None
+
+
+              # The statistics document is root only.
+              before = chardev()
+              assert (before is not None) == privileged, before
+
+              fds = [os.open("/dev/jitterentropy", os.O_RDONLY)
+                     for _ in range(opens)]
+
+              if before is not None:
+                  admitted = chardev()
+                  assert admitted["openInstances"] == \
+                      before["openInstances"] + opens, admitted
+                  assert admitted["cumulativeOpens"] == \
+                      before["cumulativeOpens"] + opens, admitted
+
+              if limit and privileged:
+                  # CAP_SYS_RESOURCE is exempt from the cap.
+                  fds += [os.open("/dev/jitterentropy", os.O_RDONLY)
+                          for _ in range(2)]
+              elif limit:
+                  try:
+                      os.close(os.open("/dev/jitterentropy", os.O_RDONLY))
+                  except OSError as e:
+                      assert e.errno == errno.ENFILE, f"errno {e.errno}"
+                  else:
+                      raise AssertionError("open beyond max_instances succeeded")
+
+                  # Closing one frees exactly one slot.
+                  os.close(fds.pop())
+                  fds.append(os.open("/dev/jitterentropy", os.O_RDONLY))
+
+              for fd in fds:
+                  os.close(fd)
+              if before is not None:
+                  assert chardev()["openInstances"] == \
+                      before["openInstances"], chardev()
+              print("OK")
+          '';
+
+          # The loop count bound JENT_IOCLOOPCNT enforces.
+          environment.etc."jitterentropy-loopcnt-test.py".text = ''
+              import errno
+              import fcntl
+              import os
+              import struct
+
+              # From jitterentropy_uapi.h: _IOW('J', 0x02, __u64).
+              JENT_IOCLOOPCNT = 0x40084A02
+              JENT_LOOPCNT_MAX = 1 << 18
+
+              fd = os.open("/sys/kernel/debug/jitter_rng/jent_raw_hires",
+                           os.O_RDONLY)
+
+              # 0 means the configured count.
+              for cnt in (0, 1, JENT_LOOPCNT_MAX):
+                  fcntl.ioctl(fd, JENT_IOCLOOPCNT, struct.pack("=Q", cnt))
+
+              for cnt in (JENT_LOOPCNT_MAX + 1, 1 << 20, (1 << 32) - 1,
+                          1 << 63):
+                  try:
+                      fcntl.ioctl(fd, JENT_IOCLOOPCNT, struct.pack("=Q", cnt))
+                  except OSError as e:
+                      assert e.errno == errno.EINVAL, f"{cnt}: errno {e.errno}"
+                  else:
+                      raise AssertionError(f"loop count {cnt} accepted")
+
+              os.close(fd)
+              print("OK")
+          '';
           # The ISO profile autologs in "nixos"; these are test images.
           services.getty.autologinUser = lib.mkForce "root";
           console.keyMap = "de";
@@ -386,6 +481,10 @@
             # procfs exports, including the per-instance status directory.
             print(machine.succeed("cat /proc/jitterentropy/statistics"))
             print(machine.succeed("cat /proc/jitterentropy/hwrng_status"))
+
+            # The size the machine configuration pins reached the module.
+            out = machine.succeed("cat /proc/jitterentropy/config/flags")
+            assert "max memory size: 32 MB" in " ".join(out.split()), out
 
             # Reading opens an instance; its UUID-named status file appears.
             machine.succeed(
@@ -487,6 +586,161 @@
                          "jitterentropy-chardev-status",
                          "jitterentropy-chardev-fields"):
                 machine.succeed(f"command -v {tool}")
+
+            print(machine.succeed(
+                "python3 /etc/jitterentropy-loopcnt-test.py"
+            ))
+            # The recording tool rejects the same values itself.
+            out = machine.fail("getrawentropy --samples 1 --loopcnt 262145 2>&1")
+            assert "out of range" in out, out
+
+            # The raw noise recording takes a signal per measurement, not
+            # per batch of 1000. Calibrate a loop count slow enough to tell
+            # the two apart.
+            def measurement_ms(loopcnt, samples=1):
+                return int(machine.succeed(
+                    "start=$(date +%s%N); "
+                    f"getrawentropy --samples {samples} --loopcnt {loopcnt}"
+                    " >/dev/null; "
+                    "echo $(( ($(date +%s%N) - start) / 1000000 ))"
+                ).strip())
+
+            loopcnt = 1 << 16
+            while measurement_ms(loopcnt) < 50 and loopcnt < (1 << 18):
+                loopcnt <<= 2
+            per_measurement = measurement_ms(loopcnt)
+            batch = per_measurement * 1000
+            print(f"loopcnt {loopcnt}: {per_measurement} ms per measurement, "
+                  f"{batch} ms per batch of 1000")
+            assert batch > 30000, f"batch of {batch} ms too short to tell"
+
+            answered = int(machine.succeed(
+                "start=$(date +%s%N); "
+                f"timeout -s INT 2 getrawentropy --samples 100000"
+                f" --loopcnt {loopcnt} >/dev/null || true; "
+                "echo $(( ($(date +%s%N) - start) / 1000000 ))"
+            ).strip())
+            print(f"SIGINT answered after {answered} ms")
+            assert answered < 2000 + 4 * per_measurement + 3000, \
+                f"SIGINT answered after {answered} ms, batch is {batch} ms"
+
+            # Documents reporting instance activity are root only; the
+            # configuration files stay world readable.
+            machine.succeed(
+                "test \"$(stat -c %a /proc/jitterentropy/hwrng_status)\" = 400"
+            )
+            machine.succeed(
+                "test \"$(stat -c %a /proc/jitterentropy/statistics)\" = 400"
+            )
+            machine.succeed(
+                "test \"$(stat -c %a /proc/jitterentropy/instances)\" = 500"
+            )
+            for world_readable in ("version",
+                                   "config/flags", "config/flags_raw",
+                                   "config/osr", "config/ntg1", "config/fips",
+                                   "interfaces/kcapi", "interfaces/hwrng",
+                                   "interfaces/chardev", "interfaces/testing"):
+                machine.succeed(
+                    "test \"$(stat -c %a"
+                    f" /proc/jitterentropy/{world_readable})\" = 444"
+                )
+
+            # An unprivileged caller is refused there but can still read the
+            # device. setpriv rather than runuser, which would reset PATH.
+            unpriv = "setpriv --reuid=65534 --regid=65534 --clear-groups"
+            for root_only in ("hwrng_status", "statistics"):
+                out = machine.fail(
+                    f"{unpriv} cat /proc/jitterentropy/{root_only} 2>&1"
+                )
+                assert "Permission denied" in out, out
+            out = machine.fail(f"{unpriv} ls /proc/jitterentropy/instances 2>&1")
+            assert "Permission denied" in out, out
+            machine.succeed(
+                f"test \"$({unpriv} sh -c"
+                " 'head -c 32 /dev/jitterentropy | wc -c')\" = 32"
+            )
+
+            # The per-instance status file likewise.
+            machine.succeed(
+                "exec 3</dev/jitterentropy; "
+                "test \"$(stat -c %a /proc/jitterentropy/instances/*)\" = 400; "
+                f"denied=$({unpriv} sh -c"
+                " 'cat /proc/jitterentropy/instances/*' 2>&1 || true); "
+                "case $denied in *'Permission denied'*) ;; "
+                "*) echo \"$denied\"; exit 1;; esac; "
+                "exec 3<&-"
+            )
+
+            # The concurrent-instance cap.
+            machine.succeed("rmmod jitter_rng")
+            machine.succeed("modprobe jitter_rng max_instances=4")
+            machine.wait_for_file("/dev/jitterentropy")
+            machine.succeed(
+                "test \"$(cat /sys/module/jitter_rng/parameters/max_instances)\""
+                " = 4"
+            )
+            print(machine.succeed(
+                "python3 /etc/jitterentropy-maxinstances-test.py 4"
+            ))
+
+            # An unprivileged caller is held to the cap. It cannot read the
+            # counters, so they are checked here: 4 + 1 admitted opens.
+            before = json.loads(
+                machine.succeed("cat /proc/jitterentropy/statistics")
+            )["charDevice"]
+            print(machine.succeed(
+                f"{unpriv}"
+                " python3 /etc/jitterentropy-maxinstances-test.py 4"
+            ))
+            after = json.loads(
+                machine.succeed("cat /proc/jitterentropy/statistics")
+            )["charDevice"]
+            assert after["openInstances"] == before["openInstances"], after
+            assert after["cumulativeOpens"] == \
+                before["cumulativeOpens"] + 5, after
+
+            # max_memsize pins the memory access region of every instance.
+            machine.succeed("rmmod jitter_rng")
+            machine.succeed("modprobe jitter_rng max_memsize=1024")
+            machine.wait_for_file("/dev/jitterentropy")
+            machine.succeed(
+                "test \"$(cat /sys/module/jitter_rng/parameters/max_memsize)\""
+                " = 1024"
+            )
+            out = machine.succeed("cat /proc/jitterentropy/config/flags")
+            assert "max memory size: 1 MB" in " ".join(out.split()), out
+            machine.succeed("test \"$(head -c 32 /dev/jitterentropy | wc -c)\" = 32")
+
+            # A size the field cannot hold refuses the load.
+            machine.succeed("rmmod jitter_rng")
+            machine.fail("modprobe jitter_rng max_memsize=3")
+            machine.fail("modprobe jitter_rng max_memsize=1048576")
+            # 0 overrides the machine's pinned size with the derivation.
+            machine.succeed("modprobe jitter_rng max_memsize=0")
+            machine.wait_for_file("/dev/jitterentropy")
+            out = machine.succeed("cat /proc/jitterentropy/config/flags")
+            assert "max memory size: auto" in " ".join(out.split()), out
+
+            # max_instances=0 keeps the unbounded behaviour of before. Three
+            # hundred instances of the 32 MB the machine configuration pins
+            # are ten gigabytes, so this case pins 512 kB instead - the size
+            # the L1 derivation arrives at without cache_all, and small
+            # enough that three hundred of them fit. What is unbounded here
+            # is the instance count; the size has its own case above.
+            machine.succeed("rmmod jitter_rng")
+            machine.succeed(
+                "modprobe jitter_rng max_instances=0 cache_all=0 max_memsize=512"
+            )
+            machine.wait_for_file("/dev/jitterentropy")
+            print(machine.succeed(
+                "python3 /etc/jitterentropy-maxinstances-test.py 0 300"
+            ))
+
+            # Back to the configuration the machine is set up with.
+            machine.succeed("rmmod jitter_rng")
+            machine.succeed("modprobe jitter_rng")
+            machine.wait_for_file("/dev/jitterentropy")
+            machine.succeed("test \"$(head -c 32 /dev/jitterentropy | wc -c)\" = 32")
           '';
         };
 

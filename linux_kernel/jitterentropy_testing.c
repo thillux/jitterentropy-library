@@ -124,7 +124,7 @@ static int jent_testing_log(struct rand_data *ec)
 	logged_osr = testing_osr;
 	logged_flags = testing_flags;
 
-	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL);
+	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		return -ENOMEM;
 
@@ -189,7 +189,7 @@ static int jent_testing_open(struct inode *inode, struct file *file)
 	if (jent_testing_locked_down())
 		return -EPERM;
 
-	ctx = kvzalloc(sizeof(*ctx), GFP_KERNEL);
+	ctx = kvzalloc(sizeof(*ctx), GFP_KERNEL_ACCOUNT);
 	if (!ctx)
 		return -ENOMEM;
 
@@ -270,7 +270,6 @@ static ssize_t jent_testing_extract_user(struct file *file, char __user *buf,
 	u64 *tmp = NULL;
 	u64 loop_cnt;
 	ssize_t ret = 0;
-	int large_request = (nbytes > 256);
 
 	unsigned int (*measure_jitter)(struct rand_data *ec,
 				       uint64_t loop_cnt,
@@ -317,7 +316,7 @@ static ssize_t jent_testing_extract_user(struct file *file, char __user *buf,
 	 */
 #define JENT_TESTING_SAMPLES	1000
 #define JENT_TESTING_DATA_SIZE	(JENT_TESTING_SAMPLES * sizeof(u64))
-	tmp = kvmalloc(JENT_TESTING_DATA_SIZE, GFP_KERNEL);
+	tmp = kvmalloc(JENT_TESTING_DATA_SIZE, GFP_KERNEL_ACCOUNT);
 	if (!tmp) {
 		mutex_unlock(&jent_testing_read_lock);
 		return -ENOMEM;
@@ -326,7 +325,7 @@ static ssize_t jent_testing_extract_user(struct file *file, char __user *buf,
 	while (nbytes >= sizeof(u64)) {
 		u32 samples = (u32)min_t(size_t, nbytes / sizeof(u64),
 					 JENT_TESTING_SAMPLES);
-		size_t len = samples * sizeof(u64);
+		size_t len;
 		size_t not_copied;
 		u32 i;
 
@@ -336,10 +335,6 @@ static ssize_t jent_testing_extract_user(struct file *file, char __user *buf,
 				ret = -ERESTARTSYS;
 			break;
 		}
-
-		/* Be cooperative for large requests. */
-		if (large_request && need_resched())
-			schedule();
 
 		/*
 		 * Prime the common measurement (initialize ec->prev_time) so
@@ -354,8 +349,33 @@ static ssize_t jent_testing_extract_user(struct file *file, char __user *buf,
 			jent_measure_jitter(ec, 0, NULL);
 
 		for (i = 0; i < samples; i++) {
+			/*
+			 * Yield and take signals per measurement, as one can
+			 * run long at a high loop count. Re-prime after a
+			 * reschedule so the scheduling gap is not recorded as
+			 * a delta, as the priming above does for copy_to_user().
+			 */
+			if (need_resched()) {
+				schedule();
+
+				if (measure_jitter == jent_measure_jitter)
+					jent_measure_jitter(ec, 0, NULL);
+			}
+
+			if (signal_pending(current))
+				break;
+
 			/* Disregard stuck indicator */
 			measure_jitter(ec, loop_cnt, &tmp[i]);
+		}
+
+		/* A signal cut the batch short: deliver what was measured. */
+		samples = i;
+		len = samples * sizeof(u64);
+		if (!len) {
+			if (ret == 0)
+				ret = -ERESTARTSYS;
+			break;
 		}
 
 		not_copied = copy_to_user(buf, tmp, len);
@@ -408,7 +428,7 @@ static long jent_testing_ioctl_status(struct jent_testing_ctx *ctx,
 	if (copy_from_user(&status, arg, sizeof(status)))
 		return -EFAULT;
 
-	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL);
+	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		return -ENOMEM;
 
@@ -470,8 +490,8 @@ static long jent_testing_ioctl_loopcnt(struct jent_testing_ctx *ctx,
 	if (copy_from_user(&loop_cnt, arg, sizeof(loop_cnt)))
 		return -EFAULT;
 
-	/* Mirror the bound of the userspace recording tools. */
-	if (loop_cnt > UINT_MAX)
+	/* Bounds one uninterruptible measurement, see JENT_LOOPCNT_MAX. */
+	if (loop_cnt > JENT_LOOPCNT_MAX)
 		return -EINVAL;
 
 	if (mutex_lock_interruptible(&jent_testing_read_lock))

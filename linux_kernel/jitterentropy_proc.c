@@ -177,10 +177,22 @@ static int jent_proc_version_show(struct seq_file *m, void *v)
 static atomic_t jent_open_instances = ATOMIC_INIT(0);
 static atomic64_t jent_cumulative_opens = ATOMIC64_INIT(0);
 
-void jent_proc_instance_inc(void)
+/*
+ * Take a slot for a new instance, refusing beyond @max (0 = unlimited). Taken
+ * before the collector is allocated, so cumulativeOpens counts admitted opens.
+ */
+bool jent_proc_instance_inc(unsigned int max)
 {
-	atomic_inc(&jent_open_instances);
+	int now = atomic_inc_return(&jent_open_instances);
+
+	/* Unsigned: @max is a module parameter and may exceed INT_MAX. */
+	if (max && (now < 0 || (unsigned int)now > max)) {
+		atomic_dec(&jent_open_instances);
+		return false;
+	}
+
 	atomic64_inc(&jent_cumulative_opens);
+	return true;
 }
 
 void jent_proc_instance_dec(void)
@@ -252,7 +264,11 @@ int __init jent_proc_init(void)
 		return -ENOMEM;
 	}
 
-	if (!proc_create_single("statistics", 0444, jent_proc_dir,
+	/*
+	 * Root only: the instance counts reveal other users' activity. The
+	 * configuration files below stay world readable.
+	 */
+	if (!proc_create_single("statistics", 0400, jent_proc_dir,
 				jent_proc_statistics_show)) {
 		pr_warn("jitterentropy: failed to create /proc/%s/statistics\n",
 			JENT_PROC_DIRNAME);

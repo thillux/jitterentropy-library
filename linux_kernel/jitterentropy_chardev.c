@@ -16,6 +16,7 @@
  * Copyright (C) 2026, Stephan Mueller <smueller@chronox.de>
  */
 
+#include <linux/capability.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -54,6 +55,33 @@ extern unsigned int flags;
 #define JENT_CHARDEV_READ_BUF_SIZE 32
 
 /*
+ * Concurrent open instances allowed an unprivileged caller, 0 for unlimited.
+ * Every open allocates a collector of hundreds of kB (up to 512 MB with
+ * JENT_CACHE_ALL), so the world-readable device needs a bound. It is global,
+ * so one caller can hold every slot and keep others out (ENFILE); restrict the
+ * device to a group, or set 0 and rely on the memory cgroup accounting, where
+ * that matters.
+ */
+static unsigned int max_instances = 256;
+module_param(max_instances, uint, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(max_instances,
+		 "Maximum concurrent unprivileged /dev/jitterentropy instances (0: unlimited)");
+
+static bool jent_chardev_instance_get(void)
+{
+	/* Exempt, so a device filled by unprivileged callers stays usable. */
+	if (capable(CAP_SYS_RESOURCE))
+		return jent_proc_instance_inc(0);
+
+	return jent_proc_instance_inc(max_instances);
+}
+
+static void jent_chardev_instance_put(void)
+{
+	jent_proc_instance_dec();
+}
+
+/*
  * Subdirectory /proc/jitterentropy/instances holding one status file per open
  * character-device instance. NULL if procfs is unavailable.
  */
@@ -82,7 +110,7 @@ static int jent_chardev_instance_status_show(struct seq_file *m, void *v)
 	char *buf;
 	int ret;
 
-	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL);
+	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		return -ENOMEM;
 
@@ -123,7 +151,7 @@ static void jent_chardev_instance_proc_create(struct jent_chardev_ctx *ctx)
 	if (jent_uuid(ctx->entropy_collector, name, sizeof(name)) || !name[0])
 		return;
 
-	ctx->proc = proc_create_single_data(name, 0444, jent_chardev_proc_dir,
+	ctx->proc = proc_create_single_data(name, 0400, jent_chardev_proc_dir,
 					    jent_chardev_instance_status_show,
 					    ctx);
 	if (!ctx->proc)
@@ -135,9 +163,14 @@ static int jent_chardev_open(struct inode *inode, struct file *file)
 {
 	struct jent_chardev_ctx *ctx;
 
-	ctx = kvzalloc(sizeof(*ctx), GFP_KERNEL);
-	if (!ctx)
+	if (!jent_chardev_instance_get())
+		return -ENFILE;
+
+	ctx = kvzalloc(sizeof(*ctx), GFP_KERNEL_ACCOUNT);
+	if (!ctx) {
+		jent_chardev_instance_put();
 		return -ENOMEM;
+	}
 
 	mutex_init(&ctx->lock);
 
@@ -145,6 +178,7 @@ static int jent_chardev_open(struct inode *inode, struct file *file)
 	if (!ctx->entropy_collector) {
 		mutex_destroy(&ctx->lock);
 		kvfree(ctx);
+		jent_chardev_instance_put();
 		return -ENOMEM;
 	}
 
@@ -153,11 +187,7 @@ static int jent_chardev_open(struct inode *inode, struct file *file)
 	jent_selftest_instance_init(&ctx->selftest, &ctx->lock,
 				    &ctx->entropy_collector);
 
-	/*
-	 * Account for this instance in /proc/jitterentropy/statistics and
-	 * publish its status under /proc/jitterentropy/instances/<uuid>.
-	 */
-	jent_proc_instance_inc();
+	/* Publish its status under /proc/jitterentropy/instances/<uuid>. */
 	jent_chardev_instance_proc_create(ctx);
 
 	return 0;
@@ -186,7 +216,7 @@ static int jent_chardev_release(struct inode *inode, struct file *file)
 	kvfree(ctx);
 	file->private_data = NULL;
 
-	jent_proc_instance_dec();
+	jent_chardev_instance_put();
 
 	return 0;
 }
@@ -204,7 +234,7 @@ static ssize_t jent_chardev_read(struct file *file, char __user *buf,
 	if (!nbytes)
 		return 0;
 
-	tmp = kvmalloc(JENT_CHARDEV_READ_BUF_SIZE, GFP_KERNEL);
+	tmp = kvmalloc(JENT_CHARDEV_READ_BUF_SIZE, GFP_KERNEL_ACCOUNT);
 	if (!tmp)
 		return -ENOMEM;
 
@@ -317,7 +347,7 @@ static long jent_chardev_ioctl_status(struct jent_chardev_ctx *ctx,
 	if (copy_from_user(&status, arg, sizeof(status)))
 		return -EFAULT;
 
-	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL);
+	buf = kvzalloc(JENT_STATUS_MAX_LEN, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		return -ENOMEM;
 
@@ -453,8 +483,9 @@ int __init jent_chardev_init(void)
 	 * (and jent_proc_dir is NULL without CONFIG_PROC_FS).
 	 */
 	if (jent_proc_dir) {
-		jent_chardev_proc_dir = proc_mkdir(JENT_CHARDEV_PROC_DIRNAME,
-						   jent_proc_dir);
+		/* Root only: the file names are the instances' UUIDs. */
+		jent_chardev_proc_dir = proc_mkdir_mode(JENT_CHARDEV_PROC_DIRNAME,
+							0500, jent_proc_dir);
 		if (!jent_chardev_proc_dir)
 			pr_warn("jitterentropy: failed to create /proc/%s/%s\n",
 				JENT_PROC_DIRNAME, JENT_CHARDEV_PROC_DIRNAME);

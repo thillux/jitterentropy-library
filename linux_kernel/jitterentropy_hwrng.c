@@ -149,7 +149,7 @@ static int jent_hwrng_proc_status_show(struct seq_file *m, void *v)
 	char *buf;
 	int ret;
 
-	buf = kvzalloc(JENT_HWRNG_STATUS_BUF_SIZE, GFP_KERNEL);
+	buf = kvzalloc(JENT_HWRNG_STATUS_BUF_SIZE, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		return -ENOMEM;
 
@@ -232,7 +232,8 @@ int __init jent_hwrng_init(void)
 	 * where jent_proc_dir is NULL) must not abort registration.
 	 */
 	if (jent_proc_dir) {
-		jent_hwrng_proc = proc_create_single(JENT_HWRNG_PROC_NAME, 0444,
+		/* Root only: it reports other users' activity on /dev/hwrng. */
+		jent_hwrng_proc = proc_create_single(JENT_HWRNG_PROC_NAME, 0400,
 						     jent_proc_dir,
 						     jent_hwrng_proc_status_show);
 		if (!jent_hwrng_proc)

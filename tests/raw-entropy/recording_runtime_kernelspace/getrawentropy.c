@@ -337,6 +337,7 @@ out:
  * --loopcnt Apply the given loop count value for the operation (i.e. apply it
  *	     to the respecive used noise source(s)) - requires the
  *	     JENT_IOCLOOPCNT ioctl of the out-of-tree module's test interface
+ *	     and is bounded by JENT_LOOPCNT_MAX
  * --max-mem Set the memory size of the memory block used for the memory access
  *	     loop
  * --hashloop Perform the measurement of the hash loop only
@@ -454,13 +455,13 @@ int main(int argc, char * argv[])
 				return 1;
 			}
 
-			/*
-			 * Mirror the bound of the userspace recording tool
-			 * jitterentropy-hashtime (also enforced by the
-			 * JENT_IOCLOOPCNT ioctl).
-			 */
-			if (parse_ulong(argv[1], &val) || val >= UINT_MAX)
+			/* Checked here for a clearer error than EINVAL. */
+			if (parse_ulong(argv[1], &val) ||
+			    val > JENT_LOOPCNT_MAX) {
+				printf("Loop count out of range (maximum %u)\n",
+				       JENT_LOOPCNT_MAX);
 				return 1;
+			}
 			opts.loopcnt = val;
 		} else if (!strncmp(argv[1], "--max-mem", 9)) {
 			unsigned long val;

@@ -20,6 +20,7 @@
 #endif
 #include <linux/fips.h>
 #include <linux/kernel.h>
+#include <linux/log2.h>
 #include <linux/module.h>
 
 #include "jitterentropy.h"
@@ -53,6 +54,18 @@ static bool ntg1 = false;
 static bool force_fips = false;
 static bool cache_all = false;
 
+/*
+ * Size of the memory access region of every instance, in kB: a power of two
+ * up to 524288 (512 MB), 0 (the default) leaving it to the library.
+ *
+ * Unset, the size follows the cache size (hundreds of MB with cache_all) and
+ * doubles on every health-test recovery in a compliance mode, up to 512 MB;
+ * max_instances bounds neither. Setting it pins the size: the recovery raises
+ * only the oversampling rate and the hash loop count. It takes precedence
+ * over a size given through the flags parameter.
+ */
+static unsigned int max_memsize;
+
 module_param(osr, uint, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(osr, "Jitter RNG OSR parameter");
 module_param(flags, uint, S_IRUSR | S_IRGRP | S_IROTH);
@@ -65,6 +78,9 @@ module_param(force_fips, bool, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(force_fips, "Force FIPS compliant operation (shortcut for the JENT_FORCE_FIPS bit in flags)");
 module_param(cache_all, bool, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(cache_all, "Derive the memory access region from the size of all caches instead of L1 only (shortcut for the JENT_CACHE_ALL bit in flags)");
+module_param(max_memsize, uint, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(max_memsize,
+		 "Memory access region of an instance in kB, a power of two up to 524288 (shortcut for the JENT_MAX_MEMSIZE_* bits in flags; 0: derived from the cache size and grown by health-test recovery)");
 
 static int __init jent_mod_init(void)
 {
@@ -82,6 +98,24 @@ static int __init jent_mod_init(void)
 		flags |= JENT_FORCE_FIPS;
 	if (cache_all)
 		flags |= JENT_CACHE_ALL;
+
+	if (max_memsize) {
+		/*
+		 * The field encodes 1 kB << (field - 1). Other sizes refuse the
+		 * load rather than being rounded to one nobody asked for.
+		 */
+		unsigned int max_kb = 1U <<
+			(JENT_FLAGS_TO_MAX_MEMSIZE(JENT_MAX_MEMSIZE_MAX) - 1);
+
+		if (!is_power_of_2(max_memsize) || max_memsize > max_kb) {
+			pr_err("jitterentropy: max_memsize %u kB is not a power of two of at most %u kB\n",
+			       max_memsize, max_kb);
+			return -EINVAL;
+		}
+
+		flags &= ~(unsigned int)JENT_MAX_MEMSIZE_MASK;
+		flags |= JENT_MAX_MEMSIZE_TO_FLAGS(ilog2(max_memsize) + 1);
+	}
 
 	ret = jent_entropy_init_ex(osr, flags);
 	if (ret) {
