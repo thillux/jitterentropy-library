@@ -273,6 +273,8 @@ static void test_safe_recovery(void)
 	for (i = 0; i < sizeof(failures) / sizeof(failures[0]); i++) {
 		struct rand_data *ec =
 			jent_entropy_collector_alloc(0, JENT_FORCE_FIPS);
+		char uuid_before[JENT_UUID_STRLEN];
+		uint64_t bytes_before, reads_before;
 		unsigned int osr_before;
 		ssize_t ret;
 
@@ -280,6 +282,21 @@ static void test_safe_recovery(void)
 			JENT_UT_SKIP(failures[i].name, "no collector");
 			continue;
 		}
+
+		/*
+		 * A history for the reallocation to carry: the instance's
+		 * UUID and its output accounting.
+		 */
+		if (jent_read_entropy_safe(&ec, buf, sizeof(buf)) !=
+		    (ssize_t)sizeof(buf)) {
+			JENT_UT_SKIP(failures[i].name,
+				     "the noise source did not converge on this machine");
+			jent_entropy_collector_free(ec);
+			continue;
+		}
+		memcpy(uuid_before, ec->uuid, sizeof(uuid_before));
+		bytes_before = ec->bytes_output;
+		reads_before = ec->read_invocations;
 
 		osr_before = ec->osr;
 		ec->health_failure = failures[i].bit;
@@ -290,6 +307,8 @@ static void test_safe_recovery(void)
 				   "a permanent failure is returned");
 			JENT_UT_EQ(ec->osr, osr_before,
 				   "and no reallocation was attempted");
+			JENT_UT_EQ(ec->bytes_output, bytes_before,
+				   "a read that delivered nothing counts nothing");
 		} else {
 			JENT_UT_EQ(ret, (ssize_t)sizeof(buf),
 				   "an intermittent failure is recovered from");
@@ -297,6 +316,16 @@ static void test_safe_recovery(void)
 				     "by raising the oversampling rate");
 			JENT_UT_EQ(ec->reinit_count, 1u,
 				   "and the reinitialization is counted");
+			JENT_UT_TRUE(ec->uuid[0] != '\0',
+				     "the replacement carries an identifier");
+			JENT_UT_TRUE(!memcmp(ec->uuid, uuid_before,
+					     sizeof(uuid_before)),
+				     "and it is the one the instance had");
+			JENT_UT_EQ(ec->bytes_output,
+				   bytes_before + sizeof(buf),
+				   "the output accounting spans the reallocation");
+			JENT_UT_EQ(ec->read_invocations, reads_before + 1,
+				   "as does the count of reads it answered");
 		}
 
 		jent_entropy_collector_free(ec);
@@ -333,6 +362,21 @@ static void test_recovery_gives_up(void)
 	JENT_UT_EQ(ec->osr, (unsigned int)JENT_MAX_OSR,
 		   "and the collector was left untouched");
 
+	/*
+	 * The verdict is final, so later reads report it without generating
+	 * a block; ->prev_time would move if one were generated.
+	 */
+	JENT_UT_EQ(ec->recovery_exhausted, 1u,
+		   "the exhausted recovery is remembered");
+	{
+		uint64_t prev_time = ec->prev_time;
+
+		JENT_UT_EQ(jent_read_entropy_safe(&ec, buf, sizeof(buf)),
+			   JENT_ERR_RCT, "the same failure is reported again");
+		JENT_UT_EQ(ec->prev_time, prev_time,
+			   "without spending a block on it");
+	}
+
 	jent_entropy_collector_free(ec);
 }
 
@@ -347,8 +391,9 @@ static void test_state_duplication(void)
 
 	jent_ut_group("the health test state survives a reallocation");
 
-	old_ec = jent_entropy_collector_alloc(0, JENT_FORCE_FIPS);
-	new_ec = jent_entropy_collector_alloc(0, JENT_FORCE_FIPS);
+	/* Different rates, so the two collectors' cutoffs can be told apart. */
+	old_ec = jent_entropy_collector_alloc(3, JENT_FORCE_FIPS);
+	new_ec = jent_entropy_collector_alloc(4, JENT_FORCE_FIPS);
 	if (!old_ec || !new_ec) {
 		JENT_UT_SKIP("state duplication", "no collector");
 		jent_entropy_collector_free(old_ec);
@@ -383,10 +428,12 @@ static void test_state_duplication(void)
 	JENT_UT_EQ(new_ec->apt_count, new_ec->apt_cutoff,
 		   "and the count primed at the intermittent cutoff");
 
-	/* RCT with memory: likewise primed at its intermittent cutoff. */
-	jent_rct_mem_duplicate(new_ec, old_ec);
+	/* RCT with memory: likewise primed at its own intermittent cutoff. */
+	JENT_UT_NE(new_ec->rct_mem_cutoff, old_ec->rct_mem_cutoff,
+		   "the two collectors' RCT-with-memory cutoffs differ");
+	jent_rct_mem_duplicate(new_ec);
 	JENT_UT_EQ(new_ec->rct_mem_count, new_ec->rct_mem_cutoff,
-		   "the RCT with memory is primed at its intermittent cutoff");
+		   "the RCT with memory is primed at its own intermittent cutoff");
 
 #ifdef JENT_HEALTH_LAG_PREDICTOR
 	/* Lag: the whole predictor state, history and scoreboard included. */

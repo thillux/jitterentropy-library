@@ -436,26 +436,22 @@ static void jent_apt_reinit(struct rand_data *ec,
 	ec->apt_base = current_delta;	/* APT Step 1 */
 	ec->apt_base_set = 1;		/* APT Step 2 */
 
-	/*
-	 * Reset APT counter
-	 * Note that we've taken in the first symbol in the window.
-	 *
-	 * Thus, if apt_count is zero, set it to the intermittent error.
-	 */
-	if (apt_count)
-		ec->apt_count = apt_count;
-	else
-		ec->apt_count = ec->apt_cutoff;
+	/* Reset APT counter to the count the caller asks for. */
+	ec->apt_count = apt_count;
 	ec->apt_observations = apt_observations;
 }
 
 void jent_apt_duplicate(struct rand_data *new_ec, struct rand_data *old_ec)
 {
-	if (old_ec->apt_observations) {
-		/* APT re-initialization to intermittent error */
-		jent_apt_reinit(new_ec, old_ec->apt_base, 0,
-				old_ec->apt_observations);
-	}
+	if (!old_ec->apt_observations)
+		return;
+
+	/*
+	 * Prime the replacement at its own intermittent cutoff, so a window
+	 * that keeps failing escalates to the permanent failure.
+	 */
+	jent_apt_reinit(new_ec, old_ec->apt_base, new_ec->apt_cutoff,
+			old_ec->apt_observations);
 }
 
 /**
@@ -698,10 +694,11 @@ static void jent_rct_mem_insert(struct rand_data *ec, unsigned int stuck)
 		ec->rct_mem_ctr++;
 }
 
-void jent_rct_mem_duplicate(struct rand_data *new_ec, struct rand_data *old_ec)
+void jent_rct_mem_duplicate(struct rand_data *new_ec)
 {
 	/*
-	 * RCT with memory re-initialization to intermittent error.
+	 * RCT with memory re-initialization to intermittent error, at the
+	 * replacement's own cutoff: it runs at a higher oversampling rate.
 	 *
 	 * NOTE: this priming is currently ineffective. Every output block
 	 * starts with jent_random_data_one() setting rct_mem_ctr = 0, and the
@@ -712,7 +709,7 @@ void jent_rct_mem_duplicate(struct rand_data *new_ec, struct rand_data *old_ec)
 	 * start reset in jent_rct_mem_insert() would need to spare a primed
 	 * value once).
 	 */
-	new_ec->rct_mem_count = old_ec->rct_mem_cutoff;
+	new_ec->rct_mem_count = new_ec->rct_mem_cutoff;
 }
 
 /***************************************************************************
@@ -784,7 +781,7 @@ void jent_rct_duplicate(struct rand_data *new_ec)
 void jent_health_duplicate(struct rand_data *new_ec, struct rand_data *old_ec)
 {
 	jent_rct_duplicate(new_ec);
-	jent_rct_mem_duplicate(new_ec, old_ec);
+	jent_rct_mem_duplicate(new_ec);
 
 	/* A different clock: the two below describe another source. */
 	if (new_ec->enable_notime != old_ec->enable_notime)

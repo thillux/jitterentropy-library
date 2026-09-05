@@ -201,6 +201,16 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 #define JENT_INT_MEASURE_CLOCK	(UINT32_C(1) << 23)
 
 /*
+ * The memory size in the flags is the caller's choice, not the library's
+ * derivation. Set by jent_entropy_collector_alloc() for a JENT_MAX_MEMSIZE_*
+ * value and by jent_health_failure_reset() from the collector it replaces;
+ * jent_entropy_collector_alloc_internal() reads it into ->max_mem_set and does
+ * not store it. The size field cannot say this: jent_update_memsize() sets it
+ * in every collector's flags.
+ */
+#define JENT_INT_MEMSIZE_PINNED	(UINT32_C(1) << 22)
+
+/*
  * JENT_-prefixed, and defined outside the LINUX_KERNEL split above, for the
  * same reason JENT_FALLTHROUGH is: the bare names belong to the environment,
  * not to this library.
@@ -591,6 +601,16 @@ struct rand_data
 	 * stop the output in every mode. Set by jent_random_data_one().
 	 */
 	unsigned int noise_stopped:1;
+
+	/*
+	 * jent_read_entropy_safe() has given up recovering this collector:
+	 * it is at JENT_MAX_OSR, so the reallocation cannot be attempted
+	 * again, and the health failure that ended the recovery is sticky.
+	 * Every further read would generate an output block only to discard
+	 * it and report the same failure, so the reads report it without
+	 * spending the block. Set by jent_health_failure_reset() alone.
+	 */
+	unsigned int recovery_exhausted:1;
 
 #ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
 	volatile uint8_t notime_interrupt;	/* indicator to interrupt ctr */
