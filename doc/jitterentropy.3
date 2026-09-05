@@ -21,6 +21,8 @@ jitterentropy \- CPU Jitter Random Number Generator
 .sp
 .BI "int jent_entropy_switch_notime_impl(struct jent_notime_thread *" new_thread );
 .sp
+.BI "int jent_entropy_set_notime_cpu(unsigned long " cpu ");
+.sp
 .BI "int jent_set_fips_failure_callback(jent_fips_failure_cb " cb ");
 .sp
 .BI "int jent_entropy_init(" void ");
@@ -39,6 +41,16 @@ jitterentropy \- CPU Jitter Random Number Generator
 .sp
 .BI "ssize_t jent_read_entropy_safe(struct rand_data **" entropy_collector ",
 .BI "                               char *" data ", size_t " len );
+.sp
+.BI "int jent_status(const struct rand_data *" entropy_collector ",
+.BI "                char *" buf ", size_t " buflen );
+.sp
+.BI "int jent_uuid(const struct rand_data *" entropy_collector ",
+.BI "              char *" buf ", size_t " buflen );
+.sp
+.BI "#define JENT_UUID_STRLEN 37"
+.sp
+.BI "int jent_secure_memory_supported(" void ");
 .sp
 .BI "#define JENT_MAJVERSION x"
 .sp
@@ -83,6 +95,21 @@ for a documentation of
 This function must be called before
 .BR jent_entropy_init ()
 as after this call, the change of the thread handler is denied.
+.LP
+.BR jent_entropy_set_notime_cpu ()
+pins the counting thread of the timer-less mode to the logical CPU index
+.IR cpu .
+When it is not set, that thread runs on the highest-numbered CPU the caller
+may run on. As with the thread handler above, it must be called before
+.BR jent_entropy_init ():
+afterwards the call has no effect and returns
+.IR -EAGAIN .
+The pinning is advisory - an index the platform cannot honor, and a platform
+with no thread-to-CPU affinity API at all (OpenBSD, macOS on Apple Silicon),
+leave the counting thread where the scheduler puts it rather than failing the
+call. It returns
+.IR 0
+on success and a negative errno otherwise.
 .LP
 .BR jent_set_fips_failure_callback ()
 allows the caller to set a callback that is invoked by the
@@ -366,6 +393,87 @@ The function
 .BR jent_read_entropy_safe ()
 has the same error codes as
 .BR jent_read_entropy ().
+.LP
+.BR jent_status ()
+writes a JSON document describing an entropy collector into
+.IR buf :
+the library version, the identifier of the instance, what it has delivered
+over its lifetime, the state of each health test, the runtime environment it
+found and the configuration it is running with. It is what the
+.B FIPS 140-3 Considerations
+and
+.B AIS 20/31 NTG.1 Compliance
+sections below ask to be read for the properties they require. The document
+is a serialization of state the instance holds, not a measurement: it costs
+no entropy and collects nothing.
+.LP
+At most
+.IR buflen
+bytes are written, the terminating NUL included, and the result is always NUL
+terminated. The call returns
+.IR 0
+when the whole document fit and
+.IR -1
+when it did not - a document cut short is not handed back as if it were
+complete, because a consumer would fail to parse it - as well as for a
+.IR buf
+of
+.IR NULL
+or a
+.IR buflen
+of zero. A buffer of 4096 bytes holds the document; that is the size the
+kernel module's interfaces use for it.
+.LP
+The
+.IR entropy_collector
+may be
+.IR NULL .
+The result is then a complete JSON object carrying the library version alone,
+which is the way to ask for the version without allocating an instance; it is
+not an error and returns
+.IR 0 .
+.LP
+.BR jent_uuid ()
+copies the identifier of an instance - an RFC 4122 version 4 UUID in its
+canonical string form - into
+.IR buf ,
+which must hold
+.B JENT_UUID_STRLEN
+bytes, the terminating NUL included. The identifier is assigned once, when the
+instance is allocated, and is stable for its lifetime: it is carried over when
+.BR jent_read_entropy_safe ()
+reallocates the collector on a health test failure, so it names the instance
+rather than the allocation. It is the
+.IR uuid
+field of the status document above.
+.LP
+The call returns
+.IR 0
+on success and
+.IR -1
+on error, which includes a
+.IR buf
+too small for the string. Where the platform offers no cryptographic random
+number generator to draw an identifier from, the instance has none: the string
+is empty and the
+.IR uuid
+status field is empty with it. That is the honest answer rather than an
+identifier that identifies nothing, and callers that need one must test for
+it.
+.LP
+.BR jent_secure_memory_supported ()
+reports whether this build has a mechanism for secure memory at all - a memory
+lock from the operating system, or the secure arena of the crypto library the
+library was built against. It describes the build, not an allocation: whether a
+given entropy collector actually holds such memory is what
+.B JENT_FORCE_SECURE_MEM
+makes a condition of, and what the
+.IR secureMemory
+field of the status document reports. It returns
+.IR 1
+where there is such a mechanism and
+.IR 0
+where there is none.
 .LP
 .BR JENT_MAJVERSION
 indicates API / ABI incompatible changes, functional changes that require
