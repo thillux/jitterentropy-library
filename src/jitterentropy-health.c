@@ -437,25 +437,53 @@ static void jent_apt_reinit(struct rand_data *ec,
 	ec->apt_base_set = 1;		/* APT Step 2 */
 
 	/*
-	 * Reset APT counter
-	 * Note that we've taken in the first symbol in the window.
-	 *
-	 * Thus, if apt_count is zero, set it to the intermittent error.
+	 * Reset APT counter. Both callers state the count they want: one for
+	 * the window a first symbol opens, the priming of a reallocation for
+	 * a window that continues.
 	 */
-	if (apt_count)
-		ec->apt_count = apt_count;
-	else
-		ec->apt_count = ec->apt_cutoff;
+	ec->apt_count = apt_count;
 	ec->apt_observations = apt_observations;
 }
 
 void jent_apt_duplicate(struct rand_data *new_ec, struct rand_data *old_ec)
 {
-	if (old_ec->apt_observations) {
-		/* APT re-initialization to intermittent error */
-		jent_apt_reinit(new_ec, old_ec->apt_base, 0,
-				old_ec->apt_observations);
-	}
+	unsigned int primed;
+
+	if (!old_ec->apt_observations)
+		return;
+
+	/*
+	 * APT re-initialization to intermittent error: prime the replacement
+	 * at its own intermittent cutoff, so a window that is continuing to
+	 * fail escalates to the permanent failure instead of restarting from
+	 * zero.
+	 *
+	 * Only where that leaves the permanent cutoff out of reach of a
+	 * single further repeat, though. Both cutoffs are capped at the
+	 * window size and the common tables meet there: at osr 14 they are
+	 * one apart, from osr 15 on both are JENT_APT_WINDOW_SIZE. Priming at
+	 * the intermittent cutoff there would turn the very next delta equal
+	 * to the base symbol into a permanent APT failure - which ends the
+	 * instance for good, and panics a fips=1 kernel - on evidence a
+	 * collector that had not been reallocated would need a whole window
+	 * of identical symbols to reach. Note the reallocation happens for
+	 * any health test that failed, so the APT need not be the test that
+	 * triggered it.
+	 *
+	 * Where the two have met, the replacement continues from the count
+	 * the old window actually reached. That is the evidence the test has,
+	 * so the reallocation still cannot be used to clear it.
+	 */
+	primed = new_ec->apt_cutoff;
+	if (primed + 1 >= new_ec->apt_cutoff_permanent)
+		primed = old_ec->apt_count;
+
+	/* Whatever the tables hold, the priming itself never fails the test. */
+	if (primed >= new_ec->apt_cutoff_permanent)
+		primed = new_ec->apt_cutoff_permanent - 1;
+
+	jent_apt_reinit(new_ec, old_ec->apt_base, primed,
+			old_ec->apt_observations);
 }
 
 /**
@@ -703,10 +731,15 @@ static void jent_rct_mem_insert(struct rand_data *ec, unsigned int stuck)
 		ec->rct_mem_ctr++;
 }
 
-void jent_rct_mem_duplicate(struct rand_data *new_ec, struct rand_data *old_ec)
+void jent_rct_mem_duplicate(struct rand_data *new_ec)
 {
 	/*
-	 * RCT with memory re-initialization to intermittent error.
+	 * RCT with memory re-initialization to intermittent error, at the
+	 * cutoff of the replacement rather than of the collector it replaces:
+	 * the two differ, the replacement being allocated at a higher
+	 * oversampling rate, and it is the replacement's own comparisons the
+	 * primed value has to be meaningful for. jent_rct_duplicate() states
+	 * the same for the RCT, where a mismatched value is outright harmful.
 	 *
 	 * NOTE: this priming is currently ineffective. Every output block
 	 * starts with jent_random_data_one() setting rct_mem_ctr = 0, and the
@@ -717,7 +750,7 @@ void jent_rct_mem_duplicate(struct rand_data *new_ec, struct rand_data *old_ec)
 	 * start reset in jent_rct_mem_insert() would need to spare a primed
 	 * value once).
 	 */
-	new_ec->rct_mem_count = old_ec->rct_mem_cutoff;
+	new_ec->rct_mem_count = new_ec->rct_mem_cutoff;
 }
 
 /***************************************************************************
@@ -789,7 +822,7 @@ void jent_rct_duplicate(struct rand_data *new_ec)
 void jent_health_duplicate(struct rand_data *new_ec, struct rand_data *old_ec)
 {
 	jent_rct_duplicate(new_ec);
-	jent_rct_mem_duplicate(new_ec, old_ec);
+	jent_rct_mem_duplicate(new_ec);
 
 	/* A different clock: the two below describe another source. */
 	if (new_ec->enable_notime != old_ec->enable_notime)

@@ -273,6 +273,8 @@ static void test_safe_recovery(void)
 	for (i = 0; i < sizeof(failures) / sizeof(failures[0]); i++) {
 		struct rand_data *ec =
 			jent_entropy_collector_alloc(0, JENT_FORCE_FIPS);
+		char uuid_before[JENT_UUID_STRLEN];
+		uint64_t bytes_before, reads_before;
 		unsigned int osr_before;
 		ssize_t ret;
 
@@ -280,6 +282,23 @@ static void test_safe_recovery(void)
 			JENT_UT_SKIP(failures[i].name, "no collector");
 			continue;
 		}
+
+		/*
+		 * A history for the reallocation to carry: the identifier the
+		 * instance is known by - the kernel character device names its
+		 * per-instance procfs file after it - and the lifetime output
+		 * accounting jent_status() reports.
+		 */
+		if (jent_read_entropy_safe(&ec, buf, sizeof(buf)) !=
+		    (ssize_t)sizeof(buf)) {
+			JENT_UT_SKIP(failures[i].name,
+				     "the noise source did not converge on this machine");
+			jent_entropy_collector_free(ec);
+			continue;
+		}
+		memcpy(uuid_before, ec->uuid, sizeof(uuid_before));
+		bytes_before = ec->bytes_output;
+		reads_before = ec->read_invocations;
 
 		osr_before = ec->osr;
 		ec->health_failure = failures[i].bit;
@@ -290,6 +309,8 @@ static void test_safe_recovery(void)
 				   "a permanent failure is returned");
 			JENT_UT_EQ(ec->osr, osr_before,
 				   "and no reallocation was attempted");
+			JENT_UT_EQ(ec->bytes_output, bytes_before,
+				   "a read that delivered nothing counts nothing");
 		} else {
 			JENT_UT_EQ(ret, (ssize_t)sizeof(buf),
 				   "an intermittent failure is recovered from");
@@ -297,6 +318,16 @@ static void test_safe_recovery(void)
 				     "by raising the oversampling rate");
 			JENT_UT_EQ(ec->reinit_count, 1u,
 				   "and the reinitialization is counted");
+			JENT_UT_TRUE(ec->uuid[0] != '\0',
+				     "the replacement carries an identifier");
+			JENT_UT_TRUE(!memcmp(ec->uuid, uuid_before,
+					     sizeof(uuid_before)),
+				     "and it is the one the instance had");
+			JENT_UT_EQ(ec->bytes_output,
+				   bytes_before + sizeof(buf),
+				   "the output accounting spans the reallocation");
+			JENT_UT_EQ(ec->read_invocations, reads_before + 1,
+				   "as does the count of reads it answered");
 		}
 
 		jent_entropy_collector_free(ec);
@@ -333,7 +364,73 @@ static void test_recovery_gives_up(void)
 	JENT_UT_EQ(ec->osr, (unsigned int)JENT_MAX_OSR,
 		   "and the collector was left untouched");
 
+	/*
+	 * The verdict cannot change - the oversampling rate is fixed and the
+	 * health failure is sticky - so it is remembered, and the reads that
+	 * follow report it without generating an output block that would be
+	 * discarded on the way to the same answer. ->prev_time is what such a
+	 * block would move.
+	 */
+	JENT_UT_EQ(ec->recovery_exhausted, 1u,
+		   "the exhausted recovery is remembered");
+	{
+		uint64_t prev_time = ec->prev_time;
+
+		JENT_UT_EQ(jent_read_entropy_safe(&ec, buf, sizeof(buf)),
+			   JENT_ERR_RCT, "the same failure is reported again");
+		JENT_UT_EQ(ec->prev_time, prev_time,
+			   "without spending a block on it");
+	}
+
 	jent_entropy_collector_free(ec);
+}
+
+/*
+ * The APT priming of a reallocation must not put the permanent cutoff within
+ * one repeated symbol: the cutoffs are capped at the window size and the
+ * common tables meet there, where priming at the intermittent cutoff would
+ * make the next repeat a permanent failure - a verdict a collector that was
+ * not reallocated needs a whole window of identical symbols for.
+ */
+static void test_recovery_apt_priming_headroom(void)
+{
+	/*
+	 * Allocated without JENT_FORCE_FIPS for the reason
+	 * test_recovery_gives_up() states; the duplication below does not
+	 * depend on it. From osr 15 on the two cutoffs have met.
+	 */
+	struct rand_data *old_ec = jent_entropy_collector_alloc(15, 0);
+	struct rand_data *new_ec = jent_entropy_collector_alloc(16, 0);
+
+	jent_ut_group("the APT priming of a reallocation keeps its headroom");
+
+	if (!old_ec || !new_ec) {
+		JENT_UT_SKIP("APT priming", "no collector");
+		jent_entropy_collector_free(old_ec);
+		jent_entropy_collector_free(new_ec);
+		return;
+	}
+
+	JENT_UT_EQ(new_ec->apt_cutoff, new_ec->apt_cutoff_permanent,
+		   "the two cutoffs have met at this oversampling rate");
+
+	/* A window in progress, with the repeats it has actually seen. */
+	old_ec->apt_base = 0xc0ffee;
+	old_ec->apt_base_set = 1;
+	old_ec->apt_observations = 42;
+	old_ec->apt_count = 7;
+
+	jent_apt_duplicate(new_ec, old_ec);
+
+	JENT_UT_EQ(new_ec->apt_observations, 42u,
+		   "the window position is carried over");
+	JENT_UT_EQ(new_ec->apt_count, 7u,
+		   "with the count the old window actually reached");
+	JENT_UT_TRUE(new_ec->apt_count + 1 < new_ec->apt_cutoff_permanent,
+		     "so one repeated symbol cannot fail the test permanently");
+
+	jent_entropy_collector_free(old_ec);
+	jent_entropy_collector_free(new_ec);
 }
 
 /*
@@ -347,8 +444,13 @@ static void test_state_duplication(void)
 
 	jent_ut_group("the health test state survives a reallocation");
 
-	old_ec = jent_entropy_collector_alloc(0, JENT_FORCE_FIPS);
-	new_ec = jent_entropy_collector_alloc(0, JENT_FORCE_FIPS);
+	/*
+	 * Different oversampling rates, as a reallocation and the collector it
+	 * replaces have: with identical ones the assertions below could not
+	 * tell the two collectors' cutoffs apart.
+	 */
+	old_ec = jent_entropy_collector_alloc(3, JENT_FORCE_FIPS);
+	new_ec = jent_entropy_collector_alloc(4, JENT_FORCE_FIPS);
 	if (!old_ec || !new_ec) {
 		JENT_UT_SKIP("state duplication", "no collector");
 		jent_entropy_collector_free(old_ec);
@@ -383,10 +485,12 @@ static void test_state_duplication(void)
 	JENT_UT_EQ(new_ec->apt_count, new_ec->apt_cutoff,
 		   "and the count primed at the intermittent cutoff");
 
-	/* RCT with memory: likewise primed at its intermittent cutoff. */
-	jent_rct_mem_duplicate(new_ec, old_ec);
+	/* RCT with memory: likewise primed at its own intermittent cutoff. */
+	JENT_UT_NE(new_ec->rct_mem_cutoff, old_ec->rct_mem_cutoff,
+		   "the two collectors' RCT-with-memory cutoffs differ");
+	jent_rct_mem_duplicate(new_ec);
 	JENT_UT_EQ(new_ec->rct_mem_count, new_ec->rct_mem_cutoff,
-		   "the RCT with memory is primed at its intermittent cutoff");
+		   "the RCT with memory is primed at its own intermittent cutoff");
 
 #ifdef JENT_HEALTH_LAG_PREDICTOR
 	/* Lag: the whole predictor state, history and scoreboard included. */
@@ -766,6 +870,7 @@ int main(void)
 	test_no_report_without_fips();
 	test_safe_recovery();
 	test_recovery_gives_up();
+	test_recovery_apt_priming_headroom();
 	test_recovery_keeps_caller_memsize();
 	test_state_duplication();
 	test_state_duplication_clock_change();

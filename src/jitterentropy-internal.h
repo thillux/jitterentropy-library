@@ -593,6 +593,16 @@ struct rand_data
 	 */
 	unsigned int noise_stopped:1;
 
+	/*
+	 * jent_read_entropy_safe() has given up recovering this collector:
+	 * it is at JENT_MAX_OSR, so the reallocation cannot be attempted
+	 * again, and the health failure that ended the recovery is sticky.
+	 * Every further read would generate an output block only to discard
+	 * it and report the same failure, so the reads report it without
+	 * spending the block. Set by jent_health_failure_reset() alone.
+	 */
+	unsigned int recovery_exhausted:1;
+
 #ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
 	volatile uint8_t notime_interrupt;	/* indicator to interrupt ctr */
 	volatile uint64_t notime_timer;		/* high-res timer mock-up */

@@ -77,7 +77,7 @@ static inline uint64_t jent_delta_abs(uint64_t prev, uint64_t next)
 void jent_lag_duplicate(struct rand_data *new_ec, struct rand_data *old_ec);
 void jent_apt_duplicate(struct rand_data *new_ec, struct rand_data *old_ec);
 void jent_rct_duplicate(struct rand_data *new_ec);
-void jent_rct_mem_duplicate(struct rand_data *new_ec, struct rand_data *old_ec);
+void jent_rct_mem_duplicate(struct rand_data *new_ec);
 /*
  * The four above as one call, for the reallocation on a health test failure:
  * it leaves out what belongs to the old instance's clock, which the

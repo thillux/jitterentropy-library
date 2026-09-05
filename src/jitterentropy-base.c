@@ -226,6 +226,36 @@ static inline unsigned int jent_update_secure_mem(unsigned int flags)
  * Random Number Generation
  ***************************************************************************/
 
+/*
+ * The error code a health test failure bitmask is reported as. The permanent
+ * failures take precedence: they end the instance, while the intermittent ones
+ * are what jent_read_entropy_safe() recovers from by reallocating.
+ */
+static int jent_health_failure_code(unsigned int health_test_result)
+{
+	if (health_test_result & JENT_RCT_FAILURE_PERMANENT)
+		return JENT_ERR_RCT_PERMANENT;
+	if (health_test_result & JENT_APT_FAILURE_PERMANENT)
+		return JENT_ERR_APT_PERMANENT;
+	if (health_test_result & JENT_LAG_FAILURE_PERMANENT)
+		return JENT_ERR_LAG_PERMANENT;
+	if (health_test_result & JENT_RCT_MEM_FAILURE_PERMANENT)
+		return JENT_ERR_RCT_MEM_PERMANENT;
+	if (health_test_result & JENT_RCT_FAILURE)
+		return JENT_ERR_RCT;
+	if (health_test_result & JENT_APT_FAILURE)
+		return JENT_ERR_APT;
+	if (health_test_result & JENT_RCT_MEM_FAILURE)
+		return JENT_ERR_RCT_MEM;
+
+	/*
+	 * The only remaining defined bit is JENT_LAG_FAILURE. A hypothetical
+	 * unknown bit lands here as well: a health test failure must never
+	 * result in a success return.
+	 */
+	return JENT_ERR_LAG;
+}
+
 /**
  * Entry function: Obtain entropy for the caller.
  *
@@ -326,32 +356,7 @@ ssize_t jent_read_entropy(struct rand_data *ec, char *data, size_t len)
 		}
 
 		if ((health_test_result = jent_health_failure(ec))) {
-			if (health_test_result & JENT_RCT_FAILURE_PERMANENT)
-				ret = JENT_ERR_RCT_PERMANENT;
-			else if (health_test_result &
-				 JENT_APT_FAILURE_PERMANENT)
-				ret = JENT_ERR_APT_PERMANENT;
-			else if (health_test_result &
-				 JENT_LAG_FAILURE_PERMANENT)
-				ret = JENT_ERR_LAG_PERMANENT;
-			else if (health_test_result &
-				 JENT_RCT_MEM_FAILURE_PERMANENT)
-				ret = JENT_ERR_RCT_MEM_PERMANENT;
-			else if (health_test_result & JENT_RCT_FAILURE)
-				ret = JENT_ERR_RCT;
-			else if (health_test_result & JENT_APT_FAILURE)
-				ret = JENT_ERR_APT;
-			else if (health_test_result & JENT_RCT_MEM_FAILURE)
-				ret = JENT_ERR_RCT_MEM;
-			else
-				/*
-				 * The only remaining defined bit is
-				 * JENT_LAG_FAILURE. A hypothetical unknown bit
-				 * lands here as well: a health test failure
-				 * must never result in a success return.
-				 */
-				ret = JENT_ERR_LAG;
-
+			ret = jent_health_failure_code(health_test_result);
 			goto err;
 		}
 
@@ -420,9 +425,18 @@ static int jent_health_failure_reset(
 			flags |= JENT_DISABLE_INTERNAL_TIMER;
 	}
 
-	/* generic arbitrary cutoff to prevent running "forever" */
-	if (osr > JENT_MAX_OSR)
+	/*
+	 * Generic arbitrary cutoff to prevent running "forever". Remembered on
+	 * the collector: its oversampling rate does not change, so this
+	 * verdict cannot change either, and the health failure that brought
+	 * the caller here is sticky. Every further read would generate an
+	 * output block only to discard it and arrive back here - see
+	 * jent_read_entropy_safe().
+	 */
+	if (osr > JENT_MAX_OSR) {
+		(*ec)->recovery_exhausted = 1;
 		return -1;
+	}
 
 	/*
 	 * If the caller did not set any specific maximum value let the Jitter
@@ -462,8 +476,9 @@ static int jent_health_failure_reset(
 
 	/*
 	 * Carry the instance identifier over so the reallocated collector keeps
-	 * the same UUID (empty during the startup-time reset, when it has not
-	 * been assigned yet), and count this reinitialization.
+	 * the same UUID. The replacement has none of its own: only
+	 * jent_entropy_collector_alloc() assigns one, and it is empty on both
+	 * sides during the startup-time reset, which runs before that.
 	 */
 	memcpy(new_ec->uuid, (*ec)->uuid, sizeof(new_ec->uuid));
 	new_ec->reinit_count = (*ec)->reinit_count + 1;
@@ -524,8 +539,13 @@ ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 
 	JENT_BUILD_BUG_ON(sizeof(ssize_t) != sizeof(size_t));
 
-	/* check obvious misuse of API */
-	if (!ec || (data == NULL && len > 0))
+	/*
+	 * Check obvious misuse of API. The collector itself as well, not only
+	 * the pointer to it: this function reads the collector's state before
+	 * handing it to jent_read_entropy(), whose own check would otherwise
+	 * be what catches a NULL one.
+	 */
+	if (!ec || !*ec || (data == NULL && len > 0))
 		return JENT_ERR_EINVAL;
 
 	/*
@@ -537,6 +557,19 @@ ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 	orig_len = len;
 
 	while (len > 0) {
+		unsigned int health_test_result;
+
+		/*
+		 * Recovery gave up on this collector, and nothing about that
+		 * can change: report the failure it gave up on rather than
+		 * generating an output block that is discarded on the way to
+		 * the same answer. Through jent_health_failure(), so a
+		 * registered callback still sees it as it would have.
+		 */
+		if ((*ec)->recovery_exhausted &&
+		    (health_test_result = jent_health_failure(*ec)) != 0)
+			return jent_health_failure_code(health_test_result);
+
 		ret = jent_read_entropy(*ec, p, len);
 
 		switch (ret) {
@@ -569,6 +602,29 @@ ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 			 * the startup sequence for NTG.1 again.
 			 *
 			 * If we fail here, the Jitter RNG returns the error.
+			 *
+			 * This loop bounds neither how many reallocations one
+			 * call makes nor what they cost: a replacement that
+			 * fails again is replaced again, up to JENT_MAX_OSR,
+			 * and every step pays a power-on test and a startup at
+			 * a raised oversampling rate over a memory region
+			 * twice the size - seconds per step at the upper end,
+			 * a few minutes for a whole ladder, in one call that
+			 * no caller can interrupt.
+			 *
+			 * That is intended. The health tests report in the
+			 * compliance modes alone, where the platform is
+			 * validated before it is deployed and the oversampling
+			 * rate is chosen high enough that production never
+			 * walks this ladder. Walking it far says the rate was
+			 * chosen too low, and giving up earlier would only
+			 * hide that behind an error the caller can do no more
+			 * with. What the ladder reaches is bounded elsewhere:
+			 * a caller-pinned memory size stops the doubling (see
+			 * max_mem_set in jent_health_failure_reset()), and the
+			 * state it leaves behind is remembered rather than
+			 * recomputed on every later read (->recovery_exhausted
+			 * above).
 			 */
 			if (jent_health_failure_reset(
 				ec, _jent_entropy_collector_alloc))
@@ -916,13 +972,6 @@ static struct rand_data *_jent_entropy_collector_alloc(unsigned int osr,
 
 	jent_notime_unsettick(ec);
 
-	/*
-	 * Assign the stable per-instance identifier. This is done once, after a
-	 * successful startup; jent_health_failure_reset() carries it over to the
-	 * replacement collector so the identity survives a reallocation.
-	 */
-	jent_uuid_generate(ec->uuid);
-
 	return ec;
 }
 
@@ -938,8 +987,22 @@ struct rand_data *jent_entropy_collector_alloc(unsigned int osr,
 	 * passed: this one would let an instance generate from a clock no
 	 * startup measured.
 	 */
-	return _jent_entropy_collector_alloc(osr,
-					     flags & ~JENT_INT_MEASURE_CLOCK);
+	struct rand_data *ec =
+		_jent_entropy_collector_alloc(osr,
+					      flags & ~JENT_INT_MEASURE_CLOCK);
+
+	/*
+	 * Assign the stable per-instance identifier, once, to the collector
+	 * this call hands out. The reallocation on health-test recovery goes
+	 * through _jent_entropy_collector_alloc() instead and carries the
+	 * identifier over itself (see jent_health_failure_reset()), so the
+	 * identity survives a reallocation - and no replacement draws one only
+	 * to have it overwritten.
+	 */
+	if (ec)
+		jent_uuid_generate(ec->uuid);
+
+	return ec;
 }
 
 #ifdef LINUX_KERNEL
