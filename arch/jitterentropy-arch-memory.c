@@ -284,6 +284,12 @@ void *jent_zalloc(size_t len, unsigned int flags)
 	return kvzalloc(len, GFP_KERNEL_ACCOUNT);
 }
 
+/* Kernel memory is not locked: the same allocation as above. */
+void *jent_zalloc_unlocked(size_t len)
+{
+	return jent_zalloc(len, 0);
+}
+
 void jent_zfree(void *ptr, size_t len)
 {
 	/* See the NULL guard of the userspace variant below. */
@@ -295,13 +301,19 @@ void jent_zfree(void *ptr, size_t len)
 
 #else /* !JENT_ARCH_MEM_LINUX_KERNEL */
 
-void *jent_zalloc(size_t len, unsigned int flags)
+/*
+ * @secure asks for the lock or the secure arena, and only then is @flags
+ * consulted. Zeroing, guard pages and dump exclusion are the same either way,
+ * so jent_zfree() releases both kinds.
+ */
+static void *jent_zalloc_common(size_t len, unsigned int flags, int secure)
 {
 	void *tmp = NULL;
 
 #ifndef JENT_MEM_SECURE_ON_REQUEST
-	/* Only a backend that can be denied secure memory reads the flag. */
+	/* Only a backend that can be denied secure memory reads these. */
 	(void)flags;
+	(void)secure;
 #endif
 
 #ifdef LIBGCRYPT
@@ -320,7 +332,8 @@ void *jent_zalloc(size_t len, unsigned int flags)
 	 * is exhausted, terminating the host process from inside the library.
 	 * The NULL return is handled by all callers.
 	 */
-	tmp = gcry_malloc_secure(len);
+	if (secure)
+		tmp = gcry_malloc_secure(len);
 
 	/*
 	 * Check that the memory really came out of the pool. libgcrypt returns
@@ -354,7 +367,7 @@ void *jent_zalloc(size_t len, unsigned int flags)
 	 * knows what else in the process allocates from it - see
 	 * arch/jitterentropy-arch-memory.h. Only its presence is checked.
 	 */
-	if (CRYPTO_secure_malloc_initialized())
+	if (secure && CRYPTO_secure_malloc_initialized())
 		tmp = OPENSSL_secure_malloc(len);
 	/*
 	 * If secure memory was not available, OpenSSL falls back to "normal"
@@ -414,11 +427,10 @@ void *jent_zalloc(size_t len, unsigned int flags)
 		 *
 		 * VirtualLock() charges its pages against the process
 		 * *minimum* working set and fails with ERROR_WORKING_SET_QUOTA
-		 * once that budget is exhausted. The default minimum is
-		 * smaller than the memory block of a collector asking for a
-		 * large size (a JENT_CACHE_ALL one most visibly), so with
-		 * JENT_FORCE_SECURE_MEM such an allocation fails unless the
-		 * quota was raised beforehand.
+		 * once that budget is exhausted. A collector locks one page of
+		 * state (its memory access region is not locked), one more
+		 * with the internal timer and two more while its startup runs,
+		 * so the 200 kB default holds some 44 collectors.
 		 *
 		 * Raising it here is deliberately not done: the working set
 		 * limits are process-wide state, extending them evicts what
@@ -427,7 +439,7 @@ void *jent_zalloc(size_t len, unsigned int flags)
 		 * RLIMIT_MEMLOCK is on the POSIX path below; the test programs
 		 * raise both in tests/jitterentropy-memlock.h.
 		 */
-		if (!VirtualLock(tmp, payload) &&
+		if (secure && !VirtualLock(tmp, payload) &&
 		    (flags & JENT_FORCE_SECURE_MEM)) {
 			VirtualFree(base, 0, MEM_RELEASE);
 			return NULL;
@@ -543,7 +555,7 @@ void *jent_zalloc(size_t len, unsigned int flags)
 		 * The mapping itself is unaffected by the flag, so
 		 * jent_zfree() needs no knowledge of it.
 		 */
-		if (mlock(tmp, len) &&
+		if (secure && mlock(tmp, len) &&
 		    ((flags & JENT_FORCE_SECURE_MEM) ||
 		     (errno != EPERM && errno != ENOMEM && errno != EAGAIN))) {
 			munmap(base, total);
@@ -560,6 +572,16 @@ void *jent_zalloc(size_t len, unsigned int flags)
 	if (tmp != NULL)
 		jent_memset_secure(tmp, len);
 	return tmp;
+}
+
+void *jent_zalloc(size_t len, unsigned int flags)
+{
+	return jent_zalloc_common(len, flags, 1);
+}
+
+void *jent_zalloc_unlocked(size_t len)
+{
+	return jent_zalloc_common(len, 0, 0);
 }
 
 void jent_zfree(void *ptr, size_t len)

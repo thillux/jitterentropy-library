@@ -17,9 +17,9 @@ package de.chronox.jitterentropy.example
 class JitterEntropy(private val config: Config = Config(Mode.DEFAULT)) :
     AutoCloseable {
     /**
-     * The flags a collector is allocated with, as jitterentropy.h defines
-     * them. Both compliance modes imply JENT_FORCE_SECURE_MEM: where the
-     * memory lock is refused, their power-on tests already fail with EMEM.
+     * The mode flags of jitterentropy.h. Both compliance modes imply
+     * JENT_FORCE_SECURE_MEM, so they fail with EMEM where the state cannot
+     * be locked.
      */
     enum class Mode(val flags: Int, private val label: String) {
         DEFAULT(0, "default"),

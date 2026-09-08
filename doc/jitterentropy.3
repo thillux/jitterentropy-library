@@ -266,7 +266,7 @@ FIPS setting of the underlying operating system.
 Enable the BSI AIS 20/31 v3.0 NTG.1 compliant behavior.
 .TP
 .B JENT_FORCE_SECURE_MEM
-Require the memory of the entropy collector to be secure memory.
+Require the state of the entropy collector to be secure memory.
 The Jitter RNG always asks for it - a memory lock from the operating
 system, or an allocation from the secure memory arena of the crypto
 library it was built against; this flag decides what happens when that
@@ -296,6 +296,32 @@ whose compliance claims cover the protection of the collector state.
 It has no effect in the Linux kernel, where the memory is secure by
 construction, nor with AWS-LC, which wipes its memory but does not lock
 it and therefore never claims to be secure.
+.IP
+The memory access region, whose size
+.B JENT_MAX_MEMSIZE_*
+sets, is not part of that state and is never secure memory: it is what the
+memory access noise source is timed on, and its contents are neither hashed
+into the entropy pool nor part of any output. It is zeroed on allocation and
+wiped on release, and excluded from core dumps where the platform allows, but
+it is not locked and not taken from a secure memory arena. What a collector
+locks is therefore a small fixed amount whatever its memory size: one page of
+state, a second with the internal timer, and two more for the delta history
+while its startup runs. A health test reallocation holds two collectors while
+it runs. The small default quotas - the 64 KiB
+.I RLIMIT_MEMLOCK
+of older Linux systems and of Android apps, the 200 KiB minimum working set a
+Windows process starts with, against which
+.BR VirtualLock ()
+is charged - hold several collectors at a time; the Windows default held 44.
+An application allocating more raises the quotas itself, with
+.BR setrlimit ()
+or
+.BR SetProcessWorkingSetSizeEx ();
+.I tests/jitterentropy-memlock.h
+does this for the tools shipped with the library and can be used as it stands.
+The library does not do it itself: the limits are process-wide state,
+extending them evicts what the host application reserved, and they cannot be
+restored on free.
 .TP
 .B JENT_MAX_MEMSIZE_*
 Define the maximum amount of memory that the Jitter RNG will use

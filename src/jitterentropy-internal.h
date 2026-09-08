@@ -375,11 +375,11 @@ uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
  * On a 64-bit target this is JENT_MAX_MEMSIZE_MAX, i.e. no additional limit.
  * On a 32-bit target the address space is the binding constraint rather than
  * the cache: a two-socket machine with a large L3 makes JENT_CACHE_ALL derive
- * the full 512 MB, which the collector then both maps and mlock()s. That is a
- * sixth of the usable address space of a 32-bit process and well beyond a
- * typical RLIMIT_MEMLOCK, so jent_zalloc() fails and the whole collector
- * allocation fails with it. Capping the derived value at 64 MB keeps the
- * automatic path working on i686, armv7, RV32 and 31-bit s390.
+ * the full 512 MB, which the collector then maps. That is a sixth of the
+ * usable address space of a 32-bit process, where a contiguous mapping of that
+ * size may not be had, and the whole collector allocation fails with it.
+ * Capping the derived value at 64 MB keeps the automatic path working on i686,
+ * armv7, RV32 and 31-bit s390.
  *
  * UINTPTR_MAX is the pointer-width test; where it is unavailable (the Linux
  * kernel build does not define it) the 64-bit branch is taken, which leaves
@@ -513,6 +513,41 @@ uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 #define JENT_SHA3_256_SIZE_DIGEST_BITS	256
 #define JENT_SHA3_256_SIZE_DIGEST	(JENT_SHA3_256_SIZE_DIGEST_BITS >> 3)
 
+#define JENT_SHA3_SIZE_BLOCK(bits)	((1600 - 2 * bits) >> 3)
+
+#define JENT_SHA3_256_SIZE_BLOCK                                               \
+	JENT_SHA3_SIZE_BLOCK(JENT_SHA3_256_SIZE_DIGEST_BITS)
+
+#define JENT_XDRBG_SIZE_STATE		64
+
+/*
+ * The SHA-3 / SHAKE state. Defined here rather than with its functions in
+ * jitterentropy-sha3.h, which includes this header: struct rand_data below
+ * holds one as a member.
+ */
+struct jent_sha_ctx {
+	uint64_t state[25];
+	uint8_t partial[JENT_SHA3_256_SIZE_BLOCK];
+	size_t msg_len;
+	uint8_t r;
+	uint8_t rword;
+	/*
+	 * This implementation only supports up to rate-size digests for XOFs,
+	 * thus the data type can be appropriately small.
+	 */
+	uint8_t digestsize;
+	uint8_t padding;
+	uint8_t initially_seeded:1;
+
+	/*
+	 * Scratch for one XDRBG generate: the successor state V followed by
+	 * the bits returned to the caller. A member rather than a stack local
+	 * so that, for the collector's context, it lives in the secure memory
+	 * of struct rand_data. Unused by the HASH_CTX_ON_STACK contexts.
+	 */
+	uint8_t xdrbg_block[JENT_XDRBG_SIZE_STATE + JENT_SHA3_256_SIZE_DIGEST];
+};
+
 /*
  * The output 256 bits can receive more than 256 bits of min entropy,
  * of course, but the 256-bit output of XDRBG-256(M) can only
@@ -547,7 +582,11 @@ struct rand_data
 	 * of the RNG are marked as SENSITIVE. A user must not
 	 * access that information while the RNG executes its loops to
 	 * calculate the next random value. */
-	void *hash_state;		/* SENSITIVE hash state entropy pool */
+	/*
+	 * SENSITIVE hash state entropy pool. A member rather than a separate
+	 * allocation, as locked memory is counted in whole pages.
+	 */
+	struct jent_sha_ctx hash_state;
 	uint64_t prev_time;		/* SENSITIVE Previous time stamp */
 #define DATA_SIZE_BITS (JENT_SHA3_256_SIZE_DIGEST_BITS)
 

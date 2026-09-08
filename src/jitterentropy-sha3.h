@@ -27,43 +27,7 @@ extern "C"
 {
 #endif
 
-#define JENT_SHA3_SIZE_BLOCK(bits)	((1600 - 2 * bits) >> 3)
-
-#define JENT_SHA3_256_SIZE_BLOCK                                               \
-	JENT_SHA3_SIZE_BLOCK(JENT_SHA3_256_SIZE_DIGEST_BITS)
-
-#define JENT_XDRBG_SIZE_STATE		64
-
-struct jent_sha_ctx {
-	uint64_t state[25];
-	uint8_t partial[JENT_SHA3_256_SIZE_BLOCK];
-	size_t msg_len;
-	uint8_t r;
-	uint8_t rword;
-	/*
-	 * This implementation only supports up to rate-size digests for XOFs,
-	 * thus the data type can be appropriately small.
-	 */
-	uint8_t digestsize;
-	uint8_t padding;
-	uint8_t initially_seeded:1;
-
-	/*
-	 * Scratch for one XDRBG generate: the successor state V followed by
-	 * the bits returned to the caller. A member rather than a local of
-	 * jent_xdrbg256_generate_block() so that, for the collector's own
-	 * context, it lives in the memory jent_sha3_alloc() obtained - locked,
-	 * guard-paged and excluded from core dumps where the platform allows
-	 * it, which is what JENT_FORCE_SECURE_MEM asks of the state. On the
-	 * stack it was outside all of that.
-	 *
-	 * The stack contexts (HASH_CTX_ON_STACK) carry it unused; it is 96
-	 * bytes of frame they never read, and the wipe on release covers it
-	 * with the rest.
-	 */
-	uint8_t xdrbg_block[JENT_XDRBG_SIZE_STATE + JENT_SHA3_256_SIZE_DIGEST];
-};
-
+/* struct jent_sha_ctx is defined in jitterentropy-internal.h. */
 #define JENT_SHA_MAX_CTX_SIZE	(sizeof(struct jent_sha_ctx))
 #define HASH_CTX_ON_STACK(name)						       \
 	struct jent_sha_ctx name
@@ -80,8 +44,6 @@ void jent_sha3_256_init(struct jent_sha_ctx *ctx);
 void jent_sha3_update(struct jent_sha_ctx *ctx, const uint8_t *in,
 		      size_t inlen);
 void jent_sha3_final(struct jent_sha_ctx *ctx, uint8_t *digest);
-int jent_sha3_alloc(void **hash_state, unsigned int flags);
-void jent_sha3_dealloc(void *hash_state);
 int jent_sha3_tester(void);
 
 void jent_shake256_init(struct jent_sha_ctx *ctx);

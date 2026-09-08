@@ -168,7 +168,7 @@ static inline unsigned int jent_update_memsize(unsigned int flags,
 		/*
 		 * Bound the automatically derived size. This is a no-op on
 		 * 64-bit targets; on 32-bit ones it keeps a large host cache
-		 * from deriving a working set that cannot be mapped and locked.
+		 * from deriving a working set that cannot be mapped.
 		 * See JENT_MAX_AUTO_MEMSIZE.
 		 */
 		if (max > JENT_MAX_AUTO_MEMSIZE)
@@ -867,8 +867,19 @@ static struct rand_data
 	if (!(flags & JENT_DISABLE_MEMORY_ACCESS)) {
 		flags = jent_update_memsize(flags, 0);
 		memsize = jent_memsize(flags);
+
+		/*
+		 * Not secure memory, whatever JENT_FORCE_SECURE_MEM says: the
+		 * region is only timed, its contents are neither hashed into
+		 * the pool nor output. It is by far the largest allocation (up
+		 * to 512 MB, doubled by every reallocation) and locking it
+		 * would exceed common lock quotas such as Android's 64 KiB
+		 * RLIMIT_MEMLOCK. With JENT_RANDOM_MEMACCESS its bytes count,
+		 * mod 256, the updates time-stamp-seeded addresses made -
+		 * summed over all accesses, no record of any one sample.
+		 */
 		entropy_collector->mem =
-			(unsigned char *)jent_zalloc(memsize, flags);
+			(unsigned char *)jent_zalloc_unlocked(memsize);
 
 		if (entropy_collector->mem == NULL)
 			goto err;
@@ -885,13 +896,10 @@ static struct rand_data
 	flags = jent_update_hashloop(flags, 0);
 	entropy_collector->hashloopcnt = jent_hashloop_cnt(flags);
 
-	if (jent_sha3_alloc(&entropy_collector->hash_state, flags))
-		goto err;
-
 	/*
 	 * Initialize the hash state for the XDRBG
 	 */
-	jent_shake256_init(entropy_collector->hash_state);
+	jent_shake256_init(&entropy_collector->hash_state);
 
 	if ((flags & JENT_FORCE_FIPS) || jent_fips_enabled()) {
 		/*
@@ -1131,11 +1139,6 @@ void jent_entropy_collector_free(struct rand_data *entropy_collector)
 		jent_notime_unsettick(entropy_collector);
 
 		jent_notime_disable(entropy_collector);
-
-		if (entropy_collector->hash_state != NULL) {
-			jent_sha3_dealloc(entropy_collector->hash_state);
-			entropy_collector->hash_state = NULL;
-		}
 
 		if (entropy_collector->mem != NULL) {
 			/*

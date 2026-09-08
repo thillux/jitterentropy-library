@@ -29,9 +29,9 @@
  *
  * The allocator is interposed rather than the library being given a test hook.
  * These programs absorb the library sources (see CMakeLists.txt here), so
- * renaming jent_zalloc() through the preprocessor while
- * arch/jitterentropy-arch-memory.c is compiled hides that definition under a
- * private name and lets this file supply jent_zalloc() itself. Every absorbed
+ * renaming jent_zalloc() and jent_zalloc_unlocked() through the preprocessor
+ * while arch/jitterentropy-arch-memory.c is compiled hides those definitions
+ * under private names and lets this file supply both itself. Every absorbed
  * caller reaches the interposed one, and the shipped library carries no
  * testing conditional.
  */
@@ -81,6 +81,13 @@ static int fi_fail_mmap;
 static int fi_fail_mprotect;
 static unsigned int fi_mprotect_calls;
 static int fi_fail_mlock;
+static unsigned int fi_mlock_calls;
+
+/*
+ * A per-call lock quota in bytes, zero for none. Enough to tell the memory
+ * access region from the state around it.
+ */
+static size_t fi_mlock_quota;
 
 #ifdef FI_WINDOWS
 
@@ -116,7 +123,8 @@ static JENT_UT_MAYBE_UNUSED BOOL fi_VirtualProtect(LPVOID addr, SIZE_T len,
  */
 static JENT_UT_MAYBE_UNUSED BOOL fi_VirtualLock(LPVOID addr, SIZE_T len)
 {
-	if (fi_fail_mlock) {
+	fi_mlock_calls++;
+	if (fi_fail_mlock || (fi_mlock_quota && len > fi_mlock_quota)) {
 		SetLastError(ERROR_WORKING_SET_QUOTA);
 		return FALSE;
 	}
@@ -150,8 +158,13 @@ static JENT_UT_MAYBE_UNUSED int fi_mprotect(void *addr, size_t len, int prot)
 
 static JENT_UT_MAYBE_UNUSED int fi_mlock(const void *addr, size_t len)
 {
+	fi_mlock_calls++;
 	if (fi_fail_mlock) {
 		errno = fi_mlock_errno;
+		return -1;
+	}
+	if (fi_mlock_quota && len > fi_mlock_quota) {
+		errno = ENOMEM;
 		return -1;
 	}
 	return mlock(addr, len);
@@ -161,10 +174,12 @@ static JENT_UT_MAYBE_UNUSED int fi_mlock(const void *addr, size_t len)
 
 /*
  * Compile the real allocator under a private name, with its kernel calls
- * redirected. The header it includes declares jent_zalloc(), which is renamed
- * with it, so the declaration and the definition still agree.
+ * redirected. The header it includes declares jent_zalloc() and
+ * jent_zalloc_unlocked(), which are renamed with them, so the declarations and
+ * the definitions still agree.
  */
 #define jent_zalloc jent_fi_real_zalloc
+#define jent_zalloc_unlocked jent_fi_real_zalloc_unlocked
 #ifdef FI_WINDOWS
 # define VirtualAlloc fi_VirtualAlloc
 # define VirtualProtect fi_VirtualProtect
@@ -191,25 +206,40 @@ static JENT_UT_MAYBE_UNUSED int fi_mlock(const void *addr, size_t len)
 # undef mprotect
 # undef mmap
 #endif
+#undef jent_zalloc_unlocked
 #undef jent_zalloc
 
 /*
  * Fail the n-th allocation from now on, counting from 1. Zero disables the
  * injection. Only one allocation is failed per arming, so that the collector
  * is built up to a chosen point and only then denied its next allocation -
- * which is what walks the cleanup paths one stage at a time.
+ * which is what walks the cleanup paths one stage at a time. Both allocators
+ * count, the memory access region being one of the stages.
  */
 static unsigned int fi_fail_alloc;
 static unsigned int fi_alloc_count;
 
-void *jent_zalloc(size_t len, unsigned int flags)
+static int fi_deny_alloc(void)
 {
 	fi_alloc_count++;
 
-	if (fi_fail_alloc && fi_alloc_count == fi_fail_alloc)
+	return fi_fail_alloc && fi_alloc_count == fi_fail_alloc;
+}
+
+void *jent_zalloc(size_t len, unsigned int flags)
+{
+	if (fi_deny_alloc())
 		return NULL;
 
 	return jent_fi_real_zalloc(len, flags);
+}
+
+void *jent_zalloc_unlocked(size_t len)
+{
+	if (fi_deny_alloc())
+		return NULL;
+
+	return jent_fi_real_zalloc_unlocked(len);
 }
 
 static void fi_arm(unsigned int nth)
@@ -657,23 +687,6 @@ static void test_gcd_failures(void)
 		   "and passes again with the allocator restored");
 }
 
-/* The hash state allocation, which the collector cannot do without. */
-static void test_sha3_alloc_failure(void)
-{
-	void *hash_state = (void *)0x1;
-
-	jent_ut_group("the hash state under allocation failure");
-
-	fi_arm(1);
-	JENT_UT_NE(jent_sha3_alloc(&hash_state, 0), 0,
-		   "jent_sha3_alloc reports the denial");
-	fi_disarm();
-
-	JENT_UT_EQ(jent_sha3_alloc(&hash_state, 0), 0,
-		   "and succeeds again with the allocator restored");
-	jent_sha3_dealloc(hash_state);
-}
-
 /*
  * The recovery of jent_read_entropy_safe() reallocates the collector. When
  * that reallocation is denied, the original collector must be left intact and
@@ -845,6 +858,13 @@ static void test_secure_memory_failures(void)
 	p = jent_fi_real_zalloc(4096, 0);
 	JENT_UT_TRUE(p == NULL, "but an unexpected errno is not");
 
+	/* The unlocked allocation does not ask for the lock at all. */
+	fi_mlock_calls = 0;
+	p = jent_fi_real_zalloc_unlocked(4096);
+	JENT_UT_TRUE(p != NULL && fi_mlock_calls == 0,
+		     "the unlocked allocation does not ask for the lock");
+	jent_zfree(p, 4096);
+
 	fi_fail_mlock = 0;
 	fi_mlock_errno = EPERM;
 
@@ -886,6 +906,13 @@ static void test_secure_memory_failures(void)
 	p = jent_fi_real_zalloc(4096, 0);
 	JENT_UT_TRUE(p != NULL, "and tolerated without that demand");
 	jent_zfree(p, 4096);
+
+	/* The unlocked allocation does not ask for the lock at all. */
+	fi_mlock_calls = 0;
+	p = jent_fi_real_zalloc_unlocked(4096);
+	JENT_UT_TRUE(p != NULL && fi_mlock_calls == 0,
+		     "the unlocked allocation does not ask for the lock");
+	jent_zfree(p, 4096);
 	fi_fail_mlock = 0;
 
 	p = jent_fi_real_zalloc(4096, JENT_FORCE_SECURE_MEM);
@@ -894,6 +921,38 @@ static void test_secure_memory_failures(void)
 #else
 	jent_ut_group("the secure allocator when the kernel refuses");
 	JENT_UT_SKIP("the secure allocator", "not a mapping backend");
+#endif
+}
+
+/*
+ * A lock quota below the memory access region but above the collector state,
+ * such as Android's 64 KiB RLIMIT_MEMLOCK. The region is never locked, so a
+ * compliance-mode collector is still allocated.
+ */
+static void test_lock_quota_below_region(void)
+{
+#if defined(JENT_ARCH_MEM_POSIX_MLOCK) || defined(JENT_ARCH_MEM_WINDOWS)
+	/* Pinned well above the quota, whatever the cache geometry derives. */
+	const unsigned int flags = JENT_FORCE_FIPS | JENT_MAX_MEMSIZE_1MB;
+	struct rand_data *ec;
+	char buf[32];
+
+	jent_ut_group("a lock quota below the memory access region");
+
+	fi_mlock_quota = 64 * 1024;
+	ec = jent_entropy_collector_alloc(0, flags);
+	JENT_UT_TRUE(ec != NULL, "a FIPS collector is allocated under it");
+	if (ec) {
+		JENT_UT_TRUE(ec->memmask + 1 > fi_mlock_quota,
+			     "with a region the quota would refuse");
+		JENT_UT_TRUE(jent_read_entropy_safe(&ec, buf, sizeof(buf)) ==
+			     (ssize_t)sizeof(buf), "and generates");
+		jent_entropy_collector_free(ec);
+	}
+	fi_mlock_quota = 0;
+#else
+	jent_ut_group("a lock quota below the memory access region");
+	JENT_UT_SKIP("the lock quota", "not a mapping backend");
 #endif
 }
 
@@ -1257,12 +1316,12 @@ int main(void)
 	test_startup_rejects_bad_timers();
 
 	test_injection_works();
-	test_sha3_alloc_failure();
 	test_gcd_failures();
 	test_collector_alloc_failures();
 	test_init_failures();
 	test_recovery_alloc_failure();
 	test_secure_memory_failures();
+	test_lock_quota_below_region();
 	test_platform_query_failures();
 	test_system_fips_mode();
 	test_allocator_bounds();

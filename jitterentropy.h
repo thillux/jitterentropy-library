@@ -169,8 +169,10 @@ extern "C" {
 				 automatically determine the memory size for the
 				 memory access? By default it is only the L1
 				 cache size. */
-#define JENT_FORCE_SECURE_MEM (1<<8) /* Require the memory of the entropy
-				   collector to be secure memory: fail the
+#define JENT_FORCE_SECURE_MEM (1<<8) /* Require the state of the entropy
+				   collector to be secure memory - all of
+				   it but the memory access region, which
+				   is never locked: fail the
 				   allocation when the platform does not grant
 				   it - a memory lock the operating system
 				   refuses, or a secure memory arena that the

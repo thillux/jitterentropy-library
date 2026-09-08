@@ -382,27 +382,6 @@ void jent_sha3_final(struct jent_sha_ctx *ctx, uint8_t *digest)
 	jent_sha3_init(ctx);
 }
 
-int jent_sha3_alloc(void **hash_state, unsigned int flags)
-{
-	struct jent_sha_ctx *tmp;
-
-	tmp = jent_zalloc(JENT_SHA_MAX_CTX_SIZE, flags);
-	if (!tmp)
-		return 1;
-
-	*hash_state = tmp;
-
-	return 0;
-}
-
-void jent_sha3_dealloc(void *hash_state)
-{
-	struct jent_sha_ctx *ctx = (struct jent_sha_ctx *)hash_state;
-
-	if (ctx)
-		jent_zfree(ctx, JENT_SHA_MAX_CTX_SIZE);
-}
-
 /*********************************** XDRBG ************************************/
 
 #define JENT_XDRBG_DRNG_ENCODE_N(x) ((x) * 85)

@@ -214,25 +214,16 @@ static void test_shake256(void)
 	}
 }
 
-/* The heap-allocating variant, including the failure path of a bogus size. */
-static void test_alloc(void)
+/* The rate an initialized SHA3-256 state reports. */
+static void test_rate(void)
 {
-	void *hash_state = NULL;
+	HASH_CTX_ON_STACK(ctx);
 
-	jent_ut_group("SHA-3 state allocation");
+	jent_ut_group("SHA-3 state rate");
 
-	JENT_UT_EQ(jent_sha3_alloc(&hash_state, 0), 0, "jent_sha3_alloc");
-	JENT_UT_TRUE(hash_state != NULL, "the state was allocated");
-	if (hash_state) {
-		jent_sha3_256_init(hash_state);
-		JENT_UT_EQ(jent_sha3_rate(hash_state),
-			   JENT_SHA3_256_SIZE_BLOCK,
-			   "the rate of an initialized SHA3-256 state");
-		jent_sha3_dealloc(hash_state);
-	}
-
-	/* Must tolerate being handed nothing. */
-	jent_sha3_dealloc(NULL);
+	jent_sha3_256_init(&ctx);
+	JENT_UT_EQ(jent_sha3_rate(&ctx), JENT_SHA3_256_SIZE_BLOCK,
+		   "the rate of an initialized SHA3-256 state");
 }
 
 int main(void)
@@ -241,7 +232,7 @@ int main(void)
 	test_sha3_256_kat();
 	test_sha3_incremental();
 	test_shake256();
-	test_alloc();
+	test_rate();
 
 	return jent_ut_report("unit-sha3");
 }

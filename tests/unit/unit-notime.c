@@ -135,10 +135,12 @@ static JENT_UT_MAYBE_UNUSED int fi_mlock(const void *addr, size_t len)
 
 /*
  * Compile the real allocator under a private name, with its kernel calls
- * redirected. The header it includes declares jent_zalloc(), which is renamed
- * with it, so the declaration and the definition still agree.
+ * redirected. The header it includes declares jent_zalloc() and
+ * jent_zalloc_unlocked(), which are renamed with them, so the declarations and
+ * the definitions still agree.
  */
 #define jent_zalloc jent_fi_real_zalloc
+#define jent_zalloc_unlocked jent_fi_real_zalloc_unlocked
 #ifdef FI_WINDOWS
 # define VirtualAlloc fi_VirtualAlloc
 # define VirtualProtect fi_VirtualProtect
@@ -165,25 +167,40 @@ static JENT_UT_MAYBE_UNUSED int fi_mlock(const void *addr, size_t len)
 # undef mprotect
 # undef mmap
 #endif
+#undef jent_zalloc_unlocked
 #undef jent_zalloc
 
 /*
  * Fail the n-th allocation from now on, counting from 1. Zero disables the
  * injection. Only one allocation is failed per arming, so that the collector
  * is built up to a chosen point and only then denied its next allocation -
- * which is what walks the cleanup paths one stage at a time.
+ * which is what walks the cleanup paths one stage at a time. Both allocators
+ * count, the memory access region being one of the stages.
  */
 static unsigned int fi_fail_alloc;
 static unsigned int fi_alloc_count;
 
-void *jent_zalloc(size_t len, unsigned int flags)
+static int fi_deny_alloc(void)
 {
 	fi_alloc_count++;
 
-	if (fi_fail_alloc && fi_alloc_count == fi_fail_alloc)
+	return fi_fail_alloc && fi_alloc_count == fi_fail_alloc;
+}
+
+void *jent_zalloc(size_t len, unsigned int flags)
+{
+	if (fi_deny_alloc())
 		return NULL;
 
 	return jent_fi_real_zalloc(len, flags);
+}
+
+void *jent_zalloc_unlocked(size_t len)
+{
+	if (fi_deny_alloc())
+		return NULL;
+
+	return jent_fi_real_zalloc_unlocked(len);
 }
 
 /*

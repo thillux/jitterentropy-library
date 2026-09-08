@@ -48,7 +48,11 @@
  *     secure heap, ...). Of the collector flags only JENT_FORCE_SECURE_MEM is
  *     consulted: it turns secure memory the environment does not grant from a
  *     silent fallback to ordinary memory into an allocation failure.
- *   - jent_zfree(ptr, len): zero and release such an allocation.
+ *   - jent_zalloc_unlocked(len): what jent_zalloc() falls back to - zeroed,
+ *     guard-paged and excluded from core dumps where the backend does so, but
+ *     neither locked nor from a secure arena. For the memory access region,
+ *     which holds no collector state.
+ *   - jent_zfree(ptr, len): zero and release either kind of allocation.
  *   - jent_memset_secure(s, n): wipe a buffer in a way the compiler may
  *     not optimize away.
  *   - jent_secure_memory_supported(): whether the active path locks and wipes.
@@ -80,10 +84,12 @@
  * quota) and how large the libgcrypt and OpenSSL arenas are is process-wide
  * state belonging to the application, which the library does not change: a
  * size chosen here would bound every other user of those libraries in the
- * process. An application that needs a large collector locked raises the
- * limits and configures the arena itself, as the test programs do in
- * tests/jitterentropy-memlock.h; jent_zalloc() only checks that the allocation
- * came out of a configured arena.
+ * process. A collector locks one page of state whatever its memory size, one
+ * more with the internal timer and two more while its startup runs, so the
+ * defaults cover several collectors. An application that needs more raises
+ * the limits and configures the arena itself, as the test programs do in
+ * tests/jitterentropy-memlock.h; jent_zalloc() only checks that the
+ * allocation came out of a configured arena.
  */
 
 #ifndef _JITTERENTROPY_ARCH_MEMORY_H
@@ -91,6 +97,7 @@
 
 void jent_memset_secure(void *s, size_t n);
 void *jent_zalloc(size_t len, unsigned int flags);
+void *jent_zalloc_unlocked(size_t len);
 
 /*
  * Releases what jent_zalloc() returned, wiping @len bytes first. @len must be
