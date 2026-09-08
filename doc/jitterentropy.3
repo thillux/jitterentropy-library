@@ -283,6 +283,27 @@ whose compliance claims cover the protection of the collector state.
 It has no effect in the Linux kernel, where the memory is secure by
 construction, nor with AWS-LC, which wipes its memory but does not lock
 it and therefore never claims to be secure.
+.IP
+On Windows the quota that grants the lock is the process working set, and its
+default is smaller than the collector: a process starts with a minimum working
+set of 200 KiB, while the memory access region of a default collector alone is
+256 KiB. So
+.BR VirtualLock ()
+fails with
+.IR ERROR_WORKING_SET_QUOTA ,
+this flag turns that into a failed allocation, and - the flag being implied by
+the two modes above - no compliance-mode collector can be allocated at all
+until something raises the quota. An application that wants secure memory on
+Windows therefore raises its minimum working set by at least the size of the
+collector, with
+.BR SetProcessWorkingSetSizeEx (),
+before allocating one;
+.I tests/jitterentropy-memlock.h
+does this for the tools shipped with the library and can be used as it stands.
+The library does not do it itself for the reason it does not raise
+.I RLIMIT_MEMLOCK
+on the POSIX side: the limits are process-wide state, extending them evicts
+what the host application reserved, and they cannot be restored on free.
 .TP
 .B JENT_MAX_MEMSIZE_*
 Define the maximum amount of memory that the Jitter RNG will use
