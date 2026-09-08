@@ -607,6 +607,22 @@ for cryptographic operations, the output of
 .BR jent_read_entropy ()
 can be used for seeding a deterministic random number generator.
 .PP
+Every call that runs the noise source clears the stack it ran over before it
+returns, so that the time stamps, deltas and conditioning temporaries left in
+those frames do not survive the call on a stack that is neither locked,
+guard-paged nor kept out of a core dump. The wipe uses a buffer of its own and
+is therefore the deepest frame the library takes: a hosted build needs some
+4.5 kB of stack available to
+.BR jent_entropy_init (),
+.BR jent_entropy_init_ex (),
+.BR jent_entropy_collector_alloc (),
+.BR jent_read_entropy ()
+and
+.BR jent_read_entropy_safe ().
+A caller invoking them on a thread whose stack it sizes itself has to allow
+for that. Kernel and freestanding builds do not scrub and do not need it,
+their stacks already having the properties the wipe is there to make up for.
+.PP
 .SH SEE ALSO
 http://www.chronox.de provides the design description,
 the entropy and statistical analyses as well as a number of

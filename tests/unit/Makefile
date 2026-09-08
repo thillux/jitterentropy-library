@@ -132,8 +132,11 @@ gcov: DBG-all
 $(NAMES): %: %.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
-# The mocked time source is compiled into this one program only.
-unit-mock: CFLAGS += -DJENT_CONF_ENABLE_MOCK_TIMER
+# The mocked time source is compiled into these programs only. unit-mock
+# replays recordings through the noise source; unit-stack-residue needs the
+# timestamps to be its own so that what it finds on the stack can be
+# attributed to the library rather than to the machine.
+unit-mock unit-stack-residue: CFLAGS += -DJENT_CONF_ENABLE_MOCK_TIMER
 
 DBG-all: CFLAGS += -g -DDEBUG
 DBG-all: $(NAMES)

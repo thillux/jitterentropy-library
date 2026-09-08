@@ -256,6 +256,65 @@ static int jent_health_failure_code(unsigned int health_test_result)
 	return JENT_ERR_LAG;
 }
 
+/*
+ * Clear the stack a noise source run left behind: it leaves time stamps,
+ * deltas, the memory loop's address selector and the Keccak round temporaries
+ * in frames that are neither locked, guard-paged nor kept out of a core dump.
+ *
+ * Here rather than on that path: between two time stamps every instruction is
+ * inside the interval the next delta measures, so a wipe there would be part
+ * of what the noise source times. A scrub also reaches the copies of samples
+ * passed by value that the C source cannot name.
+ *
+ * Called from every entry point that runs the noise source, not from
+ * jent_read_entropy() alone - and the startup is the path that needs it most.
+ * A generate ends in the conditioning pass, whose frames happen to overwrite
+ * the collection frames on the way out, so it leaves no raw time stamp behind
+ * even unscrubbed; jent_time_entropy_init() returns straight from the
+ * measurement loop, and unit-stack-residue finds its stamps still there when
+ * the wipe is taken away.
+ *
+ * 4 kB covers every one of those paths. Measured on x86_64 at -O0, the
+ * high-water marks below the entry point are 1.3 kB for a generate and 2.6 kB
+ * for the first jent_entropy_init_ex() of a process, which is the deepest:
+ * that one alone runs the conditioning known answer tests and the GCD
+ * analysis on top of the measurement loop, every later call finding that work
+ * already done.
+ *
+ * Not more than that, though the startup leaves only 1.5 kB of headroom in
+ * it. The paths being wiped have returned before this frame is allocated, so
+ * it does not add to their depth - it replaces it, and is therefore the
+ * library's peak stack demand all by itself. Doubling it to buy margin would
+ * double what a caller running the library on a thread stack of its own
+ * choosing has to provide, for a path whose depth is fixed at build time and
+ * measured at test time: unit-stack-residue examines the region below the
+ * wipe and fails if anything reached it, so a target where these frames come
+ * out fatter than they are here is caught rather than guessed at.
+ *
+ * Hosted only - a kernel stack is already secure, and this frame is a quarter
+ * of one.
+ */
+#define JENT_STACK_SCRUB_LEN	4096
+
+#if !defined(LINUX_KERNEL) && !defined(__KERNEL__) && !defined(JENT_BAREMETAL)
+
+static void jent_stack_scrub(void)
+{
+	unsigned char scrub[JENT_STACK_SCRUB_LEN];
+
+	/*
+	 * Its own frame lands below the array and stays: that is the wipe's,
+	 * not the noise source's, and beyond what the path reached.
+	 */
+	jent_memset_secure(scrub, sizeof(scrub));
+}
+
+#else /* freestanding */
+
+static void jent_stack_scrub(void) { }
+
+#endif
+
 /**
  * Entry function: Obtain entropy for the caller.
  *
@@ -393,6 +452,9 @@ err:
 		ec->read_invocations++;
 		ec->bytes_output += orig_len;
 	}
+
+	/* Last: anything called after it writes into the frames it clears. */
+	jent_stack_scrub();
 
 	return ret ? ret : (ssize_t)orig_len;
 }
@@ -627,8 +689,18 @@ ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 			 * above).
 			 */
 			if (jent_health_failure_reset(
-				ec, _jent_entropy_collector_alloc))
+				ec, _jent_entropy_collector_alloc)) {
+				/*
+				 * Every other way out of this loop is behind
+				 * a jent_read_entropy() that wiped what it
+				 * ran over. This one is not: the reset gave
+				 * up, and it did so having run a full startup
+				 * - a measurement loop of its own - at each
+				 * rung it climbed.
+				 */
+				jent_stack_scrub();
 				return ret;
+			}
 
 			/*
 			 * We are not returning the intermittent errors here.
@@ -1002,6 +1074,14 @@ struct rand_data *jent_entropy_collector_alloc(unsigned int osr,
 	if (ec)
 		jent_uuid_generate(ec->uuid);
 
+	/*
+	 * Last, as everywhere else. This covers the startup collection
+	 * _jent_entropy_collector_alloc() ran - including any health-test
+	 * reset ladder it walked, which runs a startup of its own per rung -
+	 * and the identifier draw above.
+	 */
+	jent_stack_scrub();
+
 	return ec;
 }
 
@@ -1330,7 +1410,12 @@ int jent_entropy_init(void)
 		ret = jent_time_entropy_init(0, JENT_FORCE_INTERNAL_TIMER);
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 
-	return jent_entropy_init_common_post(ret);
+	ret = jent_entropy_init_common_post(ret);
+
+	/* Last: anything called after it writes into the frames it clears. */
+	jent_stack_scrub();
+
+	return ret;
 }
 
 JENT_PRIVATE_STATIC
@@ -1388,7 +1473,12 @@ int jent_entropy_init_ex(unsigned int osr, unsigned int flags)
 					     flags | JENT_FORCE_INTERNAL_TIMER);
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 
-	return jent_entropy_init_common_post(ret);
+	ret = jent_entropy_init_common_post(ret);
+
+	/* Last: anything called after it writes into the frames it clears. */
+	jent_stack_scrub();
+
+	return ret;
 }
 
 JENT_PRIVATE_STATIC

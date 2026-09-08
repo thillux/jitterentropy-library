@@ -54,7 +54,14 @@ jent_unit_test(unit-notime)
 jent_unit_test(unit-concurrency)
 jent_unit_test(unit-zeroize)
 
-# MOCK_TIMER is a library build option, off by default; this defines it for its
-# own absorbed copy rather than for the whole build.
+# MOCK_TIMER is a library build option, off by default; these define it for
+# their own absorbed copy rather than for the whole build.
 jent_unit_test(unit-mock)
 target_compile_definitions(unit-mock PRIVATE JENT_CONF_ENABLE_MOCK_TIMER)
+
+# What the noise source leaves in the frames it used. The mocked time source
+# is what makes a find attributable: every timestamp the library reads is one
+# the program handed it, carrying a magic nothing else in the process holds.
+jent_unit_test(unit-stack-residue)
+target_compile_definitions(unit-stack-residue
+                           PRIVATE JENT_CONF_ENABLE_MOCK_TIMER)
