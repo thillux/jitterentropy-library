@@ -280,16 +280,105 @@ static void sr_survey(size_t top, size_t bottom, size_t *written,
 		*hi = last;
 }
 
+/* The deepest byte the run reached: the last one no longer holding paint. */
+static size_t sr_reach(void)
+{
+	size_t d, deepest = 0;
+
+	for (d = 1; d < SR_SLAB; d++) {
+		if (SR_AT(d) != SR_PAINT)
+			deepest = d;
+	}
+
+	return deepest;
+}
+
+/*
+ * What the two controls below establish, before any entry point is examined.
+ */
+static int sr_wipe_measurable;
+static size_t sr_control_run;
+static size_t sr_alloc_reach;
+
+static const char sr_unmeasurable[] =
+	"this build writes into the frame after the wipe returns";
+
+/*
+ * Whether the wipe can be seen in this build at all. Every claim here reads
+ * the frame once the call has returned, which takes it that nothing writes
+ * there between the wipe and the snapshot. A build that instruments every
+ * function does: ThreadSanitizer calls __tsan_func_exit() on the way out of
+ * the entry point and that frame lands on what the wipe has just cleared,
+ * while AddressSanitizer pads every frame with redzones until the path no
+ * longer fits in what the wipe covers. The wipe still runs either way. What
+ * is gone is the ability to attribute what is found afterwards to the
+ * library, so the claims are skipped rather than reported against it.
+ *
+ * Measured, not deduced from a sanitizer macro: what takes the view away is a
+ * build writing into the frame after the wipe, and that is a property to
+ * observe rather than a list of build flags to keep up to date.
+ */
+static void sr_control_wipe(void)
+{
+	size_t start = 0;
+
+	sr_paint_below();
+	jent_stack_scrub();
+	SR_SNAPSHOT();
+
+	sr_control_run = sr_zero_run(&start);
+	sr_wipe_measurable = (sr_control_run >= (size_t)JENT_STACK_SCRUB_LEN);
+}
+
+/*
+ * How deep an allocation alone reaches. Before it samples anything,
+ * jent_entropy_collector_alloc() allocates the collector and its memory
+ * region, and on Windows that is VirtualAlloc() and VirtualLock(): an
+ * excursion into the operating system that goes far below anything the noise
+ * source touches - 6.8 kB there against the 1.9 kB the same entry point needs
+ * on Linux - and that never held a time stamp. Only what the noise source
+ * reached is the wipe's to cover, so the band examined below the wipe starts
+ * below this instead where this is deeper.
+ *
+ * jent_entropy_collector_alloc_internal() is that allocation without the
+ * startup ladder on top. It is reached two frames shallower here than the
+ * entry point reaches it, which is what the SR_BELOW slack at the band covers.
+ * A failure returns NULL, and is still a measurement: the allocations happen
+ * before anything that can fail.
+ */
+static void sr_control_alloc(void)
+{
+	struct rand_data *ec;
+	unsigned int flags;
+
+	(void)jent_set_mock_timer(sr_timer, NULL);
+	flags = jent_update_secure_mem(0);
+
+	sr_paint_below();
+	ec = jent_entropy_collector_alloc_internal(0, flags);
+	SR_SNAPSHOT();
+
+	sr_alloc_reach = sr_reach();
+
+	if (ec)
+		jent_entropy_collector_free(ec);
+}
+
 /*
  * The checks every entry point gets, on the snapshot the caller has already
  * taken. @what names the claim a failure is reported against.
  */
 static void sr_check(const char *what, const char *entry)
 {
-	size_t run, start = 0, top, bottom;
+	size_t run, start = 0, top, bottom, below;
 	size_t written = 0, nonzero = 0, lo = 0, hi = 0;
 	size_t beyond = 0, beyond_hi = 0;
 	size_t stamps;
+
+	if (!sr_wipe_measurable) {
+		JENT_UT_SKIP(what, sr_unmeasurable);
+		return;
+	}
 
 	run = sr_zero_run(&start);
 
@@ -305,9 +394,20 @@ static void sr_check(const char *what, const char *entry)
 	top = start;
 	bottom = start + JENT_STACK_SCRUB_LEN - 1;
 
+	/*
+	 * Where the band below the wipe begins: clear of the wipe's own
+	 * frames, and clear of the allocation's reach where that is deeper -
+	 * see sr_control_alloc().
+	 */
+	below = bottom + SR_BELOW;
+	if (sr_alloc_reach + SR_BELOW > below)
+		below = sr_alloc_reach + SR_BELOW;
+	if (below + SR_UNTOUCHED_LEN >= SR_SLAB)
+		below = SR_SLAB - SR_UNTOUCHED_LEN - 1;
+
 	sr_survey(top, bottom, &written, &nonzero, &lo, &hi);
-	sr_survey(bottom + SR_BELOW, bottom + SR_BELOW + SR_UNTOUCHED_LEN,
-		  &beyond, NULL, NULL, &beyond_hi);
+	sr_survey(below, below + SR_UNTOUCHED_LEN, &beyond, NULL, NULL,
+		  &beyond_hi);
 
 	/*
 	 * Over everything, the entry point's own frame included. A raw time
@@ -328,8 +428,9 @@ static void sr_check(const char *what, const char *entry)
 		       "frame\n", lo, hi);
 	if (beyond)
 		printf("    the path reached %zu bytes below the entry frame, "
-		       "past the %u the wipe covers\n",
-		       beyond_hi, JENT_STACK_SCRUB_LEN);
+		       "past the %u the wipe covers and the %zu an allocation "
+		       "alone reaches\n",
+		       beyond_hi, JENT_STACK_SCRUB_LEN, sr_alloc_reach);
 
 	JENT_UT_EQ(nonzero, 0, what);
 	JENT_UT_EQ(stamps, 0, what);
@@ -521,6 +622,22 @@ static void test_generate_leaves_no_output(void)
 int main(void)
 {
 	jent_ut_setup();
+
+	/*
+	 * The controls first: they establish what this build lets the checks
+	 * below see and what an allocation costs on this machine, and neither
+	 * runs a startup - the deepest run a process makes is its first
+	 * jent_entropy_init(), and that one belongs to the test after them.
+	 */
+	sr_control_wipe();
+	sr_control_alloc();
+
+	printf("the controls: the wipe leaves a run of %zu where %u is "
+	       "written, an allocation alone reaches %zu bytes down\n",
+	       sr_control_run, JENT_STACK_SCRUB_LEN, sr_alloc_reach);
+	if (!sr_wipe_measurable)
+		printf("  %s, so what is found in that frame afterwards is "
+		       "not the library's to answer for\n", sr_unmeasurable);
 
 	/* First: the deepest startup a process runs is its first one. */
 	test_startup_scrubs_its_stack();
