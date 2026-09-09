@@ -584,7 +584,12 @@ or
 and before any thread generates. Once an initialization has run they return
 .IR -EAGAIN ,
 which reports that the window has closed - it does not synchronize with a
-thread already inside it.
+thread already inside it. The window closes on the first attempt, not on the
+first success: an initialization that fails leaves the three returning
+.I -EAGAIN
+as well, so a caller that means to install its own timer thread for a second
+attempt - after the built-in one was refused, say - has to install it before
+the first.
 .TP
 .B Initialization may be called from several threads
 .BR jent_entropy_init ()
