@@ -51,6 +51,7 @@ jent_unit_test(unit-base-gen)
 jent_unit_test(unit-error)
 jent_unit_test(unit-fault)
 jent_unit_test(unit-notime)
+jent_unit_test(unit-notime-force)
 jent_unit_test(unit-concurrency)
 jent_unit_test(unit-zeroize)
 

@@ -313,8 +313,18 @@ int jent_notime_enable(struct rand_data *ec, unsigned int flags)
 
 	/* Use internal timer */
 	if (forced || (flags & JENT_FORCE_INTERNAL_TIMER)) {
-		/* Self test not run yet */
-		if (!forced &&
+		/*
+		 * Self test not run yet - unless this is the instance running
+		 * it. jent_time_entropy_init() allocates its measuring
+		 * collector with JENT_INT_MEASURE_CLOCK and the timer forced,
+		 * and starting the startup from inside the startup would
+		 * recurse without end. That recursion used to be cut by
+		 * jent_notime_force() being called before the measurement
+		 * rather than after it passed, which is what let one failed
+		 * forced startup force the timer on the whole process - see
+		 * there.
+		 */
+		if (!forced && !(flags & JENT_INT_MEASURE_CLOCK) &&
 		    jent_time_entropy_init(ec->osr,
 					   flags | JENT_FORCE_INTERNAL_TIMER))
 			return EHEALTH;

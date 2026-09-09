@@ -1189,14 +1189,28 @@ int jent_time_entropy_init(unsigned int osr, unsigned int flags)
 	uint64_t *delta_history;
 	int i, time_backwards = 0, count_stuck = 0, ret = 0;
 	unsigned int health_test_result;
+	/*
+	 * Whether this run measures the counting thread. Remembered rather
+	 * than acted on: the process-wide decision that the internal timer is
+	 * forced is taken at the end, on a measurement that passed, and not
+	 * here on the request alone. Taken here, it stood after a run that
+	 * failed - a single CPU, a thread the system refused - and from then on
+	 * every collector of the process was steered to a clock that had just
+	 * been shown not to work, while the platform clock that had passed was
+	 * refused as disabled. One failed attempt at the internal timer left
+	 * the library unable to allocate anything.
+	 *
+	 * The recursion that early call cut - the measuring collector's own
+	 * jent_notime_enable() running the startup again - is cut by
+	 * JENT_INT_MEASURE_CLOCK instead, see there.
+	 */
+	int force = !!(flags & JENT_FORCE_INTERNAL_TIMER);
 
 	delta_history = jent_gcd_init(JENT_POWERUP_TESTLOOPCOUNT, flags);
 	if (!delta_history)
 		return EMEM;
 
-	if (flags & JENT_FORCE_INTERNAL_TIMER)
-		jent_notime_force();
-	else
+	if (!force)
 		flags |= JENT_DISABLE_INTERNAL_TIMER;
 
 	/*
@@ -1348,6 +1362,14 @@ int jent_time_entropy_init(unsigned int osr, unsigned int flags)
 		ret = ESTUCK;
 
 out:
+	/*
+	 * The one-way decision, on the evidence: the counting thread was
+	 * measured and passed every check above, so it is a clock this process
+	 * can generate from. A run that failed decides nothing.
+	 */
+	if (!ret && force)
+		jent_notime_force();
+
 	jent_gcd_fini(delta_history, JENT_POWERUP_TESTLOOPCOUNT);
 
 	/* NOOP if notime disabled. Can be done unconditionally */
