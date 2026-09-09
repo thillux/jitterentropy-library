@@ -626,14 +626,17 @@ ends by drawing the per-instance identifier from the operating system's
 CSPRNG, and where the first such call in a process has machinery to stand up,
 that draw goes deeper than anything the library itself does: on Windows
 .BR BCryptGenRandom ()
-brings up the system-preferred provider and descends some 6.8 kB, against the
-4.2 kB the same call takes once the process is warm. A hosted caller should
-therefore allow
+brings up the system-preferred provider, and the first
+.BR jent_entropy_collector_alloc ()
+of a process descends some 6.8 kB where a later one takes 4.2 kB. A hosted
+caller should therefore allow
 .B 8 kB
-for these five, and a caller invoking them on a thread whose stack it sizes
-itself has to provide it. Kernel and freestanding builds do not scrub and do
-not need it, their stacks already having the properties the wipe is there to
-make up for.
+for these five. That is about a kilobyte over the deepest reach measured
+there, and the deepest is not the usual one: a few per cent of calls take a
+path some 250 bytes further down, so the common figure is not the ceiling. A
+caller invoking them on a thread whose stack it sizes itself has to provide
+it. Kernel and freestanding builds do not scrub and do not need it, their
+stacks already having the properties the wipe is there to make up for.
 .PP
 .SH SEE ALSO
 http://www.chronox.de provides the design description,
