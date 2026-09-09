@@ -24,6 +24,7 @@
 #include <linux/module.h>
 
 #include "jitterentropy.h"
+#include "jitterentropy-internal.h"	/* JENT_MAX_OSR */
 #include "jitterentropy_chardev.h"
 #include "jitterentropy_compat.h"
 #include "jitterentropy_hwrng.h"
@@ -106,6 +107,21 @@ static int __init jent_mod_init(void)
 		flags |= JENT_FORCE_FIPS;
 	if (cache_all)
 		flags |= JENT_CACHE_ALL;
+
+	/*
+	 * The highest oversampling rate the library accepts, checked here
+	 * rather than left to the jent_entropy_init_ex() below: that call
+	 * reports a rate it will not take as a failed startup, which on a
+	 * fips=1 kernel panics - and a rate nobody can allocate with is a
+	 * configuration error, not a verdict on the host. A rate below the
+	 * minimum needs no check, the library raising it to the minimum, as
+	 * the parameter description and config/osr both say.
+	 */
+	if (osr > JENT_MAX_OSR) {
+		pr_err("jitterentropy: osr %u is above the maximum of %u\n",
+		       osr, (unsigned int)JENT_MAX_OSR);
+		return -EINVAL;
+	}
 
 	if (max_memsize) {
 		/*

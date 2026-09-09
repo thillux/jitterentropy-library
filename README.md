@@ -301,7 +301,7 @@ The following test evidence must be provided to the German BSI for proving the c
 
 	* Common behavior (SP800-90B restart + runtime tests)
 
-- If the selected OSR after applying the methodology is larger than 20, the Jitter RNG cannot be used on the particular system.
+- If the selected OSR after applying the methodology is larger than `JENT_MAX_OSR_NTG1` - 20, the highest oversampling rate an NTG.1 instance is allowed to run at - the Jitter RNG cannot be used on the particular system.
 
 # Version Numbers
 

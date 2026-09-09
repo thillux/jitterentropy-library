@@ -70,6 +70,17 @@ static inline uint64_t jent_delta_abs(uint64_t prev, uint64_t next)
 * tests/health/cutoffs.py --check compares these two multipliers, and the
 * NTG.1 division jent_rct_init() applies to them, against that formula.
 */
+/*
+ * The highest oversampling rate the cutoff tables of jitterentropy-health.c
+ * carry an entry for. They are indexed by the rate, which is why this is the
+ * ceiling JENT_MAX_OSR is held to: a rate the tables do not reach would run
+ * on the cutoffs of the highest one they know, and those are stricter than
+ * the entropy rate of 1/osr that rate claims - a healthy noise source would
+ * fail them. tests/health/cutoffs.py recomputes every table for a higher
+ * value; what bounds that in turn is the collection loop, see JENT_MAX_OSR.
+ */
+#define JENT_HEALTH_CUTOFF_TABLE_OSR	64
+
 /* RCT: Intermittent cutoff threshold for alpha = 2**-30 */
 #define JENT_HEALTH_RCT_INTERMITTENT_CUTOFF(x) ((x) * 30)
 /* RCT: permanent cutoff threshold for alpha = 2**-60 */
@@ -112,8 +123,8 @@ enum jent_health_init_type {
 	jent_health_init_type_common,
 	jent_health_init_type_ntg1,
 };
-void jent_health_init(struct rand_data *ec,
-		      enum jent_health_init_type inittype);
+int jent_health_init(struct rand_data *ec,
+		     enum jent_health_init_type inittype);
 
 #ifdef __cplusplus
 }

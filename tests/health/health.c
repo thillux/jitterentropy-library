@@ -258,17 +258,22 @@ static void jent_test_skip(const char *name, const char *reason)
 	skipped++;
 }
 
-static void jent_test_init(struct rand_data *ec, unsigned int osr,
-			   enum jent_health_init_type inittype)
+/* Returns what jent_health_init() made of the oversampling rate. */
+static int jent_test_init(struct rand_data *ec, unsigned int osr,
+			  enum jent_health_init_type inittype)
 {
+	int ret;
+
 	memset(ec, 0, sizeof(struct rand_data));
 	ec->osr = osr;
 
 	/* The health tests only report errors in FIPS mode. */
 	ec->is_fips_enabled = 1;
 
-	jent_health_init(ec, inittype);
+	ret = jent_health_init(ec, inittype);
 	ec->rct_mem_nosr = jent_test_rct_mem_nosr(osr);
+
+	return ret;
 }
 
 /*
@@ -510,44 +515,39 @@ static void jent_test_rct_mem(unsigned int osr,
 }
 
 /*
- * The cutoff tables are indexed by the oversampling rate and clamped to their
- * last entry above it. JENT_MAX_OSR currently equals the length of the longest
- * of them, so nothing the public API accepts reaches the clamp of every table
- * - it is what keeps a raised JENT_MAX_OSR, which is a compile-time tunable,
- * from indexing past the end. Reached here by initializing the health tests
- * directly at an oversampling rate above all of them.
+ * The cutoff tables are indexed by the oversampling rate, and a rate they do
+ * not cover has no cutoffs of its own: the health test initialization refuses
+ * it rather than running it on the cutoffs of a rate they do cover, which are
+ * stricter than the entropy rate of 1/osr the higher rate claims. Nothing the
+ * public API accepts reaches this - a build assertion holds JENT_MAX_OSR to
+ * what the tables cover - so it is reached here by initializing the health
+ * tests directly, at either end of the tables.
  */
-static void jent_test_cutoff_clamping(enum jent_health_init_type inittype)
+static void jent_test_cutoff_refusal(enum jent_health_init_type inittype)
 {
 	struct rand_data ec, max_ec;
-	const unsigned int beyond = JENT_MAX_OSR + 5;
+	const unsigned int covered = JENT_HEALTH_CUTOFF_TABLE_OSR;
+	const unsigned int beyond = covered + 5;
+	int refused_high = jent_test_init(&ec, beyond, inittype);
+	int refused_zero = jent_test_init(&ec, 0, inittype);
+	int took_covered = jent_test_init(&max_ec, covered, inittype);
 
-	jent_test_init(&max_ec, JENT_MAX_OSR, inittype);
-	jent_test_init(&ec, beyond, inittype);
+	printf("  %-34s %6u osr    -> ", "cutoff refusal", beyond);
 
-	printf("  %-34s %6u osr    -> ", "cutoff clamping", beyond);
-
-	if (ec.rct_mem_cutoff == max_ec.rct_mem_cutoff &&
-	    ec.apt_cutoff == max_ec.apt_cutoff &&
-#ifdef JENT_HEALTH_LAG_PREDICTOR
-	    ec.lag_local_cutoff == max_ec.lag_local_cutoff &&
-	    ec.lag_global_cutoff == max_ec.lag_global_cutoff &&
-	    ec.lag_local_cutoff_permanent == max_ec.lag_local_cutoff_permanent &&
-	    ec.lag_global_cutoff_permanent == max_ec.lag_global_cutoff_permanent &&
-#endif
-	    ec.rct_mem_cutoff_permanent == max_ec.rct_mem_cutoff_permanent &&
-	    ec.apt_cutoff_permanent == max_ec.apt_cutoff_permanent) {
-		printf("every table clamped : passed\n");
+	if (refused_high && refused_zero && !took_covered) {
+		printf("refused outside the tables : passed\n");
 	} else {
-		printf("a table was not clamped : FAILED\n");
+		printf("a rate outside the tables was taken : FAILED\n");
 		failures++;
 	}
 
 	/*
-	 * The RCT is computed rather than looked up, so it scales instead of
-	 * clamping - stated here so that the difference is deliberate.
+	 * The RCT is computed rather than looked up, so it scales with the
+	 * rate where the tables end instead of stopping there - stated here
+	 * so that the difference is deliberate.
 	 */
-	if (ec.rct_cutoff <= max_ec.rct_cutoff) {
+	jent_test_init(&ec, covered - 1, inittype);
+	if (max_ec.rct_cutoff <= ec.rct_cutoff) {
 		printf("  %-34s %6s    -> the computed RCT cutoff did not "
 		       "scale : FAILED\n", "RCT cutoff scaling", "-");
 		failures++;
@@ -581,7 +581,7 @@ static void jent_test_run(unsigned int osr,
 	jent_test_apt(osr, inittype);
 	jent_test_lag(osr, inittype);
 	jent_test_rct_mem(osr, inittype);
-	jent_test_cutoff_clamping(inittype);
+	jent_test_cutoff_refusal(inittype);
 	printf("\n");
 }
 

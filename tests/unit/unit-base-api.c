@@ -141,6 +141,64 @@ static void test_collector_alloc(void)
 	JENT_UT_TRUE(ec == NULL, "an osr above the maximum is refused");
 	jent_entropy_collector_free(ec);
 
+	/*
+	 * The maximum itself allocates, and its health test cutoffs are the
+	 * table entries of that rate rather than the last entry of a shorter
+	 * table. The tables are indexed by the oversampling rate; a rate they
+	 * do not reach would run on the cutoffs of a lower one, which are
+	 * stricter than the entropy rate of 1/osr that rate claims and fail a
+	 * healthy noise source. The rate below it tells the two apart, the
+	 * tables rising strictly where they have not reached their cap - the
+	 * APT has by then, so it is not one of them.
+	 */
+	ec = jent_entropy_collector_alloc(JENT_MAX_OSR, 0);
+	if (ec) {
+		struct rand_data *below =
+			jent_entropy_collector_alloc(JENT_MAX_OSR - 1, 0);
+		char buf[32];
+
+		JENT_UT_EQ(ec->osr, (unsigned int)JENT_MAX_OSR,
+			   "the highest osr the tables cover allocates");
+		JENT_UT_EQ(jent_read_entropy(ec, buf, sizeof(buf)),
+			   (ssize_t)sizeof(buf), "and generates from it");
+
+		if (below) {
+			JENT_UT_TRUE(ec->rct_mem_cutoff >
+				     below->rct_mem_cutoff,
+				     "its RCT-with-memory cutoff is its own");
+#ifdef JENT_HEALTH_LAG_PREDICTOR
+			JENT_UT_TRUE(ec->lag_local_cutoff >
+				     below->lag_local_cutoff,
+				     "as is its lag predictor cutoff");
+#endif
+			jent_entropy_collector_free(below);
+		} else {
+			JENT_UT_SKIP("the cutoffs of the highest osr",
+				     "no collector one rate below it");
+		}
+
+		jent_entropy_collector_free(ec);
+	} else {
+		JENT_UT_SKIP("the highest osr the tables cover",
+			     "no collector on this machine");
+	}
+
+	/*
+	 * A compliance mode has a ceiling of its own, what the analysis
+	 * behind it covers rather than how far the health test tables reach.
+	 * With the two equal, as they are by default, these repeat the
+	 * refusal above; they part company in a build that raised
+	 * JENT_MAX_OSR, which is what they are here for.
+	 */
+	ec = jent_entropy_collector_alloc(JENT_MAX_OSR_NTG1 + 1, JENT_NTG1);
+	JENT_UT_TRUE(ec == NULL, "an osr above the NTG.1 ceiling is refused");
+	jent_entropy_collector_free(ec);
+
+	ec = jent_entropy_collector_alloc(JENT_MAX_OSR_FIPS + 1,
+					  JENT_FORCE_FIPS);
+	JENT_UT_TRUE(ec == NULL, "an osr above the FIPS ceiling is refused");
+	jent_entropy_collector_free(ec);
+
 	/* With the memory access disabled there is no block to size. */
 	ec = jent_entropy_collector_alloc(0, JENT_DISABLE_MEMORY_ACCESS);
 	if (ec) {

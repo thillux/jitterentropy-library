@@ -112,6 +112,27 @@ jobs:
           ctest --test-dir build --output-on-failure -LE unreliable
           ./build/tests/raw-entropy/recording_userspace/jitterentropy-rng 256 > /dev/null
 
+  linux-raised-osr:
+    name: Linux / gcc / JENT_MAX_OSR=64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The oversampling rate is a compile-time tunable the health test
+      # cutoff tables bound, and they reach 64 while the default maximum is
+      # 20 - so nothing else here builds the entries above 20, or reaches the
+      # ceilings the compliance modes keep of their own.
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_C_FLAGS="-DJENT_MAX_OSR=64"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Run tests
+        run: |
+          ctest --test-dir build --output-on-failure -LE unreliable
+          ./build/tests/health/jitterentropy-health 64
+
   linux-musl:
     name: Linux / musl-gcc / ${{ matrix.link }}
     runs-on: ubuntu-latest

@@ -580,11 +580,22 @@ static void jent_random_data_one(
 	 *
 	 * Safety measure against wrapping: compute in 64 bits and verify the
 	 * count fits the unsigned short window counters and covers at least
-	 * one output block. With the default JENT_MAX_OSR of 20 this cannot
-	 * trigger, but JENT_MAX_OSR is a compile-time tunable and a truncated
-	 * count would silently shrink the RCT-with-memory window below what
-	 * the cutoff tables assume, disabling the health test.
+	 * one output block. A truncated count would silently shrink the
+	 * RCT-with-memory window below what the cutoff tables assume,
+	 * disabling the health test.
+	 *
+	 * The build assertion below is what keeps this from triggering: the
+	 * count is proportional to the oversampling rate, and the highest
+	 * rate the library accepts is a compile-time tunable. A counter of
+	 * this width holds the count up to a rate of 204 with the
+	 * compliance-mode safety factor and 255 without, so the assertion
+	 * holds that tunable to the former and this branch covers the
+	 * arithmetic rather than a rate an allocation would have let through.
 	 */
+	JENT_BUILD_BUG_ON(JENT_MEASURE_JITTER_LOOP_CTR(JENT_MAX_OSR,
+						       ENTROPY_SAFETY_FACTOR)
+			  + 2 > USHRT_MAX);
+
 	nosr = JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR((uint64_t)ec->osr,
 						     safety_factor);
 	if (nosr > USHRT_MAX || nosr < DATA_SIZE_BITS) {
@@ -696,11 +707,18 @@ void jent_random_data(struct rand_data *ec)
 
 		/*
 		 * Initialize the health tests as we fall through to
-		 * independently invoke the next noise source.
+		 * independently invoke the next noise source. The refusal it
+		 * can return is for an oversampling rate the cutoff tables do
+		 * not cover, which the allocation rejected and which cannot
+		 * change afterwards - reported as a collection that produced
+		 * nothing rather than passed over.
 		 */
-		jent_health_init(ec, ec->flags & JENT_NTG1 ?
-				     jent_health_init_type_ntg1 :
-				     jent_health_init_type_common);
+		if (jent_health_init(ec, ec->flags & JENT_NTG1 ?
+					 jent_health_init_type_ntg1 :
+					 jent_health_init_type_common)) {
+			ec->noise_stopped = 1;
+			return;
+		}
 
 		JENT_FALLTHROUGH;
 	case jent_startup_sha3:
@@ -709,11 +727,18 @@ void jent_random_data(struct rand_data *ec)
 
 		/*
 		 * Initialize the health tests as we fall through to
-		 * independently invoke the next noise source.
+		 * independently invoke the next noise source. The refusal it
+		 * can return is for an oversampling rate the cutoff tables do
+		 * not cover, which the allocation rejected and which cannot
+		 * change afterwards - reported as a collection that produced
+		 * nothing rather than passed over.
 		 */
-		jent_health_init(ec, ec->flags & JENT_NTG1 ?
-				     jent_health_init_type_ntg1 :
-				     jent_health_init_type_common);
+		if (jent_health_init(ec, ec->flags & JENT_NTG1 ?
+					 jent_health_init_type_ntg1 :
+					 jent_health_init_type_common)) {
+			ec->noise_stopped = 1;
+			return;
+		}
 
 		break;
 	case jent_startup_completed:

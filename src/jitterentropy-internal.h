@@ -509,9 +509,32 @@ uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
  * - is instantiated with an OSR of 0 provided to the initialization API
  *
  * During initial health tests or jent_read_entropy_safe, the RNG instance
- * may re-initialize with an incremented OSR, which stops at JENT_OSR_MAX
+ * may re-initialize with an incremented OSR, which stops at JENT_MAX_OSR
  * and returns a failure condition. Otherwise this would run "forever".
- * Set another value instead of the default 20, if necessary.
+ *
+ * JENT_MAX_OSR is what an allocation accepts and what that re-initialization
+ * climbs to. It may be raised as far as JENT_HEALTH_CUTOFF_TABLE_OSR, the
+ * highest rate the health test cutoff tables carry an entry for: above those
+ * the tests would run on the cutoffs of the highest rate they know, which
+ * are stricter than the entropy rate of 1/OSR the higher rate claims, and a
+ * healthy noise source would fail them. tests/health/cutoffs.py recomputes
+ * the tables for a value beyond even that, whose own ceiling is the
+ * collection loop - one output block takes (256 + safety factor) * OSR time
+ * deltas, counted in the unsigned short window counters of the repetition
+ * count test with memory, which caps the rate at 204 in a compliance mode
+ * and 255 outside one; the build assertion in jent_random_data_one() holds
+ * the value to the former. A high rate costs proportionally, that loop
+ * generating that many deltas per output block, and a re-initialization
+ * ladder walking a rung per failure up to the maximum.
+ *
+ * JENT_MAX_OSR_FIPS and JENT_MAX_OSR_NTG1 are the same ceiling for an
+ * instance in one of the compliance modes, which is not the same question:
+ * what the analysis behind a mode covers is settled when that analysis is
+ * made, not when the health tests gain a table entry. Both are 20, where the
+ * compliance statements of this library stop, and an allocation asking for
+ * more in either mode is refused - so raising JENT_MAX_OSR extends what the
+ * library will run at without silently extending what it claims. Neither may
+ * exceed JENT_MAX_OSR, which is asserted at build time.
  */
 #ifndef JENT_MIN_OSR
 #define JENT_MIN_OSR	3
@@ -519,6 +542,14 @@ uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 
 #ifndef JENT_MAX_OSR
 #define JENT_MAX_OSR	20
+#endif
+
+#ifndef JENT_MAX_OSR_FIPS
+#define JENT_MAX_OSR_FIPS	20
+#endif
+
+#ifndef JENT_MAX_OSR_NTG1
+#define JENT_MAX_OSR_NTG1	20
 #endif
 
 /***************************************************************************
@@ -668,8 +699,10 @@ struct rand_data
 
 	/*
 	 * jent_read_entropy_safe() has given up recovering this collector:
-	 * it is at JENT_MAX_OSR, so the reallocation cannot be attempted
-	 * again, and the health failure that ended the recovery is sticky.
+	 * it is at the highest oversampling rate it may run at - JENT_MAX_OSR,
+	 * or the ceiling of its compliance mode - so the reallocation cannot
+	 * be attempted again, and the health failure that ended the recovery
+	 * is sticky.
 	 * Every further read would generate an output block only to discard
 	 * it and report the same failure, so the reads report it without
 	 * spending the block. Set by jent_health_failure_reset() alone.

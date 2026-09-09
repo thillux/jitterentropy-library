@@ -767,6 +767,19 @@
             out = machine.succeed("cat /proc/jitterentropy/config/flags")
             assert "max memory size: auto" in " ".join(out.split()), out
 
+            # An oversampling rate the library will not accept refuses the
+            # load: reported as a failed startup it would panic a fips=1
+            # kernel, and a rate nobody can allocate with is a configuration
+            # error rather than a verdict on the host. The highest one it
+            # does accept - the machine runs NTG.1, so that mode's ceiling -
+            # loads and generates.
+            machine.succeed("rmmod jitter_rng")
+            machine.fail("modprobe jitter_rng osr=100")
+            machine.succeed("modprobe jitter_rng osr=20")
+            machine.wait_for_file("/dev/jitterentropy")
+            machine.succeed("test \"$(cat /proc/jitterentropy/config/osr)\" = 20")
+            machine.succeed("test \"$(head -c 32 /dev/jitterentropy | wc -c)\" = 32")
+
             # max_instances=0 keeps the unbounded behaviour of before. Three
             # hundred instances of the 32 MB the machine configuration pins
             # are ten gigabytes, so this case pins 512 kB instead - the size
