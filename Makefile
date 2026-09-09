@@ -89,13 +89,25 @@ LIBPATCH=$(shell grep -E "define\s+JENT_PATCHLEVEL" jitterentropy.h | awk '{prin
 LIBVERSION := $(LIBMAJOR).$(LIBMINOR).$(LIBPATCH)
 
 ARCHDIR := arch
-VPATH := $(SRCDIR):$(ARCHDIR)
+# No VPATH. It found the sources in the two directories, but it finds objects
+# too: the kernel build names its objects ../src/*.o and ../arch/*.o (see
+# linux_kernel/Kbuild.source) and leaves one beside every source, and make then
+# took those for the objects of this build, skipped compiling them and handed
+# the linker the bare names, which exist only here -
+#
+#   cc: error: no such file or directory: 'jitterentropy-base.o'
+#
+# after every make -C linux_kernel. The explicit rules below name the source
+# directory and look nowhere else, so an object in src/ or arch/, whoever left
+# it, is neither found nor used. clean still sweeps them, as a courtesy to the
+# kernel build.
 C_SRCS := $(notdir $(sort $(wildcard $(SRCDIR)/*.c) $(wildcard $(ARCHDIR)/*.c)))
 C_OBJS := ${C_SRCS:.c=.o}
 OBJS := $(C_OBJS)
 
-analyze_srcs = $(filter %.c, $(sort $(C_SRCS)))
-analyze_plists = $(analyze_srcs:%.c=%.plist)
+analyze_src_plists = $(patsubst $(SRCDIR)/%.c,%.plist,$(wildcard $(SRCDIR)/*.c))
+analyze_arch_plists = $(patsubst $(ARCHDIR)/%.c,%.plist,$(wildcard $(ARCHDIR)/*.c))
+analyze_plists = $(analyze_src_plists) $(analyze_arch_plists)
 
 INCLUDE_DIRS := . $(SRCDIR)
 LIBRARY_DIRS :=
@@ -165,7 +177,19 @@ $(SOFILE): $(OBJS) $(VERSION_SCRIPT)
 $(NAME)-static: lib$(NAME).a
 $(NAME): $(SOFILE)
 
-$(analyze_plists): %.plist: %.c
+# The compile rules the implicit %.o: %.c rule used to provide through VPATH,
+# spelled with the source directory; see the note at C_SRCS.
+%.o: $(SRCDIR)/%.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+%.o: $(ARCHDIR)/%.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(analyze_src_plists): %.plist: $(SRCDIR)/%.c
+	@echo "  CCSA  " $@
+	clang --analyze $(CFLAGS) $< -o $@
+
+$(analyze_arch_plists): %.plist: $(ARCHDIR)/%.c
 	@echo "  CCSA  " $@
 	clang --analyze $(CFLAGS) $< -o $@
 
