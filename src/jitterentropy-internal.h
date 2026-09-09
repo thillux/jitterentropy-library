@@ -62,6 +62,32 @@
 #include "arch/jitterentropy-arch-random.h"
 #include "jitterentropy-uuid.h"
 
+/*
+ * The entropy core must be compiled without optimization. The #error on
+ * __OPTIMIZE__ in jitterentropy-base.c enforces that for GCC and Clang, but
+ * MSVC has no such macro, so the pragma turns its optimizations off for every
+ * function defined after it.
+ *
+ * The pragma does not disable inline expansion (/Ob): JENT_NOINLINE marks the
+ * helpers on the measured path, and CMakeLists.txt adds /Ob0 for the rest.
+ * Nor does it reach /GL, where code generation happens at link time, so
+ * CMakeLists.txt refuses /GL and /LTCG on MSVC. Other build systems have to
+ * do both themselves. clang-cl defines __OPTIMIZE__ and takes the #error path.
+ */
+#if defined(_MSC_VER) && !defined(__clang__)
+# pragma optimize("", off)
+#endif
+
+/*
+ * The measured-path helpers MSVC would otherwise inline despite the pragma.
+ * GCC and Clang inline nothing at -O0, and the kernel has its own attributes.
+ */
+#if defined(_MSC_VER) && !defined(__clang__)
+# define JENT_NOINLINE	__declspec(noinline)
+#else
+# define JENT_NOINLINE
+#endif
+
 #ifdef LINUX_KERNEL
 /*
  * Kernel div64 primitives backing jent_udiv64()/jent_umod64() below. The
@@ -131,12 +157,14 @@ struct rand_data *jent_entropy_collector_alloc_raw(unsigned int osr,
  * div64 primitives instead. On 64-bit kernels both primitives are inline
  * plain divisions, so code generation there is identical to the operators.
  */
-static inline uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
+static inline JENT_NOINLINE
+uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
 {
 	return div64_u64(dividend, divisor);
 }
 
-static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
+static inline JENT_NOINLINE
+uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 {
 	uint64_t rem;
 
@@ -174,12 +202,14 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
  * above for the rationale. Userspace links against libgcc (or an
  * equivalent), so the plain operators are used directly.
  */
-static inline uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
+static inline JENT_NOINLINE
+uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
 {
 	return dividend / divisor;
 }
 
-static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
+static inline JENT_NOINLINE
+uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 {
 	return dividend % divisor;
 }

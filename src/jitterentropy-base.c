@@ -43,6 +43,11 @@
  * None of the following should be altered
  ***************************************************************************/
 
+/*
+ * MSVC defines no __OPTIMIZE__: there the pragma and JENT_NOINLINE in
+ * jitterentropy-internal.h and /Ob0 and the /GL check in CMakeLists.txt
+ * enforce the same.
+ */
 #ifdef __OPTIMIZE__
  #error "The CPU Jitter random number generator must not be compiled with optimizations. See documentation. Use the compiler switch -O0 for compiling jitterentropy.c."
 #endif

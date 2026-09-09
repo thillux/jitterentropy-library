@@ -30,7 +30,8 @@ extern "C"
 void jent_health_cb_block_switch(void);
 int jent_set_fips_failure_callback_internal(jent_fips_failure_cb cb);
 
-static inline uint64_t jent_delta(uint64_t prev, uint64_t next)
+static inline JENT_NOINLINE
+uint64_t jent_delta(uint64_t prev, uint64_t next)
 {
 	/*
 	 * Return the delta between two values. If the values are monotonic

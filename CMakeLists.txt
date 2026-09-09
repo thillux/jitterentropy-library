@@ -201,6 +201,44 @@ if(WIN32)
     if(MSVC)
         # MSVC deprecates the portable spellings for its own _s variants.
         list(APPEND JITTER_C_FLAGS  /Od /W4 /D_CRT_SECURE_NO_WARNINGS)
+
+        # The entropy core must not be optimized, and MSVC has no __OPTIMIZE__
+        # for the source to refuse it with. /O1, /O2 and /Ox become /Od and
+        # /Ob1-/Ob3 become /Ob0 (an explicit /Ob outlives /Od). /GL, /LTCG and
+        # interprocedural optimization are refused: they defer code
+        # generation to the linker, past the pragma in jitterentropy-internal.h.
+        foreach(_var CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE
+                     CMAKE_C_FLAGS_RELWITHDEBINFO CMAKE_C_FLAGS_MINSIZEREL)
+            if("${${_var}}" MATCHES "/GL")
+                message(FATAL_ERROR
+                    "${_var} carries /GL: whole-program optimization defers "
+                    "code generation to the linker, where the -O0 the entropy "
+                    "core requires cannot be enforced. Remove it.")
+            endif()
+            string(REGEX REPLACE "/O[12x]" "/Od" ${_var} "${${_var}}")
+            string(REGEX REPLACE "/Ob[123]" "/Ob0" ${_var} "${${_var}}")
+        endforeach()
+        foreach(_var CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS
+                     CMAKE_STATIC_LINKER_FLAGS CMAKE_MODULE_LINKER_FLAGS)
+            if("${${_var}}" MATCHES "/LTCG")
+                message(FATAL_ERROR
+                    "${_var} carries /LTCG: link-time code generation is "
+                    "where /GL defers the optimization the entropy core must "
+                    "not have. Remove it.")
+            endif()
+        endforeach()
+        set(_ipo_vars CMAKE_INTERPROCEDURAL_OPTIMIZATION)
+        foreach(_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+            list(APPEND _ipo_vars CMAKE_INTERPROCEDURAL_OPTIMIZATION_${_cfg})
+        endforeach()
+        foreach(_var IN LISTS _ipo_vars)
+            if(${_var})
+                message(FATAL_ERROR
+                    "${_var} is on: on MSVC that is /GL and /LTCG, which defer "
+                    "code generation to the linker, where the -O0 the entropy "
+                    "core requires cannot be enforced. Turn it off.")
+            endif()
+        endforeach()
     else()
         list(APPEND JITTER_C_FLAGS  -fwrapv --param ssp-buffer-size=4 -fvisibility=hidden -Wcast-align
         -Wmissing-field-initializers -Wshadow -Wswitch-enum -Wextra -Wall -pedantic -O0 -fwrapv -Wconversion)
