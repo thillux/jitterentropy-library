@@ -676,6 +676,33 @@ static unsigned int ut_run(struct ut_worker *workers, unsigned int nthreads)
 }
 
 /*
+ * Whether a run actually raced anything, and the gate every claim below goes
+ * through.
+ *
+ * A machine that refuses a thread is not a defect in the library, and the
+ * threads that did start still exercise it, so a short run is not a failure.
+ * One thread is different in kind: every check here is computed over the
+ * number that ran, so a single thread satisfies all of them without two of
+ * anything ever overlapping, and the program reports a concurrency run that
+ * raced nothing. A skip says that; a pass does not.
+ *
+ * Two, not @nthreads: what is being tested is that two collectors overlap at
+ * all, and the arms that need more than that ask for it themselves - see the
+ * notime_threads check in test_concurrent_notime().
+ */
+static int ut_raced(unsigned int started, const char *what)
+{
+	if (started >= 2)
+		return 1;
+
+	JENT_UT_SKIP(what, started ?
+			   "only one thread could be created, so nothing ran "
+			   "concurrently" :
+			   "no thread could be created");
+	return 0;
+}
+
+/*
  * One configuration per thread, so that the collectors being built at the same
  * time differ in the state the library derives per instance - memory size and
  * hash loop count - rather than all taking the same path through the
@@ -729,11 +756,8 @@ static void test_concurrent_lifecycle(void)
 	ut_init_workers(workers, nthreads, ut_work_lifecycle, ut_flags);
 
 	started = ut_run(workers, nthreads);
-	if (!started) {
-		JENT_UT_SKIP("the concurrent life cycle",
-			     "no thread could be created");
+	if (!ut_raced(started, "the concurrent life cycle"))
 		return;
-	}
 	printf("  note: %u threads, %u rounds each\n", started, UT_ROUNDS);
 
 	/*
@@ -838,11 +862,8 @@ static void test_concurrent_registrations(void)
 			ut_fips_flags);
 
 	started = ut_run(workers, nthreads);
-	if (!started) {
-		JENT_UT_SKIP("the concurrent registration",
-			     "no thread could be created");
+	if (!ut_raced(started, "the concurrent registration"))
 		return;
-	}
 
 	for (i = 0; i < started; i++) {
 		allocs += (unsigned int)workers[i].allocs;
@@ -976,11 +997,8 @@ static void test_concurrent_notime(void)
 	for (i = 0; i < nthreads; i++)
 		jent_entropy_collector_free(workers[i].ec);
 
-	if (!started) {
-		JENT_UT_SKIP("the two clocks against each other",
-			     "no thread could be created");
+	if (!ut_raced(started, "the two clocks against each other"))
 		return;
-	}
 
 	/* What each clock established, substituting one as the library does. */
 	for (i = 0; i < 2; i++) {
