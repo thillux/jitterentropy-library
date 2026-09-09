@@ -230,6 +230,21 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 #define JENT_INT_MEASURE_CLOCK	(UINT32_C(1) << 23)
 
 /*
+ * The memory size in the flags is the caller's choice, not the library's
+ * derivation. Set by jent_entropy_collector_alloc() when the caller passed a
+ * JENT_MAX_MEMSIZE_* value, and by jent_health_failure_reset() when the
+ * collector being replaced records one; jent_entropy_collector_alloc_internal()
+ * reads it into ->max_mem_set and does not store it.
+ *
+ * The size field itself cannot say this. Every collector's flags carry one
+ * once jent_update_memsize() has normalized them, so a reallocation handed
+ * those flags looked caller-pinned whatever the caller had done, and the
+ * startup ladder it then ran raised the oversampling rate and the hash loop
+ * count while leaving the memory region where it was.
+ */
+#define JENT_INT_MEMSIZE_PINNED	(UINT32_C(1) << 22)
+
+/*
  * JENT_-prefixed, and defined outside the LINUX_KERNEL split above, for the
  * same reason JENT_FALLTHROUGH is: the bare names belong to the environment,
  * not to this library.

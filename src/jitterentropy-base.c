@@ -553,9 +553,13 @@ static int jent_health_failure_reset(
 
 	/*
 	 * If the caller did not set any specific maximum value let the Jitter
-	 * RNG increase the maximum memory by one step.
+	 * RNG increase the maximum memory by one step. Their choice, where
+	 * they made one, travels as JENT_INT_MEMSIZE_PINNED: the size field
+	 * alone cannot carry it, every collector's flags holding one by now.
 	 */
-	if (!(*ec)->max_mem_set)
+	if ((*ec)->max_mem_set)
+		flags |= JENT_INT_MEMSIZE_PINNED;
+	else
 		flags = jent_update_memsize(flags, 1);
 
 	/* Increment hash loop count by one */
@@ -576,9 +580,6 @@ static int jent_health_failure_reset(
 	 */
 	if (!new_ec)
 		return -1;
-
-	/* Remember whether caller configured memory size */
-	new_ec->max_mem_set = !!(*ec)->max_mem_set;
 
 	/*
 	 * Duplicate the state of the health tests to ensure the newly allocated
@@ -885,14 +886,19 @@ static struct rand_data
 		return NULL;
 
 	/*
-	 * Record whether the caller capped the memory size before
-	 * jent_update_memsize() normalizes the flags. This must happen here
-	 * and not in the outer jent_entropy_collector_alloc(): health-test
-	 * resets during the startup loop consult max_mem_set, and were it
-	 * still unset they would grow the memory region beyond the cap the
-	 * caller requested.
+	 * Whether the caller capped the memory size, recorded here and not in
+	 * the outer jent_entropy_collector_alloc(): health-test resets during
+	 * the startup loop consult max_mem_set, and were it still unset they
+	 * would grow the memory region beyond the cap the caller requested.
+	 *
+	 * From the internal flag, not the size field: this function is also
+	 * what a reallocation calls, with flags jent_update_memsize() has
+	 * normalized, and their size field is then set whatever the caller
+	 * did. Read from that field, every reallocated collector believed
+	 * its size was pinned and its startup ladder never grew it.
 	 */
-	entropy_collector->max_mem_set = !!JENT_FLAGS_TO_MAX_MEMSIZE(flags);
+	entropy_collector->max_mem_set = !!(flags & JENT_INT_MEMSIZE_PINNED);
+	flags &= ~JENT_INT_MEMSIZE_PINNED;
 
 	if (!(flags & JENT_DISABLE_MEMORY_ACCESS)) {
 		flags = jent_update_memsize(flags, 0);
@@ -1102,17 +1108,19 @@ JENT_PRIVATE_STATIC
 struct rand_data *jent_entropy_collector_alloc(unsigned int osr,
 					       unsigned int flags)
 {
+	struct rand_data *ec;
+
 	/*
-	 * max_mem_set is recorded in jent_entropy_collector_alloc_internal()
-	 * so that it is already valid during the startup health-test resets.
-	 *
 	 * The internal flags are the library's to set, whatever the caller
-	 * passed: this one would let an instance generate from a clock no
-	 * startup measured.
+	 * passed: one would let an instance generate from a clock no startup
+	 * measured, the other says the memory size below is the caller's -
+	 * which here, and only here, the size field can still tell.
 	 */
-	struct rand_data *ec =
-		_jent_entropy_collector_alloc(osr,
-					      flags & ~JENT_INT_MEASURE_CLOCK);
+	flags &= ~(JENT_INT_MEASURE_CLOCK | JENT_INT_MEMSIZE_PINNED);
+	if (JENT_FLAGS_TO_MAX_MEMSIZE(flags))
+		flags |= JENT_INT_MEMSIZE_PINNED;
+
+	ec = _jent_entropy_collector_alloc(osr, flags);
 
 	/*
 	 * Assign the stable per-instance identifier, once, to the collector
