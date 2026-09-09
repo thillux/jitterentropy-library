@@ -298,20 +298,65 @@ static int jent_health_failure_code(unsigned int health_test_result)
 
 #if !defined(LINUX_KERNEL) && !defined(__KERNEL__) && !defined(JENT_BAREMETAL)
 
-static void jent_stack_scrub(void)
+/*
+ * The bulk of the wipe. Its own frame lands below the array and stays: that
+ * is the wipe's, not the noise source's, and beyond what the path reached.
+ */
+static void jent_stack_scrub_array(void)
 {
 	unsigned char scrub[JENT_STACK_SCRUB_LEN];
 
-	/*
-	 * Its own frame lands below the array and stays: that is the wipe's,
-	 * not the noise source's, and beyond what the path reached.
-	 */
 	jent_memset_secure(scrub, sizeof(scrub));
 }
 
+/*
+ * The bytes above that array, which it cannot reach: this frame's own return
+ * address, saved frame pointer and stack canary, and the padding the compiler
+ * leaves between the canary and the array. The array is 16-byte aligned while
+ * the canary sits in the top 8 bytes of the frame, so the array's top edge
+ * stops 8 bytes short of it - on x86_64 with both gcc and clang. Return
+ * address, frame pointer and canary are written by the call and the prologue;
+ * the padding is written by nobody, and it is the last of the frame the noise
+ * source path had here. Take this away and unit-stack-residue finds a raw
+ * time stamp sitting in it.
+ *
+ * Scalars, not a buffer: a local buffer is what makes the compiler place a
+ * canary and pad down to it, so wiping this band with one would only move the
+ * padding down by a frame. Scalars carry no canary of their own and are laid
+ * out from the top of the frame down, so they land on the band with nothing
+ * skipped. Wider than the band needs to be: what runs past it is the array
+ * this has just cleared.
+ *
+ * Called from the same frame as the array wipe and after it, so that its
+ * locals land on the frame that wipe left standing.
+ */
+static void jent_stack_scrub_frame(void)
+{
+	volatile unsigned long z0 = 0, z1 = 0, z2 = 0, z3 = 0;
+	volatile unsigned long z4 = 0, z5 = 0, z6 = 0, z7 = 0;
+
+	(void)z0; (void)z1; (void)z2; (void)z3;
+	(void)z4; (void)z5; (void)z6; (void)z7;
+}
+
+/*
+ * Two calls, and made from the entry point rather than from a function of
+ * their own: an intermediate frame would be one more frame carrying padding
+ * of its own, below the band the second call covers and above the array the
+ * first one clears. Under -fstack-protector-all, where even a frame holding
+ * nothing gets a canary and the padding down to it, that is where the time
+ * stamp then sits.
+ */
+#define jent_stack_scrub()						       \
+	do {								       \
+		jent_stack_scrub_array();				       \
+		/* Last: it clears what the call above leaves of its own. */   \
+		jent_stack_scrub_frame();				       \
+	} while (0)
+
 #else /* freestanding */
 
-static void jent_stack_scrub(void) { }
+#define jent_stack_scrub()	do { } while (0)
 
 #endif
 
