@@ -203,9 +203,22 @@ int jent_os_random_bytes(uint8_t *buf, size_t len)
 	get_random_bytes(buf, len);
 	return 0;
 #elif defined(JENT_RANDOM_WINDOWS)
-	if (BCryptGenRandom(NULL, buf, (ULONG)len,
-			    BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
-		return -1;
+	/*
+	 * In pieces a ULONG can hold: the contract is to fill @len bytes, and a
+	 * narrowed length would fill the low 32 bits' worth and report success
+	 * for the rest. Unreachable at the sixteen bytes of the one caller,
+	 * kept honest for the next one.
+	 */
+	while (len) {
+		ULONG chunk = (len > (size_t)ULONG_MAX) ? ULONG_MAX :
+							  (ULONG)len;
+
+		if (BCryptGenRandom(NULL, buf, chunk,
+				    BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+			return -1;
+		buf += chunk;
+		len -= chunk;
+	}
 	return 0;
 #elif defined(JENT_RANDOM_ARC4RANDOM)
 	arc4random_buf(buf, len);

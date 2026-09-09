@@ -855,7 +855,14 @@ static void jent_get_cachesize_uncached(long *l1, long *l2, long *l3)
 			break;
 
 		cache = &rec->Cache;
-		size = (long)cache->CacheSize;
+		/*
+		 * long is 32 bits on every Windows target, so a cache of 2 GB
+		 * or more would come out negative and lose to a level with
+		 * none. Clamped: a working set sized after LONG_MAX is still
+		 * the largest this function can say.
+		 */
+		size = (cache->CacheSize > (DWORD)LONG_MAX) ?
+		       LONG_MAX : (long)cache->CacheSize;
 
 		if (cache->Level == 1 && cache->Type == CacheData) {
 			if (size > *l1)
