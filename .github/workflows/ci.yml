@@ -91,6 +91,27 @@ jobs:
               echo "::warning::jitterentropy-rng $opt failed on this machine"
           done
 
+  # The one library configuration no other job builds: without the internal
+  # timer, jitterentropy-timer.c is its stub half and CMakeLists.txt registers
+  # no rng-force-internal-timer test. A build that only ever ran with the option
+  # on could break the option off without anything noticing.
+  linux-no-internal-timer:
+    name: Linux / gcc / INTERNAL_TIMER=OFF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DINTERNAL_TIMER=OFF
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Run tests
+        run: |
+          ctest --test-dir build --output-on-failure -LE unreliable
+          ./build/tests/raw-entropy/recording_userspace/jitterentropy-rng 256 > /dev/null
+
   linux-musl:
     name: Linux / musl-gcc / ${{ matrix.link }}
     runs-on: ubuntu-latest
