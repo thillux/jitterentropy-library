@@ -610,18 +610,30 @@ can be used for seeding a deterministic random number generator.
 Every call that runs the noise source clears the stack it ran over before it
 returns, so that the time stamps, deltas and conditioning temporaries left in
 those frames do not survive the call on a stack that is neither locked,
-guard-paged nor kept out of a core dump. The wipe uses a buffer of its own and
-is therefore the deepest frame the library takes: a hosted build needs some
-4.5 kB of stack available to
+guard-paged nor kept out of a core dump. The wipe uses a buffer of its own,
+which sets a floor under what these calls need:
 .BR jent_entropy_init (),
 .BR jent_entropy_init_ex (),
 .BR jent_entropy_collector_alloc (),
 .BR jent_read_entropy ()
 and
-.BR jent_read_entropy_safe ().
-A caller invoking them on a thread whose stack it sizes itself has to allow
-for that. Kernel and freestanding builds do not scrub and do not need it,
-their stacks already having the properties the wipe is there to make up for.
+.BR jent_read_entropy_safe ()
+descend some 4.5 kB in a hosted build, nearly all of it the wipe.
+.PP
+The wipe is not always the deepest of them, though.
+.BR jent_entropy_collector_alloc ()
+ends by drawing the per-instance identifier from the operating system's
+CSPRNG, and where the first such call in a process has machinery to stand up,
+that draw goes deeper than anything the library itself does: on Windows
+.BR BCryptGenRandom ()
+brings up the system-preferred provider and descends some 6.8 kB, against the
+4.2 kB the same call takes once the process is warm. A hosted caller should
+therefore allow
+.B 8 kB
+for these five, and a caller invoking them on a thread whose stack it sizes
+itself has to provide it. Kernel and freestanding builds do not scrub and do
+not need it, their stacks already having the properties the wipe is there to
+make up for.
 .PP
 .SH SEE ALSO
 http://www.chronox.de provides the design description,
