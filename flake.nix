@@ -1140,10 +1140,13 @@
           grep -q '"internalTimer": false' console.txt ||
             fail "the internal timer is reported present in a build without one"
           # There is no OS random pool to draw an identifier from, so the
-          # library says so rather than inventing one. This is the documented
-          # baremetal shortfall and it is asserted so that it stays documented.
-          grep -q '"uuid": "00000000-0000-0000-0000-000000000000"' console.txt ||
-            fail "expected the nil UUID where no CSPRNG exists"
+          # library reports no identifier rather than inventing one. An empty
+          # field, not the nil UUID: that one is well-formed, indistinguishable
+          # downstream from a generated identifier, and shared by every
+          # instance on such a platform. This is the documented baremetal
+          # shortfall and it is asserted so that it stays documented.
+          grep -q '"uuid": "",' console.txt ||
+            fail "expected an empty identifier where no CSPRNG exists"
           # Secure memory, and it is not a locked page: there is no swap
           # device here, no second process and no core dump, so the property
           # the flag is about holds by construction. A false would mean the
