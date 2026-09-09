@@ -44,6 +44,13 @@
  * happening shows up in the first, a path that grows past
  * JENT_STACK_SCRUB_LEN only ever in the second.
  *
+ * All three read a frame the library has returned from, which only a build
+ * that writes nothing there afterwards allows - a sanitizer does - so all
+ * three skip where that view is gone. What establishes it is a wipe of the
+ * test's own, in the shape of the library's and owing it nothing: if that one
+ * can be seen and the library's cannot, the wipe did not run, and the three
+ * are reported rather than skipped. See sr_control_observable().
+ *
  * The startup entry points are the ones where a raw time stamp actually
  * survives without the wipe - jent_time_entropy_init() returns straight from
  * the measurement loop, while a generate ends in the conditioning pass, whose
@@ -294,9 +301,11 @@ static size_t sr_reach(void)
 }
 
 /*
- * What the two controls below establish, before any entry point is examined.
+ * What the three controls below establish, before any entry point is
+ * examined.
  */
 static int sr_wipe_measurable;
+static size_t sr_observable_run;
 static size_t sr_control_run;
 static size_t sr_alloc_reach;
 
@@ -304,19 +313,95 @@ static const char sr_unmeasurable[] =
 	"this build writes into the frame after the wipe returns";
 
 /*
- * Whether the wipe can be seen in this build at all. Every claim here reads
- * the frame once the call has returned, which takes it that nothing writes
- * there between the wipe and the snapshot. A build that instruments every
- * function does: ThreadSanitizer calls __tsan_func_exit() on the way out of
- * the entry point and that frame lands on what the wipe has just cleared,
- * while AddressSanitizer pads every frame with redzones until the path no
- * longer fits in what the wipe covers. The wipe still runs either way. What
- * is gone is the ability to attribute what is found afterwards to the
- * library, so the claims are skipped rather than reported against it.
+ * The test's own wipe, in the shape of the library's: an array of the same
+ * length one call below the caller's frame, and then the scalars that land on
+ * the band above it, from the same frame and after it - see
+ * jent_stack_scrub() in src/jitterentropy-base.c, which this mirrors down to
+ * being a macro, so that the array sits at the same depth below the frame
+ * that runs it.
+ *
+ * Written out here rather than borrowed from the library: this is the probe
+ * that decides whether the library's wipe can be seen, and a probe built out
+ * of the code it is there to judge cannot tell "I cannot see it" from "it did
+ * not happen". That is the whole point of it, so it owes the library nothing.
+ *
+ * volatile because every store here is dead to any eye but the one that
+ * matters - what the frame still holds after the call - which is exactly the
+ * kind of store a compiler may drop.
+ */
+static void sr_own_wipe_array(void)
+{
+	volatile unsigned char scrub[JENT_STACK_SCRUB_LEN];
+	size_t i;
+
+	for (i = 0; i < (size_t)JENT_STACK_SCRUB_LEN; i++)
+		scrub[i] = 0x00;
+}
+
+static void sr_own_wipe_frame(void)
+{
+	volatile unsigned long z0 = 0, z1 = 0, z2 = 0, z3 = 0;
+	volatile unsigned long z4 = 0, z5 = 0, z6 = 0, z7 = 0;
+
+	(void)z0; (void)z1; (void)z2; (void)z3;
+	(void)z4; (void)z5; (void)z6; (void)z7;
+}
+
+#define sr_own_wipe()							       \
+	do {								       \
+		sr_own_wipe_array();					       \
+		sr_own_wipe_frame();					       \
+	} while (0)
+
+/*
+ * Whether a wipe can be seen in this build at all. Every claim here reads the
+ * frame once the call has returned, which takes it that nothing writes there
+ * between the wipe and the snapshot. A build that instruments every function
+ * does: ThreadSanitizer calls __tsan_func_exit() on the way out and that
+ * frame lands on what the wipe has just cleared, while AddressSanitizer pads
+ * every frame with redzones. A wipe still runs either way. What is gone is
+ * the ability to attribute what is found afterwards to the library, so the
+ * claims are skipped rather than reported against it.
  *
  * Measured, not deduced from a sanitizer macro: what takes the view away is a
  * build writing into the frame after the wipe, and that is a property to
  * observe rather than a list of build flags to keep up to date.
+ *
+ * Measured with the test's own wipe, not the library's, which is the whole
+ * of the difference between this control and sr_control_wipe(). Asking
+ * jent_stack_scrub() whether jent_stack_scrub() can be seen makes the skip
+ * fire on a build where the wipe is simply gone - the #if in
+ * jitterentropy-base.c taking the freestanding branch on a hosted target, a
+ * caller of it dropped, the macro emptied - and every claim this program
+ * makes is then skipped and the suite passes. That is the one regression a
+ * program named for the residue exists to catch, so it is the one it must not
+ * report as an unsupported build.
+ */
+static void sr_control_observable(void)
+{
+	size_t start = 0;
+
+	sr_paint_below();
+	sr_own_wipe();
+	SR_SNAPSHOT();
+
+	sr_observable_run = sr_zero_run(&start);
+	sr_wipe_measurable =
+		(sr_observable_run >= (size_t)JENT_STACK_SCRUB_LEN);
+}
+
+/*
+ * What the library's wipe leaves, on the same terms. Read against the control
+ * above: nothing here and a full run there is the wipe failing to run,
+ * short in both is a build that cannot show it either way.
+ *
+ * The two do not come out equal even when both run. Under AddressSanitizer
+ * the library's wipe measures 4064 here against the 4096 of the test's own,
+ * the redzone of the frame that jent_stack_scrub_frame() gets landing 32
+ * bytes into the array below it - an artefact of the frame this control calls
+ * from, and one the entry points do not show. So what is asked of this number
+ * is coarse, and sr_check() is left to hold the wipe to its exact length on
+ * the paths where a shortfall is the library's own. See test_the_wipe_runs().
  */
 static void sr_control_wipe(void)
 {
@@ -327,7 +412,6 @@ static void sr_control_wipe(void)
 	SR_SNAPSHOT();
 
 	sr_control_run = sr_zero_run(&start);
-	sr_wipe_measurable = (sr_control_run >= (size_t)JENT_STACK_SCRUB_LEN);
 }
 
 /*
@@ -441,6 +525,48 @@ static void sr_check(const char *what, const char *entry)
 	 * the band above is cleared by the wipe either way.
 	 */
 	JENT_UT_EQ(beyond, 0, what);
+}
+
+/*
+ * That the wipe runs at all, asked of jent_stack_scrub() directly and before
+ * any entry point is examined.
+ *
+ * The claims below all read a frame the library has returned from, which only
+ * a build that writes nothing there afterwards allows - so each of them skips
+ * where that view is gone. This one draws the line those skips need: a wipe
+ * of the test's own, in this same position, was visible, so the library's
+ * leaving nothing is the library's answer to give and not the build's.
+ *
+ * Stated as a claim of its own rather than left to the entry points, which
+ * make the same demand exactly and on the paths that matter. Two reasons to
+ * say it twice. The entry points report where residue was found, which says
+ * nothing useful when the answer is that nothing cleared it - the residue is
+ * then simply everything the path wrote. And each of them skips for reasons
+ * of its own, the mock time source among them; a build where all three skip
+ * leaves nothing at all standing behind the program's name, and this one
+ * still stands.
+ *
+ * Half the length, not the whole of it: this frame is not an entry point, and
+ * a build may write into what a wipe called straight from it has cleared -
+ * AddressSanitizer takes 32 bytes off the end here and not on any path below.
+ * Nothing between the two answers this separates, though. A wipe that ran
+ * leaves thousands of contiguous zero bytes and a wipe that did not leaves
+ * none, no noise source path writing a zero run remotely this long of its
+ * own, so no threshold in between is delicate. The wipe's exact length is
+ * sr_check()'s to demand, where a shortfall is attributable.
+ */
+static void test_the_wipe_runs(void)
+{
+	static const char *what = "the wipe leaves a run where one can be seen";
+
+	jent_ut_group("the wipe runs where the test can see it");
+
+	if (!sr_wipe_measurable) {
+		JENT_UT_SKIP(what, sr_unmeasurable);
+		return;
+	}
+
+	JENT_UT_TRUE(sr_control_run >= (size_t)JENT_STACK_SCRUB_LEN / 2, what);
 }
 
 /*
@@ -629,15 +755,20 @@ int main(void)
 	 * runs a startup - the deepest run a process makes is its first
 	 * jent_entropy_init(), and that one belongs to the test after them.
 	 */
+	sr_control_observable();
 	sr_control_wipe();
 	sr_control_alloc();
 
-	printf("the controls: the wipe leaves a run of %zu where %u is "
-	       "written, an allocation alone reaches %zu bytes down\n",
-	       sr_control_run, JENT_STACK_SCRUB_LEN, sr_alloc_reach);
+	printf("the controls: a wipe of the test's own leaves a run of %zu and "
+	       "the library's leaves %zu, where %u is written; an allocation "
+	       "alone reaches %zu bytes down\n",
+	       sr_observable_run, sr_control_run, JENT_STACK_SCRUB_LEN,
+	       sr_alloc_reach);
 	if (!sr_wipe_measurable)
 		printf("  %s, so what is found in that frame afterwards is "
 		       "not the library's to answer for\n", sr_unmeasurable);
+
+	test_the_wipe_runs();
 
 	/* First: the deepest startup a process runs is its first one. */
 	test_startup_scrubs_its_stack();
