@@ -74,14 +74,29 @@ APPVERSION := $(APPMAJOR).$(APPMINOR).$(APPPATCH)
 C_SRCS := $(wildcard *.c) ../../src/jitterentropy-gcd.c \
 	  ../../arch/jitterentropy-arch-memory.c \
 	  ../../arch/jitterentropy-arch-atomic.c
-C_OBJS := ${C_SRCS:.c=.o}
-C_GCOV := ${C_SRCS:.c=.gcda}
-C_GCOV += ${C_SRCS:.c=.gcno}
-C_GCOV += ${C_SRCS:.c=.gcov}
+# Everything this builds lands here, not next to the sources it is built from.
+# ${C_SRCS:.c=.o} kept the path of each source, so the three library sources
+# above left their objects in ../../src and ../../arch - the very directories
+# the root Makefile names in its VPATH. A plain `make` at the root then found
+# them, took them for its own, skipped compiling those three and handed the
+# linker names that exist only in the root directory:
+#
+#   cc: error: no such file or directory: 'jitterentropy-arch-atomic.o'
+#
+# The basenames are unique across the three directories, so stripping the
+# paths is enough; the vpath below is what lets make find the sources again.
+vpath %.c ../../src ../../arch
+
+C_OBJS := $(notdir ${C_SRCS:.c=.o})
+# From the objects, not the sources: gcov writes .gcno and .gcda beside the
+# object file, which is here.
+C_GCOV := ${C_OBJS:.o=.gcda}
+C_GCOV += ${C_OBJS:.o=.gcno}
+C_GCOV += ${C_OBJS:.o=.gcov}
 OBJS := $(C_OBJS)
 
 analyze_srcs = $(filter %.c, $(sort $(C_SRCS)))
-analyze_plists = $(analyze_srcs:%.c=%.plist)
+analyze_plists = $(notdir $(analyze_srcs:%.c=%.plist))
 
 .PHONY: all scan install clean cppcheck distclean debug asanaddress asanthread leak gcov
 
@@ -130,8 +145,11 @@ scan: $(analyze_plists)
 cppcheck:
 	cppcheck --force -q --enable=performance --enable=warning --enable=portability *.h *.c ../lib/*.c ../lib/*.h
 
+# Here as well - see the vpath above.
+C_ASM := $(notdir ${C_SRCS:.c=.s})
+
 asm:
-	$(foreach b, $(C_SRCS), $(CC) $(CFLAGS) -S -fverbose-asm -o ${b:.c=.s} $(b);)
+	$(foreach b, $(C_SRCS), $(CC) $(CFLAGS) -S -fverbose-asm -o $(notdir ${b:.c=.s}) $(b);)
 
 install:
 	install -m 0755 $(NAME) -D -t $(DESTDIR)$(BINDIR)/
@@ -148,6 +166,7 @@ clean:
 	@- $(RM) $(C_GCOV)
 	@- $(RM) *.gcov
 	@- $(RM) $(analyze_plists)
+	@- $(RM) $(C_ASM)
 
 distclean: clean
 
