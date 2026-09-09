@@ -615,7 +615,12 @@ endif()
 # nm reads a Mach-O symbol table without -D and an ELF one only with it. PE is
 # left out rather than guessed at: the export set there follows from the same
 # declarations, so a leak reaches macOS too and is caught below.
-if(BUILD_TESTING AND BUILD_SHARED_LIBS AND NOT WIN32)
+#
+# Cygwin and MSYS build a PE DLL as well, and CMake's WIN32 is false for both,
+# so naming Windows alone did not leave them out: nm read the DLL, listed no
+# dynamic symbol for it (-D means nothing to PE) and the check reported an
+# empty export set.
+if(BUILD_TESTING AND BUILD_SHARED_LIBS AND NOT WIN32 AND NOT CYGWIN AND NOT MSYS)
     find_program(JENT_NM NAMES nm llvm-nm)
     if(JENT_NM)
         if(APPLE)
@@ -630,6 +635,10 @@ if(BUILD_TESTING AND BUILD_SHARED_LIBS AND NOT WIN32)
                          -DJENT_NM=${JENT_NM}
                          "-DJENT_NM_ARGS=${JENT_NM_ARGS}"
                          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/JentCheckExports.cmake)
+        # An nm whose output format the check cannot read is a skip, not a
+        # pass and not a failure - see JentCheckExports.cmake.
+        set_tests_properties(exported-symbols PROPERTIES
+            SKIP_REGULAR_EXPRESSION "the export check does not know the output format")
     else()
         message(STATUS
             "no nm found, not checking the export set of the shared library")
