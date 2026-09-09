@@ -150,12 +150,106 @@ static void test_ncpu_parse(void)
 }
 #endif
 
+#ifdef JENT_ARCH_NCPU_WINDOWS
+/* The flat CPU number of @bit in @group, or -1 when no CPU has it. */
+static long ut_flat_cpu(unsigned short group, unsigned int bit)
+{
+	DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+	unsigned long cpu;
+
+	for (cpu = 0; cpu < n; cpu++) {
+		unsigned short g;
+		unsigned int b;
+
+		if (!jent_cpu_to_group(cpu, &g, &b) && g == group && b == bit)
+			return (long)cpu;
+	}
+	return -1;
+}
+
+/*
+ * Under a narrowed process affinity mask the CPU count and the highest CPU
+ * follow the mask, and the pin refuses a CPU outside it, which
+ * SetThreadGroupAffinity() alone would move the thread to. The mask is
+ * restored before returning.
+ */
+static void test_ncpu_windows_affinity(void)
+{
+	HANDLE proc = GetCurrentProcess();
+	DWORD_PTR pmask, smask;
+	GROUP_AFFINITY ga;
+	unsigned int lo, hi, bits = 0;
+	long flat_lo, flat_hi;
+
+	jent_ut_group("the Windows CPU count under a process affinity mask");
+
+	if (!GetProcessAffinityMask(proc, &pmask, &smask) || !pmask ||
+	    !GetThreadGroupAffinity(GetCurrentThread(), &ga)) {
+		JENT_UT_SKIP("the affinity mask", "it cannot be read");
+		return;
+	}
+
+	for (lo = 0; !((pmask >> lo) & 1); lo++)
+		;
+	for (hi = (unsigned int)(sizeof(pmask) * 8) - 1; !((pmask >> hi) & 1);
+	     hi--)
+		;
+	for (smask = pmask; smask; smask &= smask - 1)
+		bits++;
+
+	JENT_UT_EQ(jent_ncpu(), (long)bits,
+		   "the count is the CPUs the process may run on");
+
+	if (bits < 2) {
+		JENT_UT_SKIP("a narrowed mask", "the process has one CPU");
+		return;
+	}
+
+	flat_lo = ut_flat_cpu(ga.Group, lo);
+	flat_hi = ut_flat_cpu(ga.Group, hi);
+	JENT_UT_TRUE(flat_lo >= 0 && flat_hi > flat_lo,
+		     "both ends of the mask have a CPU number");
+	JENT_UT_EQ(jent_cpu_highest(), flat_hi,
+		   "the highest CPU is the top of the mask");
+
+	if (!SetProcessAffinityMask(proc, (DWORD_PTR)1 << lo)) {
+		JENT_UT_SKIP("a narrowed mask", "the mask cannot be changed");
+		return;
+	}
+
+	JENT_UT_EQ(jent_ncpu(), 1, "confined to one CPU, the count is one");
+	JENT_UT_EQ(jent_cpu_highest(), flat_lo,
+		   "and the highest CPU is that one");
+
+#ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
+	JENT_UT_EQ(jent_thread_pin_to_cpu((unsigned long)flat_hi), -EINVAL,
+		   "a CPU outside the process affinity is refused");
+	JENT_UT_TRUE(GetThreadGroupAffinity(GetCurrentThread(), &ga) &&
+		     ga.Mask == ((KAFFINITY)1 << lo),
+		     "and the thread stays inside it");
+	JENT_UT_EQ(jent_thread_pin_to_cpu((unsigned long)flat_lo), 0,
+		   "the CPU inside it is pinned to");
+#endif
+
+	JENT_UT_TRUE(SetProcessAffinityMask(proc, pmask),
+		     "the process affinity mask is restored");
+	JENT_UT_EQ(jent_ncpu(), (long)bits, "and the count follows it back");
+}
+#else
+static void test_ncpu_windows_affinity(void)
+{
+	JENT_UT_SKIP("the Windows CPU count under a process affinity mask",
+		     "not the Windows CPU backend");
+}
+#endif
+
 /* The CSPRNG read behind the UUID, against files with known behaviour. */
 
 int main(void)
 {
 	test_ncpu();
 	test_ncpu_parse();
+	test_ncpu_windows_affinity();
 
 	return jent_ut_report("unit-arch-ncpu");
 }

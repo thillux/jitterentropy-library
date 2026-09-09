@@ -270,10 +270,9 @@ static unsigned int fi_count_allocs(void (*op)(void))
  * The real ones are captured in wrappers defined before the names are taken
  * over, so the fakes can still forward.
  *
- * sysconf() and the affinity query are the POSIX backends' sources. The
- * Windows ones have no "cannot tell" reply to fake - jent_ncpu() there cannot
- * return an error at all - so there is nothing to interpose and the cases
- * below skip.
+ * sysconf() and the affinity query are the POSIX backends' sources. On
+ * Windows they are GetThreadGroupAffinity() and GetActiveProcessorCount(),
+ * which fail with FALSE and with a count of zero.
  */
 #ifndef FI_WINDOWS
 #include <sched.h>
@@ -323,6 +322,43 @@ static long fi_sysconf(int name)
 	default:
 		return fi_sysconf_real(name);
 	}
+}
+#else /* FI_WINDOWS */
+
+static int fi_fail_affinity;
+static int fi_empty_affinity;
+static int fi_fail_processor_count;
+
+static BOOL fi_GetThreadGroupAffinity_real(HANDLE thread, PGROUP_AFFINITY ga)
+{
+	return GetThreadGroupAffinity(thread, ga);
+}
+
+static BOOL fi_GetThreadGroupAffinity(HANDLE thread, PGROUP_AFFINITY ga)
+{
+	if (fi_fail_affinity) {
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
+	if (!fi_GetThreadGroupAffinity_real(thread, ga))
+		return FALSE;
+	/* Succeeds, but names no CPU - not a usable count either. */
+	if (fi_empty_affinity)
+		ga->Mask = 0;
+	return TRUE;
+}
+
+static DWORD fi_GetActiveProcessorCount_real(WORD group)
+{
+	return GetActiveProcessorCount(group);
+}
+
+static DWORD fi_GetActiveProcessorCount(WORD group)
+{
+	/* Zero is the documented failure reply. */
+	if (fi_fail_processor_count)
+		return 0;
+	return fi_GetActiveProcessorCount_real(group);
 }
 #endif /* FI_WINDOWS */
 
@@ -414,9 +450,17 @@ static void *fi_cpu_alloc(size_t count)
  * one CPU and a machine that has run out of threads are both configurations
  * the library has to handle and neither is one a test can be run on.
  */
+#ifdef FI_WINDOWS
+# define GetThreadGroupAffinity fi_GetThreadGroupAffinity
+# define GetActiveProcessorCount fi_GetActiveProcessorCount
+#endif
 #define jent_ncpu jent_fi_real_ncpu
 #include "jitterentropy-arch-ncpu.c"
 #undef jent_ncpu
+#ifdef FI_WINDOWS
+# undef GetActiveProcessorCount
+# undef GetThreadGroupAffinity
+#endif
 
 /*
  * The whole thread back-end - the context type, the start routine type and
@@ -522,6 +566,42 @@ int jent_fips_enabled(void);
 #include "jitterentropy-status.c"
 
 #include "jitterentropy-arch-cache.c"
+/* The Windows FIPS policy query, faked to report "on" or to fail. */
+#if defined(FI_WINDOWS) && !defined(LIBGCRYPT) && !defined(AWSLC) && \
+    !defined(OPENSSL)
+# include <bcrypt.h>
+# define FI_HAVE_BCRYPT_FIPS
+
+enum fi_bcrypt_fips_mode {
+	FI_BCRYPT_FIPS_REAL = 0,
+	FI_BCRYPT_FIPS_FAIL,	/* an error status, with TRUE written anyway */
+	FI_BCRYPT_FIPS_ON,	/* the policy is enabled */
+};
+
+static enum fi_bcrypt_fips_mode fi_bcrypt_fips_mode;
+
+static NTSTATUS fi_BCryptGetFipsAlgorithmMode_real(BOOLEAN *enabled)
+{
+	return BCryptGetFipsAlgorithmMode(enabled);
+}
+
+static NTSTATUS fi_BCryptGetFipsAlgorithmMode(BOOLEAN *enabled)
+{
+	switch (fi_bcrypt_fips_mode) {
+	case FI_BCRYPT_FIPS_FAIL:
+		*enabled = TRUE;
+		return (NTSTATUS)0xC0000001L;	/* STATUS_UNSUCCESSFUL */
+	case FI_BCRYPT_FIPS_ON:
+		*enabled = TRUE;
+		return 0;
+	case FI_BCRYPT_FIPS_REAL:
+	default:
+		return fi_BCryptGetFipsAlgorithmMode_real(enabled);
+	}
+}
+# define BCryptGetFipsAlgorithmMode fi_BCryptGetFipsAlgorithmMode
+#endif
+
 /*
  * The rename is scoped to this one include: the sources above call
  * jent_fips_enabled() and must reach the override below, not the real one.
@@ -529,6 +609,9 @@ int jent_fips_enabled(void);
 #define jent_fips_enabled jent_fi_real_fips_enabled
 #include "jitterentropy-arch-fips.c"
 #undef jent_fips_enabled
+#ifdef FI_HAVE_BCRYPT_FIPS
+# undef BCryptGetFipsAlgorithmMode
+#endif
 
 int jent_fips_enabled(void)
 {
@@ -1024,12 +1107,24 @@ static void test_platform_query_failures(void)
 	jent_ut_group("the platform queries when they cannot answer");
 
 #ifdef FI_WINDOWS
-	/*
-	 * GetActiveProcessorCount() has no failure reply, so there is no
-	 * unanswerable count to produce here - only the real one to confirm.
-	 */
-	JENT_UT_SKIP("the unanswerable CPU count",
-		     "the Windows backend has no query that can decline");
+	/* The thread's affinity first, the processors of the machine second. */
+	fi_fail_affinity = 1;
+	JENT_UT_TRUE(jent_ncpu() > 0,
+		     "an unreadable thread affinity falls back to the system count");
+	JENT_UT_EQ(jent_cpu_highest(), jent_ncpu() - 1,
+		   "and the highest CPU to the count minus one");
+
+	fi_fail_processor_count = 1;
+	JENT_UT_TRUE(jent_ncpu() < 0,
+		     "an unanswerable CPU count is reported as an error");
+	JENT_UT_TRUE(jent_cpu_highest() < 0, "and so is the highest CPU");
+	fi_fail_processor_count = 0;
+	fi_fail_affinity = 0;
+
+	fi_empty_affinity = 1;
+	JENT_UT_TRUE(jent_ncpu() > 0,
+		     "an empty affinity mask falls back to the system count");
+	fi_empty_affinity = 0;
 #else
 	/* The CPU count. Whatever it says, it must be a count or an error. */
 	fi_fail_affinity = 1;
@@ -1167,6 +1262,29 @@ static void test_system_fips_mode(void)
 		   (ssize_t)sizeof(buf), "and entropy is produced");
 
 	jent_entropy_collector_free(ec);
+}
+
+/* How the Windows backend reads the FIPS policy query. */
+static void test_windows_fips_policy(void)
+{
+	jent_ut_group("the Windows FIPS policy query");
+
+#ifdef FI_HAVE_BCRYPT_FIPS
+	fi_bcrypt_fips_mode = FI_BCRYPT_FIPS_ON;
+	JENT_UT_EQ(jent_fi_real_fips_enabled(), 1,
+		   "a policy that is on is reported as FIPS mode");
+
+	fi_bcrypt_fips_mode = FI_BCRYPT_FIPS_FAIL;
+	JENT_UT_EQ(jent_fi_real_fips_enabled(), 0,
+		   "a failed query means disabled, whatever it wrote");
+
+	fi_bcrypt_fips_mode = FI_BCRYPT_FIPS_REAL;
+	JENT_UT_EQ(jent_fi_real_fips_enabled(), jent_fips_enabled(),
+		   "the real query comes back afterwards");
+#else
+	JENT_UT_SKIP("the Windows FIPS policy query",
+		     "not the Windows FIPS backend");
+#endif
 }
 
 /* The allocator's own bounds, which no ordinary request comes near. */
@@ -1324,6 +1442,7 @@ int main(void)
 	test_lock_quota_below_region();
 	test_platform_query_failures();
 	test_system_fips_mode();
+	test_windows_fips_policy();
 	test_allocator_bounds();
 	test_alloc_runs_failing_selftest();
 	test_still_usable_afterwards();

@@ -107,7 +107,10 @@ afterwards the call has no effect and returns
 The pinning is advisory - an index the platform cannot honor, and a platform
 with no thread-to-CPU affinity API at all (OpenBSD, macOS on Apple Silicon),
 leave the counting thread where the scheduler puts it rather than failing the
-call. It returns
+call. A CPU outside the process's affinity mask or cpuset is one such index.
+On Windows the index counts the active processors of all processor groups in
+group order, and a CPU in a processor group other than the counting thread's
+is not honored either. It returns
 .IR 0
 on success and a negative errno otherwise.
 .LP
@@ -548,7 +551,11 @@ The FIPS mode is enabled by using the
 flag during initialization of the Jitter RNG library. On Linux, the
 the FIPS mode is transparently enabled if the entire operating system
 was booted in FIPS mode, usually by using the "fips=1" Linux kernel
-command line parameter.
+command line parameter. On Windows, it is transparently enabled when the
+system FIPS policy ("System cryptography: Use FIPS compliant algorithms")
+is on, as
+.BR BCryptGetFipsAlgorithmMode ()
+reports it.
 .TP
 .B Perform heursitic entropy analysis
 The test tool set provided as part of the Jitter RNG library source

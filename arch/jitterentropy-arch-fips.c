@@ -45,6 +45,15 @@
  * DAMAGE.
  */
 
+/*
+ * BCryptGetFipsAlgorithmMode() is declared from Windows Vista onwards, and
+ * mingw-w64 may default lower. Must precede every system header; an
+ * externally supplied value is left alone. As in jitterentropy-arch-random.c.
+ */
+#if (defined(_MSC_VER) || defined(__MINGW32__)) && !defined(_WIN32_WINNT)
+# define _WIN32_WINNT 0x0601
+#endif
+
 #include "jitterentropy.h"
 #include "jitterentropy-internal.h"
 
@@ -84,6 +93,23 @@ int jent_fips_enabled(void)
 # include <sys/types.h>
 # include <unistd.h>
 # define JENT_ARCH_FIPS_PROC
+#endif
+
+/*
+ * The Windows FIPS mode is the system policy "System cryptography: Use FIPS
+ * compliant algorithms", reported by BCryptGetFipsAlgorithmMode() - the
+ * counterpart of the Linux indicator. A compiled-in crypto library still
+ * answers first. bcrypt is linked by the pragma (MSVC) or by CMakeLists.txt
+ * (MinGW).
+ */
+#if !defined(LIBGCRYPT) && !defined(AWSLC) && !defined(OPENSSL) && \
+    !defined(JENT_BAREMETAL) && (defined(_MSC_VER) || defined(__MINGW32__))
+# include <windows.h>
+# include <bcrypt.h>
+# if defined(_MSC_VER)
+#  pragma comment(lib, "bcrypt.lib")
+# endif
+# define JENT_ARCH_FIPS_WINDOWS
 #endif
 
 #ifdef JENT_ARCH_FIPS_PROC
@@ -130,11 +156,18 @@ int jent_fips_enabled(void)
 #elif defined(JENT_ARCH_FIPS_PROC)
 	return jent_fips_enabled_file(FIPS_MODE_SWITCH_FILE);
 #undef FIPS_MODE_SWITCH_FILE
+#elif defined(JENT_ARCH_FIPS_WINDOWS)
+	/* A failed query means not enabled. */
+	BOOLEAN enabled = FALSE;
+
+	if (!BCRYPT_SUCCESS(BCryptGetFipsAlgorithmMode(&enabled)))
+		return 0;
+	return enabled ? 1 : 0;
 #else
 	/*
-	 * No system-wide FIPS indicator on this platform (Windows, the BSDs,
-	 * macOS, AIX, Solaris, ...). Callers that need FIPS behaviour there ask
-	 * for it explicitly with the JENT_FORCE_FIPS flag.
+	 * No system-wide FIPS indicator on this platform (the BSDs, macOS,
+	 * AIX, Solaris, ...). Callers that need FIPS behaviour there ask for it
+	 * explicitly with the JENT_FORCE_FIPS flag.
 	 */
 	return 0;
 #endif
