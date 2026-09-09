@@ -297,8 +297,17 @@
           ];
           boot.kernelModules = [ "jitter_rng" ];
           # Per-instance JSON status to the kernel log; test systems only.
+          #
+          # max_memsize pins the memory access region of an instance at the
+          # 32 MB the cache derivation arrives at here anyway, rather than
+          # leaving the size to the host the VM runs on: a health test
+          # failure reallocates the collector with the region doubled, once
+          # per rung of the recovery ladder and up to 512 MB, and the tests
+          # below hold hundreds of instances open at once. Unpinned, that is
+          # more memory than this VM has, and an out-of-memory here is a
+          # kernel panic - panic_on_oom is set for the test machines.
           boot.extraModprobeConfig = ''
-            options jitter_rng verbose=1 ntg1=1 cache_all=1 selftest_interval=15
+            options jitter_rng verbose=1 ntg1=1 cache_all=1 selftest_interval=15 max_memsize=32768
           '';
           environment.systemPackages = [
             (toolsFor pkgs)
@@ -489,6 +498,12 @@
             # procfs exports, including the per-instance status directory.
             print(machine.succeed("cat /proc/jitterentropy/statistics"))
             print(machine.succeed("cat /proc/jitterentropy/hwrng_status"))
+
+            # The size the machine configuration pins, read back: an option
+            # the module did not get is otherwise only visible as the region
+            # growing again under a health test failure.
+            out = machine.succeed("cat /proc/jitterentropy/config/flags")
+            assert "max memory size: 32 MB" in " ".join(out.split()), out
 
             # Reading opens an instance; its UUID-named status file appears.
             machine.succeed(
@@ -745,14 +760,23 @@
             machine.succeed("rmmod jitter_rng")
             machine.fail("modprobe jitter_rng max_memsize=3")
             machine.fail("modprobe jitter_rng max_memsize=1048576")
-            machine.succeed("modprobe jitter_rng")
+            # 0 is the value that asks for the derivation, and the machine
+            # configuration pins a size, so this one says so explicitly.
+            machine.succeed("modprobe jitter_rng max_memsize=0")
             machine.wait_for_file("/dev/jitterentropy")
             out = machine.succeed("cat /proc/jitterentropy/config/flags")
             assert "max memory size: auto" in " ".join(out.split()), out
 
-            # max_instances=0 keeps the unbounded behaviour of before.
+            # max_instances=0 keeps the unbounded behaviour of before. Three
+            # hundred instances of the 32 MB the machine configuration pins
+            # are ten gigabytes, so this case pins 512 kB instead - the size
+            # the L1 derivation arrives at without cache_all, and small
+            # enough that three hundred of them fit. What is unbounded here
+            # is the instance count; the size has its own case above.
             machine.succeed("rmmod jitter_rng")
-            machine.succeed("modprobe jitter_rng max_instances=0 cache_all=0")
+            machine.succeed(
+                "modprobe jitter_rng max_instances=0 cache_all=0 max_memsize=512"
+            )
             machine.wait_for_file("/dev/jitterentropy")
             print(machine.succeed(
                 "python3 /etc/jitterentropy-maxinstances-test.py 0 300"
