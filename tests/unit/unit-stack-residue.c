@@ -301,13 +301,25 @@ static size_t sr_reach(void)
 }
 
 /*
- * What the three controls below establish, before any entry point is
+ * What the four controls below establish, before any entry point is
  * examined.
  */
 static int sr_wipe_measurable;
 static size_t sr_observable_run;
 static size_t sr_control_run;
 static size_t sr_alloc_reach;
+static size_t sr_random_reach;
+
+/*
+ * The deepest excursion an entry point makes outside the noise source: the
+ * allocation and the identifier draw, whichever of the two goes further on
+ * this machine. See sr_control_alloc() and sr_control_random().
+ */
+static size_t sr_os_reach(void)
+{
+	return (sr_random_reach > sr_alloc_reach) ? sr_random_reach :
+						    sr_alloc_reach;
+}
 
 static const char sr_unmeasurable[] =
 	"this build writes into the frame after the wipe returns";
@@ -415,14 +427,29 @@ static void sr_control_wipe(void)
 }
 
 /*
+ * The two controls below measure the excursions an entry point makes into the
+ * operating system: the allocation, and the identifier draw. Both go far
+ * below anything the noise source touches, and neither ever held a time
+ * stamp. Only what the noise source reached is the wipe's to cover, so the
+ * band examined below the wipe starts below the deeper of the two where that
+ * is deeper than the wipe - see sr_os_reach(). Nothing else is relaxed by
+ * them: the stamp check still sweeps the whole snapshot, so a time stamp
+ * surviving down among these frames is still a failure.
+ *
+ * Both are one-time costs of a process, paid by whichever call comes first:
+ * Windows brings up the machinery behind these calls on first use and every
+ * later call stays shallow - 4.3 kB against 552 bytes for the allocation
+ * here. So it matters that these run before any entry point does, which is
+ * what main() arranges; measured second, each would report the shallow figure
+ * and leave the deep one to land on an entry point instead.
+ */
+
+/*
  * How deep an allocation alone reaches. Before it samples anything,
  * jent_entropy_collector_alloc() allocates the collector and its memory
- * region, and on Windows that is VirtualAlloc() and VirtualLock(): an
- * excursion into the operating system that goes far below anything the noise
- * source touches - 6.8 kB there against the 1.9 kB the same entry point needs
- * on Linux - and that never held a time stamp. Only what the noise source
- * reached is the wipe's to cover, so the band examined below the wipe starts
- * below this instead where this is deeper.
+ * region, and on Windows that is VirtualAlloc(), VirtualProtect() and
+ * VirtualLock() - 4.3 kB there against the 1.9 kB the same entry point needs
+ * on Linux.
  *
  * jent_entropy_collector_alloc_internal() is that allocation without the
  * startup ladder on top. It is reached two frames shallower here than the
@@ -446,6 +473,33 @@ static void sr_control_alloc(void)
 
 	if (ec)
 		jent_entropy_collector_free(ec);
+}
+
+/*
+ * How deep the identifier draw reaches. jent_entropy_collector_alloc() ends
+ * by drawing the per-instance UUID, and those sixteen bytes come from the
+ * operating system's CSPRNG rather than from the noise source - see
+ * jent_os_random_bytes() in arch/jitterentropy-arch-random.c. On Windows that
+ * is BCryptGenRandom(), whose first call in a process stands up the
+ * system-preferred provider and descends 6.7 kB: past what the noise source
+ * touches, and past the 4096 the wipe covers, so it is what the band below
+ * the wipe has to start under there. On Linux the same draw is a getrandom()
+ * syscall and reaches nowhere near as far.
+ *
+ * jent_uuid_generate() rather than the entry point, for the same reason
+ * sr_control_alloc() calls the internal allocation: the entry point is what
+ * this places the band for, and a control that ran it would have nothing left
+ * to measure it against.
+ */
+static void sr_control_random(void)
+{
+	char uuid[JENT_UUID_STRLEN];
+
+	sr_paint_below();
+	jent_uuid_generate(uuid);
+	SR_SNAPSHOT();
+
+	sr_random_reach = sr_reach();
 }
 
 /*
@@ -480,12 +534,12 @@ static void sr_check(const char *what, const char *entry)
 
 	/*
 	 * Where the band below the wipe begins: clear of the wipe's own
-	 * frames, and clear of the allocation's reach where that is deeper -
-	 * see sr_control_alloc().
+	 * frames, and clear of the operating system excursions where those
+	 * are deeper - see sr_control_alloc() and sr_control_random().
 	 */
 	below = bottom + SR_BELOW;
-	if (sr_alloc_reach + SR_BELOW > below)
-		below = sr_alloc_reach + SR_BELOW;
+	if (sr_os_reach() + SR_BELOW > below)
+		below = sr_os_reach() + SR_BELOW;
 	if (below + SR_UNTOUCHED_LEN >= SR_SLAB)
 		below = SR_SLAB - SR_UNTOUCHED_LEN - 1;
 
@@ -512,9 +566,9 @@ static void sr_check(const char *what, const char *entry)
 		       "frame\n", lo, hi);
 	if (beyond)
 		printf("    the path reached %zu bytes below the entry frame, "
-		       "past the %u the wipe covers and the %zu an allocation "
-		       "alone reaches\n",
-		       beyond_hi, JENT_STACK_SCRUB_LEN, sr_alloc_reach);
+		       "past the %u the wipe covers and the %zu the operating "
+		       "system excursions reach\n",
+		       beyond_hi, JENT_STACK_SCRUB_LEN, sr_os_reach());
 
 	JENT_UT_EQ(nonzero, 0, what);
 	JENT_UT_EQ(stamps, 0, what);
@@ -751,19 +805,26 @@ int main(void)
 
 	/*
 	 * The controls first: they establish what this build lets the checks
-	 * below see and what an allocation costs on this machine, and neither
-	 * runs a startup - the deepest run a process makes is its first
-	 * jent_entropy_init(), and that one belongs to the test after them.
+	 * below see, and what an allocation and an identifier draw cost on
+	 * this machine. None of them runs a startup - the deepest run a
+	 * process makes is its first jent_entropy_init(), and that one belongs
+	 * to the test after them.
+	 *
+	 * Being first is what the last two are owed: the excursions they
+	 * measure are one-time costs of the process, and a control that ran
+	 * second would measure the warm call and leave the cold one to be
+	 * charged to an entry point.
 	 */
 	sr_control_observable();
 	sr_control_wipe();
 	sr_control_alloc();
+	sr_control_random();
 
 	printf("the controls: a wipe of the test's own leaves a run of %zu and "
 	       "the library's leaves %zu, where %u is written; an allocation "
-	       "alone reaches %zu bytes down\n",
+	       "alone reaches %zu bytes down and an identifier draw %zu\n",
 	       sr_observable_run, sr_control_run, JENT_STACK_SCRUB_LEN,
-	       sr_alloc_reach);
+	       sr_alloc_reach, sr_random_reach);
 	if (!sr_wipe_measurable)
 		printf("  %s, so what is found in that frame afterwards is "
 		       "not the library's to answer for\n", sr_unmeasurable);
