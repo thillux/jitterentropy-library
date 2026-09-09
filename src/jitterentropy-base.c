@@ -46,8 +46,9 @@
 /*
  * GCC and Clang define __OPTIMIZE__ at every level above -O0, so this refuses
  * an optimized build of the noise source outright. MSVC defines no such macro:
- * there the same requirement is enforced by the pragma in
- * jitterentropy-internal.h and by CMakeLists.txt refusing /GL.
+ * there the same requirement is enforced by the pragma and JENT_NOINLINE in
+ * jitterentropy-internal.h and by CMakeLists.txt supplying /Ob0 and refusing
+ * /GL.
  */
 #ifdef __OPTIMIZE__
  #error "The CPU Jitter random number generator must not be compiled with optimizations. See documentation. Use the compiler switch -O0 for compiling jitterentropy.c."

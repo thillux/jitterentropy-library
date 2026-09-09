@@ -58,7 +58,8 @@ static inline int jent_notime_settick(struct rand_data *ec)
 
 static inline void jent_notime_unsettick(struct rand_data *ec) { (void)ec; }
 
-static inline void jent_get_nstime_internal(struct rand_data *ec, uint64_t *out)
+static inline JENT_NOINLINE
+void jent_get_nstime_internal(struct rand_data *ec, uint64_t *out)
 {
 	(void)ec;
 	jent_get_nstime(out);

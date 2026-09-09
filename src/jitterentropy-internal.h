@@ -72,23 +72,48 @@
  * takes the last one - a property of one build system's flag order, which any
  * other build of these sources would not have.
  *
- * Here the property is made intrinsic to the source instead. The pragma turns
- * off every optimization for every function defined after it, in every
- * translation unit that includes this header: wider than the noise source,
- * but MSVC builds are hosted and built /Od throughout, so nothing is lost.
- * Where GCC and Clang reject an optimized build, MSVC now cannot produce one.
+ * Here the property is made intrinsic to the source as far as it can be. The
+ * pragma turns off the optimizations - the g, s, t and y of /O - for every
+ * function defined after it, in every translation unit that includes this
+ * header: wider than the noise source, but MSVC builds are hosted and built
+ * /Od throughout, so nothing is lost.
+ *
+ * What it does not turn off is inline expansion. /Ob is none of g, s, t or y,
+ * and measured on MSVC 14.44 a build at /O2 with this pragma alone keeps
+ * every loop and every function but still folds the small helpers into their
+ * callers - the time stamp read, jent_delta(), jent_udiv64(), the rotate of
+ * the memory access PRNG - so that the instruction stream the timing runs
+ * over is not the /Od one. JENT_NOINLINE below marks those helpers, which
+ * makes the measured path stand on its own; /Ob0 on the command line, which
+ * CMakeLists.txt supplies, is what makes the rest of the build the /Od one
+ * (the memcpy intrinsic aside). A build system of its own has to add /Ob0
+ * itself: the pragma plus /Ob0 is the MSVC spelling of -O0, and neither half
+ * is it alone.
  *
  * clang-cl is left out: it defines __OPTIMIZE__ as Clang does and takes the
  * #error path, and it ignores this pragma with a warning.
  *
- * Not a complete answer on its own. Under /GL the compiler emits no machine
- * code at all and code generation is deferred to the linker (/LTCG), where
- * whether this pragma holds is not something the compile step can witness.
+ * Nor does the pragma reach /GL. Under it the compiler emits no machine code
+ * at all and code generation is deferred to the linker (/LTCG), where whether
+ * the pragma holds is not something the compile step can witness.
  * CMakeLists.txt refuses /GL, /LTCG and CMAKE_INTERPROCEDURAL_OPTIMIZATION on
  * MSVC for that reason; a build system of its own has to do the same.
  */
 #if defined(_MSC_VER) && !defined(__clang__)
 # pragma optimize("", off)
+#endif
+
+/*
+ * The helpers on the measured path that MSVC would otherwise expand inline
+ * whatever the pragma says - see above. MSVC only: GCC and Clang expand
+ * nothing at -O0, which the #error in jitterentropy-base.c holds them to, and
+ * the kernel spells its own inline attributes, so an attribute added here
+ * would only be something to conflict with there.
+ */
+#if defined(_MSC_VER) && !defined(__clang__)
+# define JENT_NOINLINE	__declspec(noinline)
+#else
+# define JENT_NOINLINE
 #endif
 
 #ifdef LINUX_KERNEL
@@ -160,12 +185,14 @@ struct rand_data *jent_entropy_collector_alloc_raw(unsigned int osr,
  * div64 primitives instead. On 64-bit kernels both primitives are inline
  * plain divisions, so code generation there is identical to the operators.
  */
-static inline uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
+static inline JENT_NOINLINE
+uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
 {
 	return div64_u64(dividend, divisor);
 }
 
-static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
+static inline JENT_NOINLINE
+uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 {
 	uint64_t rem;
 
@@ -203,12 +230,14 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
  * above for the rationale. Userspace links against libgcc (or an
  * equivalent), so the plain operators are used directly.
  */
-static inline uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
+static inline JENT_NOINLINE
+uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
 {
 	return dividend / divisor;
 }
 
-static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
+static inline JENT_NOINLINE
+uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 {
 	return dividend % divisor;
 }

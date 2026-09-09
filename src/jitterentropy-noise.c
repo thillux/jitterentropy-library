@@ -162,12 +162,14 @@ static void jent_hash_loop(struct rand_data *ec,
 	jent_memset_secure(&ctx, JENT_SHA_MAX_CTX_SIZE);
 }
 
-static inline uint32_t uint32rotl(const uint32_t x, int k)
+static inline JENT_NOINLINE
+uint32_t uint32rotl(const uint32_t x, int k)
 {
 	return (x << k) | (x >> (32 - k));
 }
 
-static inline uint32_t xoshiro128starstar(uint32_t *s)
+static inline JENT_NOINLINE
+uint32_t xoshiro128starstar(uint32_t *s)
 {
 	const uint32_t result = uint32rotl(s[1] * 5, 7) * 9;
 	const uint32_t t = s[1] << 9;
