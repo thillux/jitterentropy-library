@@ -423,6 +423,13 @@ ssize_t jent_read_entropy(struct rand_data *ec, char *data, size_t len)
 		return JENT_ERR_EINVAL;
 
 	/*
+	 * Nothing asked for, nothing done: no counting thread is started for
+	 * it, and it is not counted as a read the collector answered.
+	 */
+	if (!len)
+		return 0;
+
+	/*
 	 * (hypothetical) edge case: clamp to ssize_t range to prevent
 	 * negative return on cast
 	 */
@@ -465,7 +472,8 @@ ssize_t jent_read_entropy(struct rand_data *ec, char *data, size_t len)
 			goto err;
 		}
 
-		if ((health_test_result = jent_health_failure(ec))) {
+		health_test_result = jent_health_failure(ec);
+		if (health_test_result) {
 			ret = jent_health_failure_code(health_test_result);
 			goto err;
 		}
@@ -1350,7 +1358,8 @@ int jent_time_entropy_init(unsigned int osr, unsigned int flags)
 	}
 
 	/* First, did we encounter a health test failure? */
-	if ((health_test_result = jent_health_failure(ec))) {
+	health_test_result = jent_health_failure(ec);
+	if (health_test_result) {
 		/*
 		 * A permanent RCT failure only sets
 		 * JENT_RCT_FAILURE_PERMANENT, not the intermittent bit, so both
