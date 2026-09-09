@@ -58,7 +58,10 @@
  *   - AWSLC         -> OPENSSL_malloc / OPENSSL_free (auto-wipe)
  *   - OPENSSL       -> OPENSSL_secure_malloc / OPENSSL_secure_free
  *   - Windows       -> VirtualAlloc + VirtualLock with PAGE_NOACCESS guard
- *                      pages around the payload
+ *                      pages around the payload; also excluded from the crash
+ *                      dumps Windows Error Reporting writes, via
+ *                      WerRegisterExcludedMemoryBlock() where the release
+ *                      has it (Windows 10 1709 and later), best effort
  *   - Linux/BSD/Mac -> mmap + mlock with PROT_NONE guard pages around the
  *                      payload; also excluded from core dumps via
  *                      madvise(MADV_DONTDUMP) on Linux and MADV_NOCORE on

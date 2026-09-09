@@ -254,6 +254,72 @@ static size_t jent_pagesize(void)
 	GetSystemInfo(&si);
 	return si.dwPageSize;
 }
+
+/*
+ * Exclusion of the state from crash dumps: the counterpart of the madvise()
+ * on the POSIX path below. WerRegisterExcludedMemoryBlock() keeps a block out
+ * of the minidump Windows Error Reporting writes for a faulting process, which
+ * would otherwise carry the entropy pool and the conditioning state to disk.
+ *
+ * It exists from Windows 10 1709 on and is resolved at run time rather than
+ * linked, so the same binary runs on the releases before it - there the
+ * exclusion is simply not available, as MADV_DONTDUMP is not on an old kernel
+ * - and no import library has to be named on every build system. Best effort,
+ * as on the POSIX path: a refusal does not fail the allocation.
+ *
+ * Unlike the madvise() state, which munmap() drops with the mapping, the
+ * registration outlives VirtualFree() in a fixed-size per-process table, so
+ * jent_zfree() unregisters before it releases.
+ *
+ * Resolved once and published through the atomic accessors, as the other
+ * process-wide memos are: two threads allocating at once would otherwise race
+ * on the cached pointers.
+ */
+typedef HRESULT (WINAPI *jent_wer_exclude_fn)(const void *, DWORD);
+typedef HRESULT (WINAPI *jent_wer_include_fn)(const void *);
+
+static jent_fnptr jent_wer_exclude;
+static jent_fnptr jent_wer_include;
+static int jent_wer_resolved;
+
+static void jent_wer_resolve(void)
+{
+	HMODULE k32;
+
+	if (jent_atomic_load_int(&jent_wer_resolved))
+		return;
+
+	k32 = GetModuleHandleW(L"kernel32.dll");
+	if (k32) {
+		jent_atomic_store_fnptr(&jent_wer_exclude,
+			(jent_fnptr)(uintptr_t)GetProcAddress(
+				k32, "WerRegisterExcludedMemoryBlock"));
+		jent_atomic_store_fnptr(&jent_wer_include,
+			(jent_fnptr)(uintptr_t)GetProcAddress(
+				k32, "WerUnregisterExcludedMemoryBlock"));
+	}
+	jent_atomic_store_int(&jent_wer_resolved, 1);
+}
+
+static void jent_wer_exclude_block(const void *p, size_t len)
+{
+	jent_wer_exclude_fn fn;
+
+	jent_wer_resolve();
+	fn = (jent_wer_exclude_fn)(uintptr_t)
+		jent_atomic_load_fnptr(&jent_wer_exclude);
+	if (fn && len <= (size_t)MAXDWORD)
+		(void)fn(p, (DWORD)len);
+}
+
+static void jent_wer_include_block(const void *p)
+{
+	jent_wer_include_fn fn = (jent_wer_include_fn)(uintptr_t)
+		jent_atomic_load_fnptr(&jent_wer_include);
+
+	if (fn)
+		(void)fn(p);
+}
 #endif /* JENT_ARCH_MEM_WINDOWS */
 
 #ifdef JENT_ARCH_MEM_POSIX_MLOCK
@@ -436,6 +502,9 @@ void *jent_zalloc(size_t len, unsigned int flags)
 			VirtualFree(base, 0, MEM_RELEASE);
 			return NULL;
 		}
+
+		/* Kept out of the crash dump - see jent_wer_exclude_block(). */
+		jent_wer_exclude_block(tmp, payload);
 	}
 
 #elif defined(JENT_ARCH_MEM_POSIX_MLOCK)
@@ -628,6 +697,13 @@ void jent_zfree(void *ptr, size_t len)
 		size_t payload = (len + page_size - 1) & ~(page_size - 1);
 		uint8_t *base = (uint8_t *)ptr - page_size;
 
+		/*
+		 * Before the release: the registration is not tied to the
+		 * mapping and would otherwise stay in the process's table,
+		 * which is of fixed size, for an address that may be handed
+		 * out again.
+		 */
+		jent_wer_include_block(ptr);
 		VirtualUnlock(ptr, payload);
 		VirtualFree(base, 0, MEM_RELEASE);
 	}
