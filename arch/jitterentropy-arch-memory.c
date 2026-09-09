@@ -261,6 +261,14 @@ static size_t jent_pagesize(void)
  * of the minidump Windows Error Reporting writes for a faulting process, which
  * would otherwise carry the entropy pool and the conditioning state to disk.
  *
+ * One writer, not all of them. The exclusion is honored by WerFault.exe's own
+ * collection; MiniDumpWriteDump() does not consult it, measured with a
+ * registered block that came back S_OK and appeared in the dump all the same.
+ * So a dump taken by procdump, by Task Manager, by Crashpad or Breakpad, or by
+ * a SetUnhandledExceptionFilter() handler of the process's own still holds
+ * the state. That is narrower than MADV_DONTDUMP, which covers every core the
+ * Linux kernel writes, and there is no wider mechanism to ask for.
+ *
  * It exists from Windows 10 1709 on and is resolved at run time rather than
  * linked, so the same binary runs on the releases before it - there the
  * exclusion is simply not available, as MADV_DONTDUMP is not on an old kernel

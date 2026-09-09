@@ -61,7 +61,13 @@
  *                      pages around the payload; also excluded from the crash
  *                      dumps Windows Error Reporting writes, via
  *                      WerRegisterExcludedMemoryBlock() where the release
- *                      has it (Windows 10 1709 and later), best effort
+ *                      has it (Windows 10 1709 and later), best effort. That
+ *                      is one dump writer, WerFault.exe: MiniDumpWriteDump()
+ *                      does not consult the exclusion - a dump taken by
+ *                      procdump, Task Manager, Crashpad or a handler of the
+ *                      process's own still holds the state. Narrower than
+ *                      MADV_DONTDUMP, which covers every core the kernel
+ *                      writes.
  *   - Linux/BSD/Mac -> mmap + mlock with PROT_NONE guard pages around the
  *                      payload; also excluded from core dumps via
  *                      madvise(MADV_DONTDUMP) on Linux and MADV_NOCORE on
