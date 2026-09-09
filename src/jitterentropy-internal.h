@@ -62,6 +62,35 @@
 #include "arch/jitterentropy-arch-random.h"
 #include "jitterentropy-uuid.h"
 
+/*
+ * The entropy core must be compiled without optimization - the #error on
+ * __OPTIMIZE__ in jitterentropy-base.c is what refuses anything else. That
+ * macro is GCC's and Clang's; MSVC defines no macro that says whether it is
+ * optimizing, so the check cannot fire there, and cl /O2 compiled the noise
+ * source clean. The shipped MSVC build was unoptimized only because
+ * CMakeLists.txt appended /Od after the /O2 of the configuration flags and cl
+ * takes the last one - a property of one build system's flag order, which any
+ * other build of these sources would not have.
+ *
+ * Here the property is made intrinsic to the source instead. The pragma turns
+ * off every optimization for every function defined after it, in every
+ * translation unit that includes this header: wider than the noise source,
+ * but MSVC builds are hosted and built /Od throughout, so nothing is lost.
+ * Where GCC and Clang reject an optimized build, MSVC now cannot produce one.
+ *
+ * clang-cl is left out: it defines __OPTIMIZE__ as Clang does and takes the
+ * #error path, and it ignores this pragma with a warning.
+ *
+ * Not a complete answer on its own. Under /GL the compiler emits no machine
+ * code at all and code generation is deferred to the linker (/LTCG), where
+ * whether this pragma holds is not something the compile step can witness.
+ * CMakeLists.txt refuses /GL, /LTCG and CMAKE_INTERPROCEDURAL_OPTIMIZATION on
+ * MSVC for that reason; a build system of its own has to do the same.
+ */
+#if defined(_MSC_VER) && !defined(__clang__)
+# pragma optimize("", off)
+#endif
+
 #ifdef LINUX_KERNEL
 /*
  * Kernel div64 primitives backing jent_udiv64()/jent_umod64() below. The
