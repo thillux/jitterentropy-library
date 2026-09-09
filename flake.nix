@@ -721,12 +721,17 @@
             out = machine.succeed("cat /proc/jitterentropy/config/flags")
             assert "max memory size: auto" in " ".join(out.split()), out
 
-            # max_instances=0 keeps the unbounded behaviour of before. Three
-            # hundred instances of the 32 MB the machine configuration pins
-            # are ten gigabytes, so this case pins 512 kB instead - the size
-            # the L1 derivation arrives at without cache_all, and small
-            # enough that three hundred of them fit. What is unbounded here
-            # is the instance count; the size has its own case above.
+            # An oversampling rate above the maximum refuses the load; the
+            # NTG.1 ceiling itself loads and generates.
+            machine.succeed("rmmod jitter_rng")
+            machine.fail("modprobe jitter_rng osr=100")
+            machine.succeed("modprobe jitter_rng osr=20")
+            machine.wait_for_file("/dev/jitterentropy")
+            machine.succeed("test \"$(cat /proc/jitterentropy/config/osr)\" = 20")
+            machine.succeed("test \"$(head -c 32 /dev/jitterentropy | wc -c)\" = 32")
+
+            # max_instances=0 is unbounded. 512 kB per instance, so that
+            # three hundred fit into the VM.
             machine.succeed("rmmod jitter_rng")
             machine.succeed(
                 "modprobe jitter_rng max_instances=0 cache_all=0 max_memsize=512"

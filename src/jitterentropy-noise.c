@@ -580,11 +580,16 @@ static void jent_random_data_one(
 	 *
 	 * Safety measure against wrapping: compute in 64 bits and verify the
 	 * count fits the unsigned short window counters and covers at least
-	 * one output block. With the default JENT_MAX_OSR of 20 this cannot
-	 * trigger, but JENT_MAX_OSR is a compile-time tunable and a truncated
-	 * count would silently shrink the RCT-with-memory window below what
-	 * the cutoff tables assume, disabling the health test.
+	 * one output block. A truncated count would silently shrink the
+	 * RCT-with-memory window below what the cutoff tables assume,
+	 * disabling the health test. The build assertion keeps JENT_MAX_OSR
+	 * within that width (204 with the safety factor), so this branch only
+	 * guards the arithmetic.
 	 */
+	JENT_BUILD_BUG_ON(JENT_MEASURE_JITTER_LOOP_CTR(JENT_MAX_OSR,
+						       ENTROPY_SAFETY_FACTOR)
+			  + 2 > USHRT_MAX);
+
 	nosr = JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR((uint64_t)ec->osr,
 						     safety_factor);
 	if (nosr > USHRT_MAX || nosr < DATA_SIZE_BITS) {
@@ -679,11 +684,16 @@ void jent_random_data(struct rand_data *ec)
 
 		/*
 		 * Initialize the health tests as we fall through to
-		 * independently invoke the next noise source.
+		 * independently invoke the next noise source. It refuses only
+		 * a rate the cutoff tables do not cover, which the allocation
+		 * already rejects.
 		 */
-		jent_health_init(ec, ec->flags & JENT_NTG1 ?
-				     jent_health_init_type_ntg1 :
-				     jent_health_init_type_common);
+		if (jent_health_init(ec, ec->flags & JENT_NTG1 ?
+					 jent_health_init_type_ntg1 :
+					 jent_health_init_type_common)) {
+			ec->noise_stopped = 1;
+			return;
+		}
 
 		JENT_FALLTHROUGH;
 	case jent_startup_sha3:
@@ -692,11 +702,16 @@ void jent_random_data(struct rand_data *ec)
 
 		/*
 		 * Initialize the health tests as we fall through to
-		 * independently invoke the next noise source.
+		 * independently invoke the next noise source. It refuses only
+		 * a rate the cutoff tables do not cover, which the allocation
+		 * already rejects.
 		 */
-		jent_health_init(ec, ec->flags & JENT_NTG1 ?
-				     jent_health_init_type_ntg1 :
-				     jent_health_init_type_common);
+		if (jent_health_init(ec, ec->flags & JENT_NTG1 ?
+					 jent_health_init_type_ntg1 :
+					 jent_health_init_type_common)) {
+			ec->noise_stopped = 1;
+			return;
+		}
 
 		break;
 	case jent_startup_completed:

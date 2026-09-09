@@ -204,7 +204,20 @@ lower than
 .B JENT_MIN_OSR
 is converted to
 .B JENT_MIN_OSR
-automatically.
+automatically. A value above
+.B JENT_MAX_OSR
+\- 20 in a default build \- is refused with a NULL return instead. The
+health test cutoffs are tabulated per oversampling rate; those tables
+reach 64, which is how far the maximum can be raised at compile time.
+The compliance modes keep ceilings of their own,
+.B JENT_MAX_OSR_FIPS
+and
+.B JENT_MAX_OSR_NTG1
+(both 20), and an allocation asking for
+.B JENT_NTG1
+or
+.B JENT_FORCE_FIPS
+is held to them however high the maximum was raised.
 .LP
 The
 .IR flags

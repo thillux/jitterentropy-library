@@ -91,6 +91,25 @@ jobs:
               echo "::warning::jitterentropy-rng $opt failed on this machine"
           done
 
+  linux-raised-osr:
+    name: Linux / gcc / JENT_MAX_OSR=64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The cutoff tables reach OSR 64, the default JENT_MAX_OSR is 20: the
+      # only job building the entries above 20.
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_C_FLAGS="-DJENT_MAX_OSR=64"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Run tests
+        run: |
+          ctest --test-dir build --output-on-failure -LE unreliable
+          ./build/tests/health/jitterentropy-health 64
+
   linux-musl:
     name: Linux / musl-gcc / ${{ matrix.link }}
     runs-on: ubuntu-latest

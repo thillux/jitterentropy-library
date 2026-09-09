@@ -320,7 +320,8 @@ static void test_startup_states(void)
 	 * truncated - a truncated count would silently shrink the
 	 * RCT-with-memory window below what its cutoff table assumes and
 	 * disable the test. Not reachable through the API, where JENT_MAX_OSR
-	 * bounds it, but it is what guards a raised JENT_MAX_OSR.
+	 * bounds it; this is the arithmetic behind the build assertion that
+	 * caps JENT_MAX_OSR.
 	 */
 	ec->startup_state = jent_startup_completed;
 	ec->osr = 60000;

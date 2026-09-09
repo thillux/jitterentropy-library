@@ -58,6 +58,12 @@ Compilation:
 The module offers the following load-time parameters:
 
 * `osr`: OSR applied to all Jitter RNG instances (0 selects the default).
+  The library accepts `JENT_MIN_OSR` to `JENT_MAX_OSR`, 3 to 20 in a
+  default build: a lower value is raised to the minimum, a higher one is
+  refused and takes the module load with it. The compliance modes have
+  ceilings of their own, `JENT_MAX_OSR_FIPS` and `JENT_MAX_OSR_NTG1`, so
+  `ntg1=1` or a fips=1 kernel is held to 20 whatever `JENT_MAX_OSR` was
+  built as.
 
 * `flags`: numeric flags value applied to all Jitter RNG instances, using the
   `JENT_*` flag bits from `jitterentropy.h`.

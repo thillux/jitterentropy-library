@@ -74,9 +74,9 @@ APT_WINDOW_SIZE = 512
 LAG_WINDOW_SIZE = 1 << 17
 LAG_HISTORY_SIZE = 8
 
-# JENT_MAX_OSR, the highest oversampling rate the library accepts: every
-# table covers 1 up to it, which a build assertion in the source enforces.
-MAX_OSR = 20
+# JENT_HEALTH_CUTOFF_TABLE_OSR: every table covers 1 up to it, and
+# JENT_MAX_OSR may be raised no further (both asserted in the source).
+MAX_OSR = 64
 
 # The 8-fold entropy margin of NTG.1 operation.
 NTG1_MARGIN = 8

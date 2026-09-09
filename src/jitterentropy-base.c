@@ -187,6 +187,29 @@ static inline unsigned int jent_update_memsize(unsigned int flags,
 	return flags;
 }
 
+/*
+ * The highest oversampling rate a collector with these flags may run at: the
+ * library's maximum, lowered to the ceiling of each compliance mode the flags
+ * ask for.
+ */
+static inline unsigned int jent_max_osr(unsigned int flags)
+{
+	unsigned int max = JENT_MAX_OSR;
+
+	if (JENT_MAX_OSR_NTG1 < max && (flags & JENT_NTG1))
+		max = JENT_MAX_OSR_NTG1;
+
+	/*
+	 * Ceiling first, so that with the default constants the compiler
+	 * drops the jent_fips_enabled() call.
+	 */
+	if (JENT_MAX_OSR_FIPS < max &&
+	    ((flags & JENT_FORCE_FIPS) || jent_fips_enabled()))
+		max = JENT_MAX_OSR_FIPS;
+
+	return max;
+}
+
 static inline unsigned int jent_update_hashloop(unsigned int flags,
 						unsigned int inc)
 {
@@ -476,13 +499,16 @@ static int jent_health_failure_reset(
 							  unsigned int flags))
 {
 	struct rand_data *new_ec;
-	unsigned int osr, flags;
+	unsigned int osr, flags, max_osr;
 
 	/* Increment OSR */
 	osr = (*ec)->osr + 1;
 
 	/* Remember flags value */
 	flags = (*ec)->flags;
+
+	/* In a compliance mode, that mode's ceiling. */
+	max_osr = jent_max_osr(flags);
 
 	/*
 	 * A compliance mode does not change its noise source underneath the
@@ -504,7 +530,7 @@ static int jent_health_failure_reset(
 	 * cannot change for this collector, so it is remembered for
 	 * jent_read_entropy_safe().
 	 */
-	if (osr > JENT_MAX_OSR) {
+	if (osr > max_osr) {
 		(*ec)->recovery_exhausted = 1;
 		return -1;
 	}
@@ -526,7 +552,7 @@ static int jent_health_failure_reset(
 	/* Perform new health test with updated OSR */
 	while (jent_entropy_init_ex(osr, flags)) {
 		osr++;
-		if (osr > JENT_MAX_OSR)
+		if (osr > max_osr)
 			return -1;
 	}
 
@@ -670,28 +696,14 @@ ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 			 *
 			 * If we fail here, the Jitter RNG returns the error.
 			 *
-			 * This loop bounds neither how many reallocations one
-			 * call makes nor what they cost: a replacement that
-			 * fails again is replaced again, up to JENT_MAX_OSR,
-			 * and every step pays a power-on test and a startup at
-			 * a raised oversampling rate over a memory region
-			 * twice the size - seconds per step at the upper end,
-			 * a few minutes for a whole ladder, in one call that
-			 * no caller can interrupt.
-			 *
-			 * That is intended. The health tests report in the
-			 * compliance modes alone, where the platform is
-			 * validated before it is deployed and the oversampling
-			 * rate is chosen high enough that production never
-			 * walks this ladder. Walking it far says the rate was
-			 * chosen too low, and giving up earlier would only
-			 * hide that behind an error the caller can do no more
-			 * with. What the ladder reaches is bounded elsewhere:
-			 * a caller-pinned memory size stops the doubling (see
-			 * max_mem_set in jent_health_failure_reset()), and the
-			 * state it leaves behind is remembered rather than
-			 * recomputed on every later read (->recovery_exhausted
-			 * above).
+			 * One call may walk the whole reallocation ladder up
+			 * to the maximum oversampling rate, each rung a full
+			 * startup over a doubled memory region - minutes in
+			 * the worst case. That is intended: the health tests
+			 * report only in the compliance modes, whose platform
+			 * validation picks a rate production never needs to
+			 * raise, and giving up earlier would only hide that
+			 * it was picked too low.
 			 */
 			if (jent_health_failure_reset(
 				ec, _jent_entropy_collector_alloc)) {
@@ -787,11 +799,17 @@ static struct rand_data
 
 	/*
 	 * Enforce the invariants of the compile-time tunable OSR bounds: the
-	 * health-test lookup tables are indexed with osr - 1, and an empty
-	 * [JENT_MIN_OSR, JENT_MAX_OSR] range would make every allocation fail.
+	 * health-test lookup tables are indexed with osr - 1 and must reach
+	 * JENT_MAX_OSR, and neither the [JENT_MIN_OSR, JENT_MAX_OSR] range
+	 * nor that of a compliance mode may be empty.
 	 */
 	JENT_BUILD_BUG_ON(JENT_MIN_OSR < 1);
 	JENT_BUILD_BUG_ON(JENT_MIN_OSR > JENT_MAX_OSR);
+	JENT_BUILD_BUG_ON(JENT_MAX_OSR > JENT_HEALTH_CUTOFF_TABLE_OSR);
+	JENT_BUILD_BUG_ON(JENT_MAX_OSR_FIPS > JENT_MAX_OSR);
+	JENT_BUILD_BUG_ON(JENT_MAX_OSR_NTG1 > JENT_MAX_OSR);
+	JENT_BUILD_BUG_ON(JENT_MIN_OSR > JENT_MAX_OSR_FIPS);
+	JENT_BUILD_BUG_ON(JENT_MIN_OSR > JENT_MAX_OSR_NTG1);
 
 	/*
 	 * Requesting disabling and forcing of internal timer
@@ -807,9 +825,9 @@ static struct rand_data
 	osr = ensure_osr_is_at_least_minimal(osr);
 
 	/*
-	 * Reject too high OSR
+	 * Reject too high OSR, including above a compliance mode's ceiling.
 	 */
-	if (osr > JENT_MAX_OSR)
+	if (osr > jent_max_osr(flags))
 		return NULL;
 
 	/* Force the self test to be run */
@@ -904,10 +922,14 @@ static struct rand_data
 		entropy_collector->is_fips_enabled = 1;
 	}
 
-	/* Initialize the health tests */
-	jent_health_init(entropy_collector, flags & JENT_NTG1 ?
-					    jent_health_init_type_ntg1 :
-					    jent_health_init_type_common);
+	/*
+	 * Initialize the health tests, which refuse an oversampling rate
+	 * their cutoff tables do not cover.
+	 */
+	if (jent_health_init(entropy_collector, flags & JENT_NTG1 ?
+					        jent_health_init_type_ntg1 :
+					        jent_health_init_type_common))
+		goto err;
 
 	/*
 	 * Use timer-less noise source - note, OSR must be set in

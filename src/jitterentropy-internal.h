@@ -476,9 +476,19 @@ uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
  * - is instantiated with an OSR of 0 provided to the initialization API
  *
  * During initial health tests or jent_read_entropy_safe, the RNG instance
- * may re-initialize with an incremented OSR, which stops at JENT_OSR_MAX
+ * may re-initialize with an incremented OSR, which stops at JENT_MAX_OSR
  * and returns a failure condition. Otherwise this would run "forever".
- * Set another value instead of the default 20, if necessary.
+ *
+ * JENT_MAX_OSR may be raised up to JENT_HEALTH_CUTOFF_TABLE_OSR, the highest
+ * rate the health test cutoff tables cover; tests/health/cutoffs.py
+ * recomputes them for more. The hard ceiling is 204: one output block takes
+ * (256 + safety factor) * OSR deltas, counted in the unsigned short window
+ * counters of the RCT with memory, which jent_random_data_one() asserts.
+ *
+ * JENT_MAX_OSR_FIPS and JENT_MAX_OSR_NTG1 bound the rate of an instance in
+ * the respective compliance mode, where the compliance analysis stops; an
+ * allocation asking for more there is refused. Both must be at most
+ * JENT_MAX_OSR, which is asserted at build time.
  */
 #ifndef JENT_MIN_OSR
 #define JENT_MIN_OSR	3
@@ -486,6 +496,14 @@ uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 
 #ifndef JENT_MAX_OSR
 #define JENT_MAX_OSR	20
+#endif
+
+#ifndef JENT_MAX_OSR_FIPS
+#define JENT_MAX_OSR_FIPS	20
+#endif
+
+#ifndef JENT_MAX_OSR_NTG1
+#define JENT_MAX_OSR_NTG1	20
 #endif
 
 /***************************************************************************
@@ -633,12 +651,10 @@ struct rand_data
 	unsigned int noise_stopped:1;
 
 	/*
-	 * jent_read_entropy_safe() has given up recovering this collector:
-	 * it is at JENT_MAX_OSR, so the reallocation cannot be attempted
-	 * again, and the health failure that ended the recovery is sticky.
-	 * Every further read would generate an output block only to discard
-	 * it and report the same failure, so the reads report it without
-	 * spending the block. Set by jent_health_failure_reset() alone.
+	 * jent_read_entropy_safe() gave up recovering this collector: it is
+	 * at its highest permitted oversampling rate, so the health failure
+	 * is sticky and reads report it without generating a block. Set by
+	 * jent_health_failure_reset().
 	 */
 	unsigned int recovery_exhausted:1;
 

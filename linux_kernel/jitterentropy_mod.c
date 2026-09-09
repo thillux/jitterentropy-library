@@ -24,6 +24,7 @@
 #include <linux/module.h>
 
 #include "jitterentropy.h"
+#include "jitterentropy-internal.h"	/* JENT_MAX_OSR */
 #include "jitterentropy_chardev.h"
 #include "jitterentropy_compat.h"
 #include "jitterentropy_hwrng.h"
@@ -98,6 +99,17 @@ static int __init jent_mod_init(void)
 		flags |= JENT_FORCE_FIPS;
 	if (cache_all)
 		flags |= JENT_CACHE_ALL;
+
+	/*
+	 * Refused here: jent_entropy_init_ex() would report it as a failed
+	 * startup, which panics a fips=1 kernel over a configuration error. A
+	 * rate below the minimum is raised by the library.
+	 */
+	if (osr > JENT_MAX_OSR) {
+		pr_err("jitterentropy: osr %u is above the maximum of %u\n",
+		       osr, (unsigned int)JENT_MAX_OSR);
+		return -EINVAL;
+	}
 
 	if (max_memsize) {
 		/*
