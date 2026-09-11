@@ -27,6 +27,10 @@ The emulator needs `/dev/kvm`. Set `NIX_ANDROID_EMULATOR_FLAGS=-no-window` to
 run it without a display, then follow the app with
 `adb logcat -s JitterEntropyExample`.
 
+The APK is signed with a debug key generated afresh by every build, so a newer
+build does not install over an older one: `adb uninstall
+de.chronox.jitterentropy.example` first.
+
 The Nix build runs offline, so Gradle cannot fetch the Android Gradle plugin
 itself. `deps.json` locks every file it needs, and Nix serves them to it. After
 changing the plugin version, or anything else Gradle downloads, regenerate the
