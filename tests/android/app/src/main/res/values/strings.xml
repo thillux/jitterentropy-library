@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Jitter RNG</string>
+    <string name="version">Jitter RNG %1$s</string>
+    <string name="show_status">Show status</string>
+    <string name="generate">32 bytes</string>
+    <string name="new_collector">New collector</string>
+    <string name="mode_default">Default</string>
+    <string name="mode_fips">FIPS</string>
+    <string name="mode_ntg1">NTG.1</string>
+    <string name="timer_thread">Timer thread</string>
+    <string name="timer_thread_note">Once a collector passed its power-on tests on the timer thread, every later one uses it too, and NTG.1 is refused until the app restarts.</string>
+</resources>
