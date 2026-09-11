@@ -175,10 +175,12 @@ Please keep the following aspects regarding jitterentropy's usage in mind:
 
 # Android
 
-To compile the code on Android, use the following Makefile:
+The library builds for Android with its `CMakeLists.txt`, included into the
+app's own build. `tests/android` holds an example app that does exactly that,
+with the build commands in its README.
 
-arch/android/Android.mk	-- NDK make file template that can be used to directly
-			   compile the CPU Jitter RNG code into Android binaries
+For ndk-build, `tests/android/Android.mk` compiles the library alone into
+Android binaries.
 
 ## Direct CPU instructions
 

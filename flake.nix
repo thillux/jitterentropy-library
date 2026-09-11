@@ -99,8 +99,17 @@
           cross-mingw32 = crossFor { cross = p.mingw32; };
         };
 
-      # ndk-build over arch/android/Android.mk against the real NDK toolchain,
-      # which is unfree - hence a dedicated nixpkgs instance for this output.
+      # The Android SDK and NDK are unfree - hence a dedicated nixpkgs instance
+      # for the two Android outputs.
+      pkgsAndroidFor = system: import nixpkgs {
+        inherit system;
+        config = {
+          allowUnfree = true;
+          android_sdk.accept_license = true;
+        };
+      };
+
+      # ndk-build over tests/android/Android.mk against the real NDK toolchain.
       #
       # APP_PLATFORM is the NDK's own floor, not this library's: r29 takes API
       # 21 upwards, and nothing the library calls is guarded above that except
@@ -109,13 +118,7 @@
       # branch compiled at all.
       androidFor = system:
         let
-          pkgsAndroid = import nixpkgs {
-            inherit system;
-            config = {
-              allowUnfree = true;
-              android_sdk.accept_license = true;
-            };
-          };
+          pkgsAndroid = pkgsAndroidFor system;
           ndk = (pkgsAndroid.androidenv.composeAndroidPackages {
             includeNDK = true;
           }).ndk-bundle;
@@ -130,7 +133,7 @@
             runHook preBuild
             ndk-build \
               NDK_PROJECT_PATH=null \
-              APP_BUILD_SCRIPT=$(pwd)/arch/android/Android.mk \
+              APP_BUILD_SCRIPT=$(pwd)/tests/android/Android.mk \
               APP_PLATFORM=android-21 \
               APP_ABI="arm64-v8a x86_64" \
               APP_OPTIM=release \
@@ -152,6 +155,106 @@
               "Jitter RNG userspace library built with the Android NDK";
             license = lib.licenses.bsd3;
           };
+        };
+
+      # The example app in tests/android, built by Gradle as an app would be:
+      # the library through its CMakeLists.txt, linked into a JNI library.
+      #
+      # Gradle resolves the Android Gradle plugin from Maven, which the build
+      # sandbox cannot reach. tests/android/deps.json records every file it
+      # fetched, and mitmCache serves them back offline. After changing the
+      # plugin version or anything else Gradle downloads, regenerate it from
+      # the repository root:
+      #
+      #   $(nix build --no-link --print-out-paths \
+      #       .#android-example.mitmCache.updateScript)
+      #
+      # The SDK holds exactly what tests/android/app/build.gradle.kts pins, as
+      # the store is read-only and AGP can install nothing that is missing.
+      androidAppFor = system:
+        let
+          pkgsAndroid = pkgsAndroidFor system;
+          buildTools = "36.1.0";
+          sdk = (pkgsAndroid.androidenv.composeAndroidPackages {
+            platformVersions = [ "36" ];
+            buildToolsVersions = [ buildTools ];
+            cmakeVersions = [ "4.1.2" ];
+            includeNDK = true;
+            ndkVersions = [ "29.0.14206865" ];
+          }).androidsdk;
+          androidHome = "${sdk}/libexec/android-sdk";
+          gradle = pkgsAndroid.gradle_9;
+        in pkgsAndroid.stdenv.mkDerivation (finalAttrs: {
+          pname = "jitterentropy-android-example";
+          version = "3.7.1";
+          src = self;
+
+          nativeBuildInputs = [ gradle ];
+
+          mitmCache = gradle.fetchDeps {
+            pkg = finalAttrs.finalPackage;
+            data = ./tests/android/deps.json;
+            # The update script's sandbox has no /bin, and ninja runs every
+            # command of the native build through /bin/sh. The build sandbox
+            # provides one.
+            bwrapFlags = ''--ro-bind "$PWD" "$PWD" --ro-bind /bin /bin'';
+          };
+
+          env.ANDROID_HOME = androidHome;
+
+          # AGP fetches aapt2 from Maven as a dynamically linked binary that
+          # does not run here; the SDK's copy is patched for the store.
+          gradleFlags = [
+            "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidHome}/build-tools/${buildTools}/aapt2"
+          ];
+          gradleBuildTask = "assembleDebug";
+          # The default, nixDownloadDeps, resolves every configuration of the
+          # app - the androidTest classpaths included, which an application
+          # module cannot resolve against itself. The build fetches what the
+          # build needs.
+          gradleUpdateTask = finalAttrs.gradleBuildTask;
+
+          # For the update script as much as the build, which both run
+          # patchPhase: Gradle runs in the project directory, and AGP writes
+          # its debug keystore below ANDROID_USER_HOME, whose default is in
+          # the unwritable $HOME.
+          postPatch = ''
+            cd tests/android
+            export ANDROID_USER_HOME=$(mktemp -d)
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            install -Dm644 app/build/outputs/apk/debug/app-debug.apk \
+              $out/jitterentropy-example.apk
+            runHook postInstall
+          '';
+
+          meta = {
+            description = "Jitter RNG example app for Android";
+            license = lib.licenses.bsd3;
+            sourceProvenance = with lib.sourceTypes; [
+              fromSource
+              binaryBytecode # the Gradle plugin from mitmCache
+            ];
+          };
+        });
+
+      # `nix run .#android-example-emulator` boots an x86_64 Android emulator,
+      # installs the example app and starts it. It needs /dev/kvm, and a
+      # display unless NIX_ANDROID_EMULATOR_FLAGS=-no-window. The device is
+      # created in a temporary directory, so every run starts from a fresh
+      # one. The script returns once the app is started and leaves the
+      # emulator running.
+      androidEmulatorFor = system: app:
+        (pkgsAndroidFor system).androidenv.emulateApp {
+          name = "jitterentropy-android-example-emulator";
+          inherit app;
+          platformVersion = "36";
+          abiVersion = "x86_64";
+          systemImageType = "default";
+          package = "de.chronox.jitterentropy.example";
+          activity = ".MainActivity";
         };
 
       # rng-tools and ESDM built against this tree. A build of this repository
@@ -1288,6 +1391,9 @@
             efi = efiFor pkgs "x86_64";
             efi-aarch64 = efiFor pkgs "aarch64";
             android = androidFor system;
+            android-example = androidAppFor system;
+            android-example-emulator =
+              androidEmulatorFor system (androidAppFor system);
             # The module for 32-bit x86, built natively through pkgsi686Linux.
             # Reaches the div64 helpers that stand in for the libgcc division
             # routines the kernel does not provide.

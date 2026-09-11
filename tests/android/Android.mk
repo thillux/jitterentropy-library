@@ -18,6 +18,9 @@ include $(CLEAR_VARS)
 
 JENT_ROOT := $(LOCAL_PATH)/../..
 
+# This builds the library alone, for ndk-build users. The example app next to
+# it (see README.md) builds it through CMakeLists.txt instead.
+
 LOCAL_MODULE := jitterentropy
 
 # The entropy collection core must not be optimized (see the __OPTIMIZE__
