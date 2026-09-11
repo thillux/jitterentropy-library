@@ -8,13 +8,13 @@ The app allocates one collector at start-up; one button shows its
 also written to logcat under the tag `JitterEntropyExample`.
 
 - `app/src/main/cpp/jitterentropy-jni.c` - the JNI binding
-- `app/src/main/java/.../JitterEntropy.java` - the Java side of it, one
+- `app/src/main/java/.../JitterEntropy.kt` - the Kotlin side of it, one
   collector per instance
-- `app/src/main/java/.../MainActivity.java` - the UI; every call into the
-  library runs on one background thread
-
-It is plain Java on the framework `Activity`, with no AndroidX or other
-libraries, so the only thing Gradle downloads is the Android Gradle plugin.
+- `app/src/main/java/.../CollectorViewModel.kt` - owns the collector across
+  activity recreation; every call into the library runs on one background
+  thread
+- `app/src/main/java/.../MainActivity.kt` - the UI, in Jetpack Compose with
+  Material 3
 
 ## Building with Nix
 
@@ -31,10 +31,11 @@ The APK is signed with a debug key generated afresh by every build, so a newer
 build does not install over an older one: `adb uninstall
 de.chronox.jitterentropy.example` first.
 
-The Nix build runs offline, so Gradle cannot fetch the Android Gradle plugin
-itself. `deps.json` locks every file it needs, and Nix serves them to it. After
-changing the plugin version, or anything else Gradle downloads, regenerate the
-lock from the repository root:
+The Nix build runs offline, so Gradle cannot fetch the Android Gradle plugin,
+the Compose compiler or the AndroidX libraries itself. `deps.json` locks every
+file it needs, and Nix serves them to it. After changing a plugin or library
+version, or anything else Gradle downloads, regenerate the lock from the
+repository root:
 
 ```
 $(nix build --no-link --print-out-paths .#android-example.mitmCache.updateScript)

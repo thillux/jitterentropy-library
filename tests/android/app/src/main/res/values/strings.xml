@@ -2,9 +2,6 @@
 <resources>
     <string name="app_name">Jitter RNG</string>
     <string name="version">Jitter RNG %1$s</string>
-    <string name="state_allocating">Allocating the entropy collector…</string>
-    <string name="state_ready">Entropy collector allocated</string>
     <string name="show_status">Show status</string>
     <string name="generate">32 bytes</string>
-    <string name="status_failed">jent_status failed</string>
 </resources>

@@ -174,9 +174,9 @@
       androidAppFor = system:
         let
           pkgsAndroid = pkgsAndroidFor system;
-          buildTools = "36.1.0";
+          buildTools = "37.0.0";
           sdk = (pkgsAndroid.androidenv.composeAndroidPackages {
-            platformVersions = [ "36" ];
+            platformVersions = [ "37.0" ];
             buildToolsVersions = [ buildTools ];
             cmakeVersions = [ "4.1.2" ];
             includeNDK = true;
