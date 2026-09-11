@@ -87,7 +87,7 @@ final class Collector: ObservableObject {
             }
 
             /* Do not leave the output behind in the buffer. */
-            buf.withUnsafeMutableBytes { memset_s($0.baseAddress, $0.count, 0, $0.count) }
+            _ = buf.withUnsafeMutableBytes { memset_s($0.baseAddress, $0.count, 0, $0.count) }
 
             NSLog("32 bytes: %@", text)
             self.show(text)

@@ -2,8 +2,15 @@ cmake_minimum_required(VERSION 3.22)
 
 # Configure with the Xcode generator for iOS, see README.md:
 #   cmake -S tests/ios -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS
+# For the app and the library alike.
+set(CMAKE_OSX_DEPLOYMENT_TARGET 15.0 CACHE STRING "")
 project(jitterentropy_example LANGUAGES C Swift)
 
+# CMake probed the C compiler against the iphoneos SDK and would hand its
+# library directories to the Swift link of the app as -L flags, also in a
+# simulator build, where the x86_64 slice then fails to link. Xcode supplies
+# the directories of the SDK it builds with.
+set(CMAKE_C_IMPLICIT_LINK_DIRECTORIES "")
 # The probes of the library's CMakeLists.txt would otherwise link an iOS
 # executable, which Xcode wants signed.
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
@@ -31,7 +38,6 @@ set_target_properties(JitterEntropyExample PROPERTIES
     MACOSX_BUNDLE_BUNDLE_VERSION 1
     MACOSX_BUNDLE_SHORT_VERSION_STRING 1.0
     XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER de.chronox.jitterentropy.example
-    XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET 15.0
     # iPhone and iPad
     XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
     # The C API reaches Swift through this header; the library target
