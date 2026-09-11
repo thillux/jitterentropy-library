@@ -1278,6 +1278,31 @@ jobs:
             }
           done
 
+  # The example app in tests/ios, built for the simulator: no signing needed.
+  ios:
+    name: iOS example app
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S tests/ios -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS
+
+      - name: Build
+        run: |
+          cmake --build build-ios --config Debug -- \
+            -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO
+
+      - name: Check the app
+        run: |
+          app=build-ios/Debug-iphonesimulator/JitterEntropyExample.app
+          test -x "$app/JitterEntropyExample" || {
+            echo "::error::no app binary in $app"
+            exit 1
+          }
+          plutil -p "$app/Info.plist"
+
   makefile:
     name: Makefile / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

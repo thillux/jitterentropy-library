@@ -20,8 +20,8 @@ directories:
 * `efi`: The library as an EFI application, which is the build with no
   operating system under it at all
 
-* `android`: Example app that builds the library into an Android app,
-  allocates a collector and shows its status and 32 bytes of output
+* `android`, `ios`: Example apps that build the library into a mobile app,
+  allocate a collector and show its status and 32 bytes of output
 
 ## Unit tests
 
@@ -354,12 +354,13 @@ such a target, reports success, and hands out something it never measured.
 
 ## Mobile apps
 
-`tests/android` is the library the way an app embeds it: built through its own
-`CMakeLists.txt` as part of the app's build, the tools and the test suite
-switched off. The app allocates one collector at start-up and has two buttons,
-one showing the `jent_status()` document and one generating 32 bytes. All calls
-into the library run on one background thread, as collection is too slow for
-the UI thread and a collector must not be shared between threads.
+`tests/android` and `tests/ios` are the library the way an app embeds it: built
+through its own `CMakeLists.txt` as part of the app's build, the tools and the
+test suite switched off. Each app allocates one collector at start-up and has
+two buttons, one showing the `jent_status()` document and one generating 32
+bytes. All calls into the library run on one background thread or serial
+queue, as collection is too slow for the UI thread and a collector must not be
+shared between threads.
 
 ```
 nix build .#android-example                 # the APK, built by Gradle offline
@@ -367,8 +368,9 @@ nix run .#android-example-emulator          # boot an emulator and start it
 nix build .#android                         # the library alone, by ndk-build
 ```
 
-`tests/android/README.md` says how the Gradle dependencies are locked for the
-offline Nix build and how to refresh them.
+The iOS app needs Xcode and is built on macOS only; `tests/ios/README.md` has
+the commands. `tests/android/README.md` says how the Gradle dependencies are
+locked for the offline Nix build and how to refresh them.
 
 ## The thread sanitizer
 

@@ -173,11 +173,11 @@ Please keep the following aspects regarding jitterentropy's usage in mind:
 * While jitterentropy is a rather fast noise source, don't expect multiple MB/s or GB/s. Use it as seed
   source for another deterministic RNG if such speeds are needed.
 
-# Android
+# Android and iOS
 
-The library builds for Android with its `CMakeLists.txt`, included into the
-app's own build. `tests/android` holds an example app that does exactly that,
-with the build commands in its README.
+The library builds for both with its `CMakeLists.txt`, included into the app's
+own build. `tests/android` and `tests/ios` hold an example app for each that
+does exactly that, with the build commands in their READMEs.
 
 For ndk-build, `tests/android/Android.mk` compiles the library alone into
 Android binaries.
