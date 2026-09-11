@@ -510,13 +510,12 @@ void jent_drbg_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
 /********************************** Selftest **********************************/
 
 /*
- * The SHAKE-256 support is only needed to support the XDRBG. Therefore, it is
- * implicitly self-tested with the XDRBG-256 self test. Yet, this self-test
- * code for SHAKE-256 is left in here to allow implementors to activate it at
- * their discretion. Furthermore it provides an example how to invoke the
- * Keccak operation as a SHAKE-256 for testing and analysis.
+ * The SHAKE-256 support is only needed to support the XDRBG, which already
+ * exercises it. This known-answer test checks SHAKE-256 on its own, so a fault
+ * in the XOF is reported as such rather than only as an XDRBG mismatch.
+ * Furthermore it provides an example how to invoke the Keccak operation as a
+ * SHAKE-256 for testing and analysis.
  */
-#if 0
 static int jent_shake256_tester(void)
 {
 	HASH_CTX_ON_STACK(ctx);
@@ -525,13 +524,21 @@ static int jent_shake256_tester(void)
 				       0x20, 0x52, 0xD8, 0xFF, 0x18, 0x81, 0x52,
 				       0xE9, 0x61, 0xC1, 0xEC, 0x5C, 0x75, 0xBF,
 				       0xC3, 0xC9, 0x1C, 0x8D };
+	/*
+	 * The first 32 bytes of the SHAKE-256 output. The squeeze only
+	 * returns whole uint64_t words, so the vector must be a multiple of
+	 * eight bytes - a 33rd byte would stay zero in act.
+	 */
 	static const uint8_t exp[] = { 0x7d, 0x6a, 0x09, 0x6e, 0x13, 0x66, 0x1d,
 				       0x9d, 0x0e, 0xca, 0xf5, 0x38, 0x30, 0xa1,
 				       0x92, 0x87, 0xe0, 0xb3, 0x6e, 0xce, 0x48,
 				       0x82, 0xeb, 0x58, 0x0b, 0x78, 0x5c, 0x1d,
-				       0xef, 0x2d, 0xe5, 0xaa, 0x6c };
+				       0xef, 0x2d, 0xe5, 0xaa };
 	uint8_t act[sizeof(exp)] = { 0 };
 	unsigned int i;
+
+	JENT_BUILD_BUG_ON(sizeof(exp) % sizeof(uint64_t));
+	JENT_BUILD_BUG_ON(sizeof(exp) > JENT_SHA3_256_SIZE_BLOCK);
 
 	jent_shake256_init(&ctx);
 	jent_sha3_update(&ctx, msg, sizeof(msg));
@@ -545,7 +552,6 @@ static int jent_shake256_tester(void)
 
 	return 0;
 }
-#endif
 
 static int jent_xdrbg256_tester(void)
 {
@@ -611,6 +617,8 @@ static int jent_sha3_256_tester(void)
 int jent_sha3_tester(void)
 {
 	if (jent_sha3_256_tester())
+		return 1;
+	if (jent_shake256_tester())
 		return 1;
 	return jent_xdrbg256_tester();
 }
