@@ -667,6 +667,18 @@ static void jent_get_cachesize_sysfs(long *l1, long *l2, long *l3)
 }
 #undef JENT_SYSFS_CPU_DIR
 
+/* Raise each level to what a later source found, never lowering one. */
+static void jent_cache_sizes_merge(long *l1, long *l2, long *l3,
+				   long s1, long s2, long s3)
+{
+	if (s1 > *l1)
+		*l1 = s1;
+	if (s2 > *l2)
+		*l2 = s2;
+	if (s3 > *l3)
+		*l3 = s3;
+}
+
 #if defined(__aarch64__) || defined(__arm__)
 /*
  * The largest cache sizes the Technical Reference Manual of an Arm core type
@@ -677,74 +689,102 @@ static void jent_get_cachesize_sysfs(long *l1, long *l2, long *l3)
  * userspace has only what the kernel publishes. Linux has no cache sysfs on
  * arm64 before 4.0, and since 4.12 ("arm64: cacheinfo: Remove CCSIDR-based
  * cache information probing") the sizes in it are what the device tree or the
- * ACPI PPTT state - often nothing. bionic's sysconf() reports no cache size on
- * arm64 in any Android release, and SELinux keeps an app out of the device
- * tree. A Nexus 5X, on Linux 3.10, is left without a single cache size.
+ * ACPI PPTT state - often nothing: an Android phone, or a virtual machine whose
+ * device tree the hypervisor generated. bionic's sysconf() reports no cache
+ * size on arm64 in any Android release, and SELinux keeps an app out of the
+ * device tree. A Nexus 5X, on Linux 3.10, is left without a single cache size.
  *
  * Where the TRM lets the licensee choose a size, the entry is the largest it
- * allows, and the L2 entry the largest L2 even where the L2 cache is optional:
- * the working set derived from them is never smaller than the real caches, so
- * the memory access still misses where the core has the largest caches its
- * design permits. The L3 cache of a DynamIQ cluster belongs to its DSU, which
- * the core's part number does not identify, so no L3 is known. The implementer
- * is part of the key: 0xd49 is a Neoverse N2 under Arm's and an Azure Cobalt
- * 100 under Microsoft's.
+ * allows, the L2 entry the largest L2 even where the L2 cache is optional or,
+ * on the Cortex-A5 and A9, an external L2C-310 controller: the working set
+ * derived from them is never smaller than the real caches, so the memory
+ * access still misses where the core has the largest caches its design
+ * permits. The L3 entry is the largest the DynamIQ Shared Unit the core is
+ * designed for supports - 4 MiB for the DSU and DSU-AE, 16 MiB for the
+ * DSU-110, 32 MiB for the DSU-120 - and 0 for the cores with none: those
+ * whose cluster-shared cache is the L2, and the Neoverse N2 and V2, which
+ * connect to the interconnect directly. A system level cache in the
+ * interconnect is memory-side, sized by the SoC rather than the core, and not
+ * known here.
+ *
+ * The implementer is part of the key: 0xd01 is a Cortex-A32 under Arm's and a
+ * TaiShan V110 under HiSilicon's (0x48). The Cortex-A12 (0xc0d) is left out:
+ * Arm folded it into the A17 and withdrew its TRM, so nothing bounds it.
  */
 struct jent_arm_core_cache {
-	unsigned long implementer;
-	unsigned long part;
-	long l1;
-	long l2;
+	unsigned short implementer;
+	unsigned short part;
+	unsigned short l1_kib;
+	unsigned short l2_kib;
+	unsigned short l3_kib;
 };
 
 static const struct jent_arm_core_cache jent_arm_core_caches[] = {
-	/* Arm Ltd */
-	{ 0x41, 0xd03, 64 << 10, 2048 << 10 },	/* Cortex-A53 */
-	{ 0x41, 0xd04, 64 << 10, 1024 << 10 },	/* Cortex-A35 */
-	{ 0x41, 0xd05, 64 << 10,  256 << 10 },	/* Cortex-A55 */
-	{ 0x41, 0xd07, 32 << 10, 2048 << 10 },	/* Cortex-A57 */
-	{ 0x41, 0xd08, 32 << 10, 4096 << 10 },	/* Cortex-A72 */
-	{ 0x41, 0xd09, 64 << 10, 8192 << 10 },	/* Cortex-A73 */
-	{ 0x41, 0xd0a, 64 << 10,  512 << 10 },	/* Cortex-A75 */
-	{ 0x41, 0xd0b, 64 << 10,  512 << 10 },	/* Cortex-A76 */
-	{ 0x41, 0xd0c, 64 << 10, 1024 << 10 },	/* Neoverse N1 */
-	{ 0x41, 0xd0d, 64 << 10,  512 << 10 },	/* Cortex-A77 */
-	{ 0x41, 0xd40, 64 << 10, 1024 << 10 },	/* Neoverse V1 */
-	{ 0x41, 0xd41, 64 << 10,  512 << 10 },	/* Cortex-A78 */
-	{ 0x41, 0xd44, 64 << 10, 1024 << 10 },	/* Cortex-X1 */
-	{ 0x41, 0xd46, 64 << 10,  512 << 10 },	/* Cortex-A510 */
-	{ 0x41, 0xd47, 64 << 10,  512 << 10 },	/* Cortex-A710 */
-	{ 0x41, 0xd48, 64 << 10, 1024 << 10 },	/* Cortex-X2 */
-	{ 0x41, 0xd49, 64 << 10, 1024 << 10 },	/* Neoverse N2 */
-	{ 0x41, 0xd4b, 64 << 10,  512 << 10 },	/* Cortex-A78C */
-	{ 0x41, 0xd4c, 64 << 10, 1024 << 10 },	/* Cortex-X1C */
-	{ 0x41, 0xd4d, 64 << 10,  512 << 10 },	/* Cortex-A715 */
-	{ 0x41, 0xd4e, 64 << 10, 1024 << 10 },	/* Cortex-X3 */
-	{ 0x41, 0xd4f, 64 << 10, 2048 << 10 },	/* Neoverse V2 */
-	{ 0x41, 0xd80, 64 << 10,  512 << 10 },	/* Cortex-A520 */
-	{ 0x41, 0xd81, 64 << 10,  512 << 10 },	/* Cortex-A720 */
-	{ 0x41, 0xd82, 64 << 10, 2048 << 10 },	/* Cortex-X4 */
-	{ 0x41, 0xd84, 64 << 10, 3072 << 10 },	/* Neoverse V3 */
-	{ 0x41, 0xd85, 64 << 10, 3072 << 10 },	/* Cortex-X925 */
-	{ 0x41, 0xd87, 64 << 10, 1024 << 10 },	/* Cortex-A725 */
+	/* Arm Ltd, ARMv7-A */
+	{ 0x41, 0xc05, 64, 8192,     0 },	/* Cortex-A5, L2C-310 */
+	{ 0x41, 0xc07, 64, 1024,     0 },	/* Cortex-A7 */
+	{ 0x41, 0xc08, 32, 1024,     0 },	/* Cortex-A8 */
+	{ 0x41, 0xc09, 64, 8192,     0 },	/* Cortex-A9, L2C-310 */
+	{ 0x41, 0xc0e, 32, 8192,     0 },	/* Cortex-A17 */
+	{ 0x41, 0xc0f, 32, 4096,     0 },	/* Cortex-A15 */
+
+	/* Arm Ltd, ARMv8-A and later */
+	{ 0x41, 0xd01, 64, 1024,     0 },	/* Cortex-A32 */
+	{ 0x41, 0xd02, 64, 1024,     0 },	/* Cortex-A34 */
+	{ 0x41, 0xd03, 64, 2048,     0 },	/* Cortex-A53 */
+	{ 0x41, 0xd04, 64, 1024,     0 },	/* Cortex-A35 */
+	{ 0x41, 0xd05, 64,  256,  4096 },	/* Cortex-A55 */
+	{ 0x41, 0xd06, 64,  256,  4096 },	/* Cortex-A65 */
+	{ 0x41, 0xd07, 32, 2048,     0 },	/* Cortex-A57 */
+	{ 0x41, 0xd08, 32, 4096,     0 },	/* Cortex-A72 */
+	{ 0x41, 0xd09, 64, 8192,     0 },	/* Cortex-A73 */
+	{ 0x41, 0xd0a, 64,  512,  4096 },	/* Cortex-A75 */
+	{ 0x41, 0xd0b, 64,  512,  4096 },	/* Cortex-A76 */
+	{ 0x41, 0xd0c, 64, 1024,  4096 },	/* Neoverse N1 */
+	{ 0x41, 0xd0d, 64,  512,  4096 },	/* Cortex-A77 */
+	{ 0x41, 0xd0e, 64,  512,  4096 },	/* Cortex-A76AE */
+	{ 0x41, 0xd40, 64, 1024,  4096 },	/* Neoverse V1 */
+	{ 0x41, 0xd41, 64,  512,  4096 },	/* Cortex-A78 */
+	{ 0x41, 0xd42, 64,  512,  4096 },	/* Cortex-A78AE */
+	{ 0x41, 0xd43, 64,  256,  4096 },	/* Cortex-A65AE */
+	{ 0x41, 0xd44, 64, 1024,  4096 },	/* Cortex-X1 */
+	{ 0x41, 0xd46, 64,  512, 16384 },	/* Cortex-A510 */
+	{ 0x41, 0xd47, 64,  512, 16384 },	/* Cortex-A710 */
+	{ 0x41, 0xd48, 64, 1024, 16384 },	/* Cortex-X2 */
+	{ 0x41, 0xd49, 64, 1024,     0 },	/* Neoverse N2, direct connect */
+	{ 0x41, 0xd4a, 64,  256,  4096 },	/* Neoverse E1 */
+	{ 0x41, 0xd4b, 64,  512,  4096 },	/* Cortex-A78C */
+	{ 0x41, 0xd4c, 64, 1024,  4096 },	/* Cortex-X1C */
+	{ 0x41, 0xd4d, 64,  512, 16384 },	/* Cortex-A715 */
+	{ 0x41, 0xd4e, 64, 1024, 16384 },	/* Cortex-X3 */
+	{ 0x41, 0xd4f, 64, 2048,     0 },	/* Neoverse V2, direct connect */
+	{ 0x41, 0xd80, 64,  512, 32768 },	/* Cortex-A520 */
+	{ 0x41, 0xd81, 64,  512, 32768 },	/* Cortex-A720 */
+	{ 0x41, 0xd82, 64, 2048, 32768 },	/* Cortex-X4 */
+	{ 0x41, 0xd83, 64, 2048, 32768 },	/* Neoverse V3AE */
+	{ 0x41, 0xd84, 64, 3072, 32768 },	/* Neoverse V3 */
+	{ 0x41, 0xd85, 64, 3072, 32768 },	/* Cortex-X925 */
+	{ 0x41, 0xd87, 64, 1024, 32768 },	/* Cortex-A725 */
+	{ 0x41, 0xd88, 64,  512, 32768 },	/* Cortex-A520AE */
+	{ 0x41, 0xd89, 64, 1024, 32768 },	/* Cortex-A720AE */
 
 	/*
 	 * Qualcomm, for the Arm cores it ships under its own part numbers -
 	 * those Linux applies the Arm core's errata to (cpu_errata.c).
 	 */
-	{ 0x51, 0x801, 64 << 10, 2048 << 10 },	/* Kryo 2XX Silver: Cortex-A53 */
-	{ 0x51, 0x804, 64 << 10,  512 << 10 },	/* Kryo 4XX Gold: Cortex-A76 */
-	{ 0x51, 0x805, 64 << 10,  256 << 10 },	/* Kryo 4XX Silver: Cortex-A55 */
+	{ 0x51, 0x801, 64, 2048,     0 },	/* Kryo 2XX Silver: Cortex-A53 */
+	{ 0x51, 0x804, 64,  512,  4096 },	/* Kryo 4XX Gold: Cortex-A76 */
+	{ 0x51, 0x805, 64,  256,  4096 },	/* Kryo 4XX Silver: Cortex-A55 */
 };
 
 /*
  * One line of /proc/cpuinfo. @implementer carries the "CPU implementer" of the
  * block the line belongs to, -1 before one was seen; a "CPU part" line looks
- * the pair up and raises @l1 and @l2 to the sizes of a core type it knows.
- * Like the sysfs walk, the largest seen at each level is kept.
+ * the pair up and raises @l1, @l2 and @l3 to the sizes of a core type it
+ * knows. Like the sysfs walk, the largest seen at each level is kept.
  */
 static void jent_cpuinfo_arm_line(const char *line, long *implementer,
-				  long *l1, long *l2)
+				  long *l1, long *l2, long *l3)
 {
 	const char *val = strchr(line, ':');
 	unsigned long v;
@@ -785,10 +825,10 @@ static void jent_cpuinfo_arm_line(const char *line, long *implementer,
 		    c->part != v)
 			continue;
 
-		if (c->l1 > *l1)
-			*l1 = c->l1;
-		if (c->l2 > *l2)
-			*l2 = c->l2;
+		jent_cache_sizes_merge(l1, l2, l3,
+				       (long)c->l1_kib << 10,
+				       (long)c->l2_kib << 10,
+				       (long)c->l3_kib << 10);
 		return;
 	}
 }
@@ -835,7 +875,7 @@ static void jent_get_cachesize_cpuinfo_file(const char *path,
 			line[len] = '\0';
 			if (!overlong)
 				jent_cpuinfo_arm_line(line, &implementer,
-						      l1, l2);
+						      l1, l2, l3);
 			len = 0;
 			overlong = 0;
 		}
@@ -845,7 +885,7 @@ static void jent_get_cachesize_cpuinfo_file(const char *path,
 	/* A last line without its newline. */
 	if (len && !overlong) {
 		line[len] = '\0';
-		jent_cpuinfo_arm_line(line, &implementer, l1, l2);
+		jent_cpuinfo_arm_line(line, &implementer, l1, l2, l3);
 	}
 }
 
@@ -859,18 +899,6 @@ static void jent_get_cachesize_cpuinfo(long *l1, long *l2, long *l3)
 #undef JENT_PROC_CPUINFO
 #endif /* __aarch64__ || __arm__ */
 
-/* Raise each level to what a later source found, never lowering one. */
-static void jent_cache_sizes_merge(long *l1, long *l2, long *l3,
-				   long s1, long s2, long s3)
-{
-	if (s1 > *l1)
-		*l1 = s1;
-	if (s2 > *l2)
-		*l2 = s2;
-	if (s3 > *l3)
-		*l3 = s3;
-}
-
 static void jent_get_cachesize_uncached(long *l1, long *l2, long *l3)
 {
 	long s1 = 0, s2 = 0, s3 = 0;
@@ -882,8 +910,6 @@ static void jent_get_cachesize_uncached(long *l1, long *l2, long *l3)
 	 * happened to run on.
 	 */
 	jent_get_cachesize_sysfs(l1, l2, l3);
-	if (*l1 > 0)
-		return;
 
 	/*
 	 * No L1 data cache found - sysfs is unavailable (not mounted, a
@@ -891,16 +917,27 @@ static void jent_get_cachesize_uncached(long *l1, long *l2, long *l3)
 	 * to sysconf, keeping the larger value per level so a partial sysfs
 	 * result is never made worse.
 	 */
-	jent_get_cachesize_sysconf(&s1, &s2, &s3);
-	jent_cache_sizes_merge(l1, l2, l3, s1, s2, s3);
+	if (*l1 <= 0) {
+		jent_get_cachesize_sysconf(&s1, &s2, &s3);
+		jent_cache_sizes_merge(l1, l2, l3, s1, s2, s3);
+	}
 
 #if defined(__aarch64__) || defined(__arm__)
-	if (*l1 > 0)
-		return;
-
-	/* Still nothing: the largest the TRMs of the core types present allow. */
-	jent_get_cachesize_cpuinfo(&s1, &s2, &s3);
-	jent_cache_sizes_merge(l1, l2, l3, s1, s2, s3);
+	/*
+	 * The levels still unknown - all of them, or the L2 and L3 on a device
+	 * tree that states only the L1 - take the largest the TRMs of the core
+	 * types present allow. A level the system did report is kept: that is
+	 * a measurement, the table an upper bound.
+	 */
+	if (*l1 <= 0 || *l2 <= 0 || *l3 <= 0) {
+		jent_get_cachesize_cpuinfo(&s1, &s2, &s3);
+		if (*l1 <= 0)
+			*l1 = s1;
+		if (*l2 <= 0)
+			*l2 = s2;
+		if (*l3 <= 0)
+			*l3 = s3;
+	}
 #endif
 }
 

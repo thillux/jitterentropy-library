@@ -502,27 +502,32 @@ static void test_sysfs_cache_walk(void)
 /*
  * The largest caches the TRMs allow: a Cortex-A57 has a fixed 32 KB L1 data
  * cache, a Cortex-A53 and A55 one of up to 64 KB, and the A57 and A53 up to
- * 2 MB of L2 - the A55 only 256 KB.
+ * 2 MB of L2 - the A55 only 256 KB, but a DSU with up to 4 MB of L3 behind
+ * it, where the other two have no L3. A Cortex-X925 sits in a DSU-120.
  */
 #define A57_L1	32768
 #define A57_L2	2097152
 #define A53_L1	65536
 #define A53_L2	2097152
 #define A55_L1	65536
+#define A55_L2	262144
+#define A55_L3	4194304
+#define X925_L3	33554432
 
 /* Feeds @text line by line, as jent_get_cachesize_cpuinfo_file() does. */
-static void cpuinfo_lines(const char *text, long *l1, long *l2)
+static void cpuinfo_lines(const char *text, long *l1, long *l2, long *l3)
 {
 	char line[256];
 	long implementer = -1;
 
 	*l1 = 0;
 	*l2 = 0;
+	*l3 = 0;
 	while (*text) {
 		size_t n = strcspn(text, "\n");
 
 		snprintf(line, sizeof(line), "%.*s", (int)n, text);
-		jent_cpuinfo_arm_line(line, &implementer, l1, l2);
+		jent_cpuinfo_arm_line(line, &implementer, l1, l2, l3);
 		text += n;
 		if (*text)
 			text++;
@@ -559,42 +564,58 @@ static void test_cache_cpuinfo(void)
 
 	jent_ut_group("the Arm core types of /proc/cpuinfo");
 
-	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd07\n", &l1, &l2);
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd07\n", &l1, &l2, &l3);
 	JENT_UT_EQ(l1, A57_L1, "a Cortex-A57 has the L1 its TRM fixes");
 	JENT_UT_EQ(l2, A57_L2, "and the largest L2 it allows");
+	JENT_UT_EQ(l3, 0, "and no L3: its cluster cache is the L2");
 
-	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd03\n", &l1, &l2);
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd05\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l2, A55_L2, "a Cortex-A55 has the largest L2 its TRM allows");
+	JENT_UT_EQ(l3, A55_L3, "and the largest L3 its DSU does");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd85\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l3, X925_L3, "a Cortex-X925 the largest L3 of a DSU-120");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd4f\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l3, 0, "a Neoverse V2, connected directly, has no L3");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd03\n", &l1, &l2, &l3);
 	JENT_UT_EQ(l1, A53_L1, "a Cortex-A53 has the largest L1 its TRM allows");
 	JENT_UT_EQ(l2, A53_L2, "and the largest L2, which is optional");
 
-	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd01\n", &l1, &l2);
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xfff\n", &l1, &l2, &l3);
 	JENT_UT_EQ(l1, 0, "a core type not listed has none");
 
-	cpuinfo_lines(cpuinfo_msm8992, &l1, &l2);
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xc0f\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l1, 32768, "an ARMv7 Cortex-A15 is listed as well");
+	JENT_UT_EQ(l2, 4194304, "with its largest L2");
+
+	cpuinfo_lines(cpuinfo_msm8992, &l1, &l2, &l3);
 	JENT_UT_EQ(l1, A53_L1, "the larger L1 of a big.LITTLE pair is taken");
 	JENT_UT_EQ(l2, A57_L2, "and the larger L2");
 
 	/* Per level: the L1 from one core type, the L2 from the other. */
 	cpuinfo_lines("processor\t: 0\nCPU implementer\t: 0x41\nCPU part\t: 0xd05\n"
 		      "processor\t: 4\nCPU implementer\t: 0x41\nCPU part\t: 0xd07\n",
-		      &l1, &l2);
+		      &l1, &l2, &l3);
 	JENT_UT_EQ(l1, A55_L1, "the largest L1 is kept across core types");
 	JENT_UT_EQ(l2, A57_L2, "and so is the largest L2");
+	JENT_UT_EQ(l3, A55_L3, "and the largest L3");
 
-	cpuinfo_lines("CPU implementer\t: 0x51\nCPU part\t: 0xd07\n", &l1, &l2);
+	cpuinfo_lines("CPU implementer\t: 0x51\nCPU part\t: 0xd07\n", &l1, &l2, &l3);
 	JENT_UT_EQ(l1, 0, "a part number counts only with its implementer");
 
-	cpuinfo_lines("CPU part\t: 0xd07\n", &l1, &l2);
+	cpuinfo_lines("CPU part\t: 0xd07\n", &l1, &l2, &l3);
 	JENT_UT_EQ(l1, 0, "a part without an implementer counts for nothing");
 
 	cpuinfo_lines("CPU implementer\t: 0x41\nprocessor\t: 1\nCPU part\t: 0xd07\n",
-		      &l1, &l2);
+		      &l1, &l2, &l3);
 	JENT_UT_EQ(l1, 0, "an implementer does not carry over to the next CPU");
 
-	cpuinfo_lines("CPU implementer\t: arm\nCPU part\t: 0xd07\n", &l1, &l2);
+	cpuinfo_lines("CPU implementer\t: arm\nCPU part\t: 0xd07\n", &l1, &l2, &l3);
 	JENT_UT_EQ(l1, 0, "an implementer that does not parse counts for nothing");
 
-	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t:\n", &l1, &l2);
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t:\n", &l1, &l2, &l3);
 	JENT_UT_EQ(l1, 0, "and neither does a part that does not");
 
 	l1 = l2 = l3 = -1;
@@ -637,7 +658,7 @@ static void test_cache_cpuinfo(void)
 	jent_get_cachesize_cpuinfo_file(path, &l1, &l2, &l3);
 	JENT_UT_EQ(l1, A57_L1, "the reader finds the core past a long line");
 	JENT_UT_EQ(l2, A57_L2, "with its L2");
-	JENT_UT_EQ(l3, 0, "and no L3, which the part number does not tell");
+	JENT_UT_EQ(l3, 0, "and no L3");
 
 	/* The whole chain, with sysfs gone and the file in place. */
 	{
@@ -656,6 +677,37 @@ static void test_cache_cpuinfo(void)
 		else
 			JENT_UT_EQ(l1, A57_L1,
 				   "without sysfs and sysconf the core type answers");
+	}
+
+	/*
+	 * A sysfs that states the L1 only, as a device tree with d-cache-size
+	 * but no L2 node gives: the L1 is the measurement and stays, the L2
+	 * comes from the core type.
+	 */
+	{
+		static char root[] = "/tmp/jent-sysfs-l1-XXXXXX";
+		char dir[160];
+		const char *saved = jent_test_sysfs_root;
+
+		if (mkdtemp(root)) {
+			snprintf(dir, sizeof(dir), "%s/cpu0", root);
+			mkdir(dir, 0700);
+			snprintf(dir, sizeof(dir), "%s/cpu0/cache", root);
+			if (!mkdir(dir, 0700) &&
+			    !sysfs_index(dir, 0, "Data\n", "1\n", "16K\n")) {
+				jent_test_sysfs_root = root;
+				jent_test_cpuinfo = path;
+				l1 = l2 = l3 = -1;
+				jent_get_cachesize_uncached(&l1, &l2, &l3);
+				jent_test_sysfs_root = saved;
+				jent_test_cpuinfo = "/proc/cpuinfo";
+
+				JENT_UT_EQ(l1, 16384,
+					   "an L1 sysfs reports is kept over the table");
+				JENT_UT_EQ(l2, A57_L2,
+					   "the L2 it does not report comes from the table");
+			}
+		}
 	}
 	unlink(path);
 }
