@@ -32,7 +32,7 @@ extern "C"
 #define HASH_CTX_ON_STACK(name)						       \
 	struct jent_sha_ctx name
 
-static inline JENT_NOINLINE
+JENT_STATIC_NOINLINE
 unsigned int jent_sha3_rate(void *hash_state)
 {
 	struct jent_sha_ctx *ctx = hash_state;

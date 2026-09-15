@@ -68,8 +68,9 @@
  * MSVC has no such macro, so the pragma turns its optimizations off for every
  * function defined after it.
  *
- * The pragma does not disable inline expansion (/Ob): JENT_NOINLINE marks the
- * helpers on the measured path, and CMakeLists.txt adds /Ob0 for the rest.
+ * The pragma does not disable inline expansion (/Ob): JENT_STATIC_NOINLINE
+ * marks the helpers on the measured path, and CMakeLists.txt adds /Ob0 for the
+ * rest.
  * Nor does it reach /GL, where code generation happens at link time, so
  * CMakeLists.txt refuses /GL and /LTCG on MSVC. Other build systems have to
  * do both themselves. clang-cl defines __OPTIMIZE__ and takes the #error path.
@@ -79,13 +80,22 @@
 #endif
 
 /*
- * The measured-path helpers MSVC would otherwise inline despite the pragma.
- * GCC and Clang inline nothing at -O0, and the kernel has its own attributes.
+ * A static helper on the measured path, which stays a call: the core is
+ * compiled unoptimized so that the noise source runs as written, and a helper
+ * expanded into it would be measured differently from one called. GCC and
+ * Clang - the kernel's compilers among them - inline nothing at -O0. MSVC's
+ * pragma above leaves inline expansion on, so there the helper carries
+ * __declspec(noinline).
+ *
+ * The "inline" in the expansion asks for no expansion; it is the C99 linkage
+ * of a function defined in a header - one copy per file that includes it, and
+ * no unused-function warning from a file that does not call it. Where it
+ * would matter, the attribute overrides it.
  */
 #if defined(_MSC_VER) && !defined(__clang__)
-# define JENT_NOINLINE	__declspec(noinline)
+# define JENT_STATIC_NOINLINE	static inline __declspec(noinline)
 #else
-# define JENT_NOINLINE
+# define JENT_STATIC_NOINLINE	static inline
 #endif
 
 #ifdef LINUX_KERNEL
@@ -157,13 +167,13 @@ struct rand_data *jent_entropy_collector_alloc_raw(unsigned int osr,
  * div64 primitives instead. On 64-bit kernels both primitives are inline
  * plain divisions, so code generation there is identical to the operators.
  */
-static inline JENT_NOINLINE
+JENT_STATIC_NOINLINE
 uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
 {
 	return div64_u64(dividend, divisor);
 }
 
-static inline JENT_NOINLINE
+JENT_STATIC_NOINLINE
 uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 {
 	uint64_t rem;
@@ -202,13 +212,13 @@ uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
  * above for the rationale. Userspace links against libgcc (or an
  * equivalent), so the plain operators are used directly.
  */
-static inline JENT_NOINLINE
+JENT_STATIC_NOINLINE
 uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
 {
 	return dividend / divisor;
 }
 
-static inline JENT_NOINLINE
+JENT_STATIC_NOINLINE
 uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 {
 	return dividend % divisor;

@@ -44,7 +44,7 @@
  ***************************************************************************/
 
 /*
- * MSVC defines no __OPTIMIZE__: there the pragma and JENT_NOINLINE in
+ * MSVC defines no __OPTIMIZE__: there the pragma and JENT_STATIC_NOINLINE in
  * jitterentropy-internal.h and /Ob0 and the /GL check in CMakeLists.txt
  * enforce the same.
  */
