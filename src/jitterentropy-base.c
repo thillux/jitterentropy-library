@@ -127,7 +127,9 @@ static inline unsigned int jent_log2_simple(unsigned int val)
  *   to determine the memory size, or
  * * 1 << JENT_DEFAULT_MEMORY_BITS
  *
- * All is capped by JENT_MAX_MEMSIZE_MAX
+ * A derived size grows by one step per reallocation on health test recovery
+ * (@inc, the collector's reinitialization count); a size the caller provided
+ * is a constraint and does not. All is capped by JENT_MAX_MEMSIZE_MAX.
  */
 static inline unsigned int jent_update_memsize(unsigned int flags,
 					       unsigned int inc)
@@ -173,7 +175,7 @@ static inline unsigned int jent_update_memsize(unsigned int flags,
 		 */
 		if (max > JENT_MAX_AUTO_MEMSIZE)
 			max = JENT_MAX_AUTO_MEMSIZE;
-	} else {
+
 		max += inc;
 	}
 
@@ -208,6 +210,33 @@ static inline unsigned int jent_max_osr(unsigned int flags)
 		max = JENT_MAX_OSR_FIPS;
 
 	return max;
+}
+
+/*
+ * The same ceiling for an allocated collector, from its own FIPS state rather
+ * than the system's: jent_fips_enabled() may read a file on every call, and
+ * jent_read_entropy_safe() asks per block.
+ */
+static inline unsigned int jent_max_osr_ec(const struct rand_data *ec)
+{
+	unsigned int max = JENT_MAX_OSR;
+
+	if (JENT_MAX_OSR_NTG1 < max && (ec->flags & JENT_NTG1))
+		max = JENT_MAX_OSR_NTG1;
+	if (JENT_MAX_OSR_FIPS < max && ec->is_fips_enabled)
+		max = JENT_MAX_OSR_FIPS;
+
+	return max;
+}
+
+/*
+ * Whether jent_health_failure_reset() has nothing left to try on this
+ * collector: it raises the oversampling rate by one, so at the ceiling there
+ * is no replacement, and a health failure the collector reports is final.
+ */
+static inline int jent_recovery_exhausted(const struct rand_data *ec)
+{
+	return ec->osr >= jent_max_osr_ec(ec);
 }
 
 static inline unsigned int jent_update_hashloop(unsigned int flags,
@@ -508,7 +537,7 @@ static int jent_health_failure_reset(
 	flags = (*ec)->flags;
 
 	/* In a compliance mode, that mode's ceiling. */
-	max_osr = jent_max_osr(flags);
+	max_osr = jent_max_osr_ec(*ec);
 
 	/*
 	 * A compliance mode does not change its noise source underneath the
@@ -527,27 +556,20 @@ static int jent_health_failure_reset(
 
 	/*
 	 * Generic arbitrary cutoff to prevent running "forever". The verdict
-	 * cannot change for this collector, so it is remembered for
-	 * jent_read_entropy_safe().
+	 * cannot change for this collector, and jent_read_entropy_safe() reads
+	 * it off the rate: see jent_recovery_exhausted().
 	 */
-	if (osr > max_osr) {
-		(*ec)->recovery_exhausted = 1;
+	if (osr > max_osr)
 		return -1;
-	}
 
 	/*
-	 * If the caller did not set any specific maximum value let the Jitter
-	 * RNG increase the maximum memory by one step. A caller's choice
-	 * travels as JENT_INT_MEMSIZE_PINNED, the normalized size field being
-	 * set either way.
+	 * The replacement is one reinitialization further along. The count
+	 * travels with the flags, which are otherwise the caller's: the
+	 * allocation derives the memory size and the hash loop count from
+	 * both - one step up per reinitialization, the memory size unless the
+	 * caller chose it - and the startup re-run below measures at them.
 	 */
-	if ((*ec)->max_mem_set)
-		flags |= JENT_INT_MEMSIZE_PINNED;
-	else
-		flags = jent_update_memsize(flags, 1);
-
-	/* Increment hash loop count by one */
-	flags = jent_update_hashloop(flags, 1);
+	flags = JENT_INT_REINIT_TO_FLAGS(flags, (*ec)->reinit_count + 1);
 
 	/* Perform new health test with updated OSR */
 	while (jent_entropy_init_ex(osr, flags)) {
@@ -575,10 +597,9 @@ static int jent_health_failure_reset(
 	/*
 	 * Carry the instance identifier over so the reallocated collector keeps
 	 * the same UUID (empty during the startup-time reset, when it has not
-	 * been assigned yet), and count this reinitialization.
+	 * been assigned yet). The reinitialization count came with the flags.
 	 */
 	memcpy(new_ec->uuid, (*ec)->uuid, sizeof(new_ec->uuid));
-	new_ec->reinit_count = (*ec)->reinit_count + 1;
 
 	/* Preserve the lifetime output accounting across the reallocation. */
 	new_ec->read_invocations = (*ec)->read_invocations;
@@ -655,11 +676,11 @@ ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 		unsigned int health_test_result;
 
 		/*
-		 * Recovery gave up on this collector for good: report the
-		 * failure without generating a block only to discard it.
-		 * Through jent_health_failure(), so the callback still fires.
+		 * No recovery is left for this collector: report the failure
+		 * without generating a block only to discard it. Through
+		 * jent_health_failure(), so the callback still fires.
 		 */
-		if ((*ec)->recovery_exhausted &&
+		if (jent_recovery_exhausted(*ec) &&
 		    (health_test_result = jent_health_failure(*ec)) != 0)
 			return jent_health_failure_code(health_test_result);
 
@@ -796,13 +817,16 @@ static struct rand_data
 {
 	struct rand_data *entropy_collector;
 	uint32_t memsize = 0;
+	unsigned int reinits;
 
 	/*
 	 * Enforce the invariants of the compile-time tunable OSR bounds: the
 	 * health-test lookup tables are indexed with osr - 1 and must reach
 	 * JENT_MAX_OSR, and neither the [JENT_MIN_OSR, JENT_MAX_OSR] range
-	 * nor that of a compliance mode may be empty.
+	 * nor that of a compliance mode may be empty. The reinitialization
+	 * field must hold one reallocation per rate the tables cover.
 	 */
+	JENT_BUILD_BUG_ON(JENT_HEALTH_CUTOFF_TABLE_OSR - 1 > JENT_INT_REINIT_MAX);
 	JENT_BUILD_BUG_ON(JENT_MIN_OSR < 1);
 	JENT_BUILD_BUG_ON(JENT_MIN_OSR > JENT_MAX_OSR);
 	JENT_BUILD_BUG_ON(JENT_MAX_OSR > JENT_HEALTH_CUTOFF_TABLE_OSR);
@@ -854,19 +878,19 @@ static struct rand_data
 		return NULL;
 
 	/*
-	 * Record whether the caller capped the memory size here and not in
-	 * the outer jent_entropy_collector_alloc(): health-test resets during
-	 * the startup loop consult max_mem_set, and were it still unset they
-	 * would grow the memory region beyond the cap the caller requested.
-	 * From the internal flag, as a reallocation passes normalized flags
-	 * whose size field is always set.
+	 * The reinitialization this collector is at, see JENT_INT_REINIT_*.
+	 * What the library derives from the caller's flags and it - the memory
+	 * size and the hash loop count - stays in the fields that hold it and
+	 * is not written back into the flags: the collector stores the flags
+	 * it was allocated with, so that a reallocation can derive afresh from
+	 * them. The field stays in the local flags, which the timer's own
+	 * startup run below measures by.
 	 */
-	entropy_collector->max_mem_set = !!(flags & JENT_INT_MEMSIZE_PINNED);
-	flags &= ~JENT_INT_MEMSIZE_PINNED;
+	reinits = JENT_FLAGS_TO_INT_REINIT(flags);
+	entropy_collector->reinit_count = reinits;
 
 	if (!(flags & JENT_DISABLE_MEMORY_ACCESS)) {
-		flags = jent_update_memsize(flags, 0);
-		memsize = jent_memsize(flags);
+		memsize = jent_memsize(jent_update_memsize(flags, reinits));
 
 		/*
 		 * Not secure memory, whatever JENT_FORCE_SECURE_MEM says: the
@@ -892,9 +916,9 @@ static struct rand_data
 		entropy_collector->memaccessloops = JENT_MEM_ACC_LOOP_DEFAULT;
 	}
 
-	/* Set the hash loop count */
-	flags = jent_update_hashloop(flags, 0);
-	entropy_collector->hashloopcnt = jent_hashloop_cnt(flags);
+	/* The hash loop count: the caller's, one step up per reinitialization. */
+	entropy_collector->hashloopcnt =
+		jent_hashloop_cnt(jent_update_hashloop(flags, reinits));
 
 	/*
 	 * Initialize the hash state for the XDRBG
@@ -913,7 +937,7 @@ static struct rand_data
 
 	/* Set the oversampling rate */
 	entropy_collector->osr = osr;
-	entropy_collector->flags = flags;
+	entropy_collector->flags = flags & ~JENT_INT_REINIT_MASK;
 
 	/*
 	 * BSI AIS 20/31 NTG.1 requires that during startup 2 noise sources
@@ -1087,12 +1111,9 @@ struct rand_data *jent_entropy_collector_alloc(unsigned int osr,
 
 	/*
 	 * The internal flags are the library's to set, whatever the caller
-	 * passed. Only here does the size field still say whether the caller
-	 * chose the memory size.
+	 * passed.
 	 */
-	flags &= ~(JENT_INT_MEASURE_CLOCK | JENT_INT_MEMSIZE_PINNED);
-	if (JENT_FLAGS_TO_MAX_MEMSIZE(flags))
-		flags |= JENT_INT_MEMSIZE_PINNED;
+	flags &= ~(JENT_INT_MEASURE_CLOCK | JENT_INT_REINIT_MASK);
 
 	ec = _jent_entropy_collector_alloc(osr, flags);
 

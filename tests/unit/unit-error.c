@@ -275,7 +275,7 @@ static void test_safe_recovery(void)
 			jent_entropy_collector_alloc(0, JENT_FORCE_FIPS);
 		char uuid_before[JENT_UUID_STRLEN];
 		uint64_t bytes_before, reads_before;
-		unsigned int osr_before;
+		unsigned int osr_before, reinits_before;
 		ssize_t ret;
 
 		if (!ec) {
@@ -298,7 +298,12 @@ static void test_safe_recovery(void)
 		bytes_before = ec->bytes_output;
 		reads_before = ec->read_invocations;
 
+		/*
+		 * Both from here: the initial allocation may already have
+		 * walked a step of the startup ladder on this machine.
+		 */
 		osr_before = ec->osr;
+		reinits_before = ec->reinit_count;
 		ec->health_failure = failures[i].bit;
 		ret = jent_read_entropy_safe(&ec, buf, sizeof(buf));
 
@@ -314,8 +319,13 @@ static void test_safe_recovery(void)
 				   "an intermittent failure is recovered from");
 			JENT_UT_TRUE(ec->osr > osr_before,
 				     "by raising the oversampling rate");
-			JENT_UT_EQ(ec->reinit_count, 1u,
-				   "and the reinitialization is counted");
+			/*
+			 * One reallocation per rate: the recovery's own, and
+			 * any the replacement's startup ladder made.
+			 */
+			JENT_UT_EQ(ec->reinit_count - reinits_before,
+				   ec->osr - osr_before,
+				   "and every reallocation is counted");
 			JENT_UT_TRUE(ec->uuid[0] != '\0',
 				     "the replacement carries an identifier");
 			JENT_UT_TRUE(!memcmp(ec->uuid, uuid_before,
@@ -363,11 +373,12 @@ static void test_recovery_gives_up(void)
 		   "and the collector was left untouched");
 
 	/*
-	 * The verdict is final, so later reads report it without generating
-	 * a block; ->prev_time would move if one were generated.
+	 * The verdict is final - the rate says so - and later reads report it
+	 * without generating a block; ->prev_time would move if one were
+	 * generated.
 	 */
-	JENT_UT_EQ(ec->recovery_exhausted, 1u,
-		   "the exhausted recovery is remembered");
+	JENT_UT_TRUE(jent_recovery_exhausted(ec),
+		     "the exhausted recovery is read off the rate");
 	{
 		uint64_t prev_time = ec->prev_time;
 
@@ -773,7 +784,8 @@ static void test_recovery_keeps_caller_memsize(void)
 
 	ec->is_fips_enabled = 1;
 
-	JENT_UT_EQ(ec->max_mem_set, 1u, "the size counts as caller-configured");
+	JENT_UT_TRUE(JENT_FLAGS_TO_MAX_MEMSIZE(ec->flags),
+		     "the collector keeps the size the caller configured");
 	memsize_before = ec->memmask + 1;
 
 	ec->health_failure = JENT_APT_FAILURE;
@@ -796,7 +808,8 @@ static void test_recovery_keeps_caller_memsize(void)
 	JENT_UT_TRUE(ec->reinit_count >= 1, "the collector was reallocated");
 	JENT_UT_EQ(ec->memmask + 1, memsize_before,
 		   "and the memory size the caller chose is kept");
-	JENT_UT_EQ(ec->max_mem_set, 1u, "as is the fact that they chose it");
+	JENT_UT_TRUE(JENT_FLAGS_TO_MAX_MEMSIZE(ec->flags),
+		     "as is the fact that they chose it");
 
 	jent_entropy_collector_free(ec);
 }

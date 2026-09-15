@@ -179,8 +179,8 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 			   ec->memmask ? (unsigned int)(ec->memmask + 1) : 0);
 
 	jent_add_to_status("\t\t\"hashLoopCount\": {\n");
-	jent_add_to_status("\t\t\t\"runtime\": %u,\n", jent_hashloop_cnt(ec->flags));
-	jent_add_to_status("\t\t\t\"initialization\": %u\n", jent_hashloop_cnt(ec->flags) * JENT_HASH_LOOP_INIT);
+	jent_add_to_status("\t\t\t\"runtime\": %u,\n", ec->hashloopcnt);
+	jent_add_to_status("\t\t\t\"initialization\": %u\n", ec->hashloopcnt * JENT_HASH_LOOP_INIT);
 	jent_add_to_status("\t\t},\n");
 
 	jent_add_to_status("\t\t\"memoryLoopCount\": {\n");

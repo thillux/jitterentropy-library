@@ -231,14 +231,23 @@ uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 #define JENT_INT_MEASURE_CLOCK	(UINT32_C(1) << 23)
 
 /*
- * The memory size in the flags is the caller's choice, not the library's
- * derivation. Set by jent_entropy_collector_alloc() for a JENT_MAX_MEMSIZE_*
- * value and by jent_health_failure_reset() from the collector it replaces;
- * jent_entropy_collector_alloc_internal() reads it into ->max_mem_set and does
- * not store it. The size field cannot say this: jent_update_memsize() sets it
- * in every collector's flags.
+ * The reinitialization a reallocated collector is at, from
+ * jent_health_failure_reset() to jent_entropy_collector_alloc_internal(), which
+ * reads it into ->reinit_count and derives the memory size and the hash loop
+ * count from the caller's flags and it - so a collector stores the flags it was
+ * allocated with, not what the library made of them, and a reallocation can
+ * pass them on. Six bits: one reallocation per oversampling rate up to the
+ * highest the health test tables cover. The public allocation clears it.
  */
-#define JENT_INT_MEMSIZE_PINNED	(UINT32_C(1) << 22)
+#define JENT_INT_REINIT_SHIFT		17
+#define JENT_INT_REINIT_MAX		UINT32_C(0x3f)
+#define JENT_INT_REINIT_MASK		(JENT_INT_REINIT_MAX << JENT_INT_REINIT_SHIFT)
+#define JENT_FLAGS_TO_INT_REINIT(flags)					\
+	(((flags) & JENT_INT_REINIT_MASK) >> JENT_INT_REINIT_SHIFT)
+#define JENT_INT_REINIT_TO_FLAGS(flags, n)				\
+	(((flags) & ~JENT_INT_REINIT_MASK) |				\
+	 ((((n) > JENT_INT_REINIT_MAX) ? JENT_INT_REINIT_MAX : (n))	\
+	  << JENT_INT_REINIT_SHIFT))
 
 /*
  * JENT_-prefixed, and defined outside the LINUX_KERNEL split above, for the
@@ -602,9 +611,10 @@ struct rand_data
 	char uuid[JENT_UUID_STRLEN];
 
 	/*
-	 * Number of times this instance has been reinitialized (reallocated on
-	 * health-test recovery). Carried over, incremented, across the identity-
-	 * preserving reallocation in jent_health_failure_reset().
+	 * Number of times this instance has been reallocated on health test
+	 * recovery, the replacement's own startup ladder included. The memory
+	 * size and the hash loop count derive from the flags and it: one step
+	 * up per reallocation, the memory size unless the caller chose it.
 	 */
 	unsigned int reinit_count;
 
@@ -669,7 +679,6 @@ struct rand_data
 	unsigned int apt_base_set:1;	/* APT base reference set? */
 	unsigned int is_fips_enabled:1;
 	unsigned int enable_notime:1;	/* Use internal high-res timer */
-	unsigned int max_mem_set:1;	/* Maximum memory configured by user */
 	unsigned int in_recovery:1;	/* Flag to indicate a recovery op. */
 
 	/*
@@ -688,14 +697,6 @@ struct rand_data
 	 * stop the output in every mode. Set by jent_random_data_one().
 	 */
 	unsigned int noise_stopped:1;
-
-	/*
-	 * jent_read_entropy_safe() gave up recovering this collector: it is
-	 * at its highest permitted oversampling rate, so the health failure
-	 * is sticky and reads report it without generating a block. Set by
-	 * jent_health_failure_reset().
-	 */
-	unsigned int recovery_exhausted:1;
 
 #ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
 	volatile uint8_t notime_interrupt;	/* indicator to interrupt ctr */
