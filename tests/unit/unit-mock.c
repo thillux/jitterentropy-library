@@ -430,6 +430,7 @@ static void test_timestamp_replay(void)
 {
 	struct rand_data *ec;
 	unsigned int i, stuck = 0;
+	uint64_t gcd;
 
 	jent_ut_group("replaying time stamps through the health tests");
 
@@ -443,8 +444,22 @@ static void test_timestamp_replay(void)
 		JENT_UT_SKIP("the replay", "no collector");
 		return;
 	}
+
+	/*
+	 * The replay normalizes each delta by the common timer divisor the
+	 * startup measured on this machine's clock, as the noise source does.
+	 * The stamps below are multiples of it, so that the deltas they imply
+	 * are the ones written here on every clock: under qemu the emulated
+	 * arm64 counter advances in steps of 1000, the divisor is 1000, and a
+	 * stamp 100 on would otherwise be a delta of 0.
+	 */
+	gcd = ec->jent_common_timer_gcd ? ec->jent_common_timer_gcd : 1;
+	printf("  note: the common timer divisor is %llu\n",
+	       (unsigned long long)gcd);
+
 	for (i = 0; i < 4096; i++)
-		stuck += jent_health_insert_timestamp(ec, (uint64_t)i * 100);
+		stuck += jent_health_insert_timestamp(ec,
+						      (uint64_t)i * 100 * gcd);
 
 	JENT_UT_NE(stuck, 0, "a constant delta produces stuck measurements");
 	JENT_UT_TRUE((jent_health_failure(ec) & JENT_RCT_FAILURE) != 0,
@@ -476,7 +491,7 @@ static void test_timestamp_replay(void)
 		stuck = 0;
 		for (i = 0; i < 4096; i++) {
 			step = (step * 1103515245u + 12345u);
-			t += 1000 + (step >> 20);
+			t += (1000 + (step >> 20)) * gcd;
 			stuck += jent_health_insert_timestamp(ec, t);
 		}
 
@@ -499,7 +514,7 @@ static void test_timestamp_replay(void)
 		if (a && b) {
 			for (i = 0; i < 512; i++) {
 				jent_health_insert_timestamp(a,
-							     (uint64_t)i * 100);
+					(uint64_t)i * 100 * gcd);
 				/* The delta those stamps imply, primed at 0. */
 				jent_stuck(b, i ? 100 : 0);
 			}
