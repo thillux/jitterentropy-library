@@ -59,6 +59,14 @@ static const char *jent_test_sysfs_root = "/sys/devices/system/cpu";
 # define JENT_SYSFS_CPU_DIR jent_test_sysfs_root
 #endif
 
+/* And /proc/cpuinfo, the last resort behind sysconf on Arm, for the same. */
+#if defined(__linux__) && (defined(__aarch64__) || defined(__arm__))
+static const char *jent_test_cpuinfo = "/proc/cpuinfo";
+# define JENT_PROC_CPUINFO jent_test_cpuinfo
+/* The backend undefines the macro after use; this one is the tests' own. */
+# define JENT_UT_CPUINFO
+#endif
+
 /*
  * The atomic accessors of the process-wide state. Absorbed ahead of
  * everything else because it depends on nothing else and nearly everything
@@ -290,9 +298,16 @@ static void test_cache_sysconf_fallback(void)
 
 	jent_get_cachesize_sysconf(&s1, &s2, &s3);
 
+	/* On Arm the core types would answer next; they are not asked here. */
 	jent_test_sysfs_root = "/nonexistent/jent/sys/devices/system/cpu";
+#ifdef JENT_UT_CPUINFO
+	jent_test_cpuinfo = "/nonexistent/jent/proc/cpuinfo";
+#endif
 	jent_get_cachesize_uncached(&l1, &l2, &l3);
 	jent_test_sysfs_root = saved;
+#ifdef JENT_UT_CPUINFO
+	jent_test_cpuinfo = "/proc/cpuinfo";
+#endif
 
 	/* Zeros included: musl has no _SC_LEVEL* and none may be invented. */
 	JENT_UT_EQ(l1, s1, "the L1 size falls back to sysconf");
@@ -477,6 +492,181 @@ static void test_sysfs_cache_walk(void)
 }
 #endif
 
+/*
+ * The core types of /proc/cpuinfo, the last resort on Arm. The file is fed in
+ * rather than read: a machine presents one core pairing, and one whose sysfs
+ * answers never reaches this at all.
+ */
+#if defined(JENT_ARCH_CACHE_LINUX) && defined(JENT_UT_CPUINFO)
+
+/*
+ * The largest caches the TRMs allow: a Cortex-A57 has a fixed 32 KB L1 data
+ * cache, a Cortex-A53 and A55 one of up to 64 KB, and the A57 and A53 up to
+ * 2 MB of L2 - the A55 only 256 KB.
+ */
+#define A57_L1	32768
+#define A57_L2	2097152
+#define A53_L1	65536
+#define A53_L2	2097152
+#define A55_L1	65536
+
+/* Feeds @text line by line, as jent_get_cachesize_cpuinfo_file() does. */
+static void cpuinfo_lines(const char *text, long *l1, long *l2)
+{
+	char line[256];
+	long implementer = -1;
+
+	*l1 = 0;
+	*l2 = 0;
+	while (*text) {
+		size_t n = strcspn(text, "\n");
+
+		snprintf(line, sizeof(line), "%.*s", (int)n, text);
+		jent_cpuinfo_arm_line(line, &implementer, l1, l2);
+		text += n;
+		if (*text)
+			text++;
+	}
+}
+
+/* A Nexus 5X (MSM8992): four Cortex-A53, two Cortex-A57. */
+static const char cpuinfo_msm8992[] =
+	"processor\t: 0\n"
+	"BogoMIPS\t: 38.40\n"
+	"Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid\n"
+	"CPU implementer\t: 0x41\n"
+	"CPU architecture: 8\n"
+	"CPU variant\t: 0x0\n"
+	"CPU part\t: 0xd03\n"
+	"CPU revision\t: 4\n"
+	"\n"
+	"processor\t: 4\n"
+	"BogoMIPS\t: 38.40\n"
+	"Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid\n"
+	"CPU implementer\t: 0x41\n"
+	"CPU architecture: 8\n"
+	"CPU variant\t: 0x1\n"
+	"CPU part\t: 0xd07\n"
+	"CPU revision\t: 3\n"
+	"\n"
+	"Hardware\t: Qualcomm Technologies, Inc MSM8992\n";
+
+static void test_cache_cpuinfo(void)
+{
+	static char path[] = "/tmp/jent-cpuinfo-XXXXXX";
+	long l1, l2, l3;
+	int fd;
+
+	jent_ut_group("the Arm core types of /proc/cpuinfo");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd07\n", &l1, &l2);
+	JENT_UT_EQ(l1, A57_L1, "a Cortex-A57 has the L1 its TRM fixes");
+	JENT_UT_EQ(l2, A57_L2, "and the largest L2 it allows");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd03\n", &l1, &l2);
+	JENT_UT_EQ(l1, A53_L1, "a Cortex-A53 has the largest L1 its TRM allows");
+	JENT_UT_EQ(l2, A53_L2, "and the largest L2, which is optional");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd01\n", &l1, &l2);
+	JENT_UT_EQ(l1, 0, "a core type not listed has none");
+
+	cpuinfo_lines(cpuinfo_msm8992, &l1, &l2);
+	JENT_UT_EQ(l1, A53_L1, "the larger L1 of a big.LITTLE pair is taken");
+	JENT_UT_EQ(l2, A57_L2, "and the larger L2");
+
+	/* Per level: the L1 from one core type, the L2 from the other. */
+	cpuinfo_lines("processor\t: 0\nCPU implementer\t: 0x41\nCPU part\t: 0xd05\n"
+		      "processor\t: 4\nCPU implementer\t: 0x41\nCPU part\t: 0xd07\n",
+		      &l1, &l2);
+	JENT_UT_EQ(l1, A55_L1, "the largest L1 is kept across core types");
+	JENT_UT_EQ(l2, A57_L2, "and so is the largest L2");
+
+	cpuinfo_lines("CPU implementer\t: 0x51\nCPU part\t: 0xd07\n", &l1, &l2);
+	JENT_UT_EQ(l1, 0, "a part number counts only with its implementer");
+
+	cpuinfo_lines("CPU part\t: 0xd07\n", &l1, &l2);
+	JENT_UT_EQ(l1, 0, "a part without an implementer counts for nothing");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nprocessor\t: 1\nCPU part\t: 0xd07\n",
+		      &l1, &l2);
+	JENT_UT_EQ(l1, 0, "an implementer does not carry over to the next CPU");
+
+	cpuinfo_lines("CPU implementer\t: arm\nCPU part\t: 0xd07\n", &l1, &l2);
+	JENT_UT_EQ(l1, 0, "an implementer that does not parse counts for nothing");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t:\n", &l1, &l2);
+	JENT_UT_EQ(l1, 0, "and neither does a part that does not");
+
+	l1 = l2 = l3 = -1;
+	jent_get_cachesize_cpuinfo_file("/nonexistent/jent/proc/cpuinfo",
+					&l1, &l2, &l3);
+	JENT_UT_TRUE(l1 == 0 && l2 == 0 && l3 == 0,
+		     "an absent /proc/cpuinfo reports nothing");
+
+	jent_get_cachesize_cpuinfo(&l1, &l2, &l3);
+	printf("  note: /proc/cpuinfo gives L1 %ld, L2 %ld\n", l1, l2);
+
+	/*
+	 * The reader: a Features line longer than its line buffer, which must
+	 * be skipped whole rather than read in pieces, and a last line
+	 * without its newline.
+	 */
+	fd = mkstemp(path);
+	if (fd < 0) {
+		JENT_UT_SKIP("the /proc/cpuinfo reader", "no temporary file");
+		return;
+	}
+	{
+		static const char tail[] =
+			"processor\t: 0\n"
+			"Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp\n"
+			"CPU implementer\t: 0x41\n"
+			"CPU part\t: 0xd07";
+		ssize_t w = write(fd, tail, sizeof(tail) - 1);
+
+		close(fd);
+		if (w != (ssize_t)sizeof(tail) - 1) {
+			unlink(path);
+			JENT_UT_SKIP("the /proc/cpuinfo reader",
+				     "the temporary file is not writable");
+			return;
+		}
+	}
+
+	l1 = l2 = l3 = -1;
+	jent_get_cachesize_cpuinfo_file(path, &l1, &l2, &l3);
+	JENT_UT_EQ(l1, A57_L1, "the reader finds the core past a long line");
+	JENT_UT_EQ(l2, A57_L2, "with its L2");
+	JENT_UT_EQ(l3, 0, "and no L3, which the part number does not tell");
+
+	/* The whole chain, with sysfs gone and the file in place. */
+	{
+		long s1, s2, s3;
+		const char *saved = jent_test_sysfs_root;
+
+		jent_get_cachesize_sysconf(&s1, &s2, &s3);
+		jent_test_sysfs_root = "/nonexistent/jent/sys/devices/system/cpu";
+		jent_test_cpuinfo = path;
+		jent_get_cachesize_uncached(&l1, &l2, &l3);
+		jent_test_sysfs_root = saved;
+		jent_test_cpuinfo = "/proc/cpuinfo";
+
+		if (s1 > 0)
+			JENT_UT_EQ(l1, s1, "an L1 from sysconf is not second-guessed");
+		else
+			JENT_UT_EQ(l1, A57_L1,
+				   "without sysfs and sysconf the core type answers");
+	}
+	unlink(path);
+}
+#else
+static void test_cache_cpuinfo(void)
+{
+	JENT_UT_SKIP("the Arm core types of /proc/cpuinfo",
+		     "not the Linux backend on Arm");
+}
+#endif
+
 /* The "online" CPU list, in every shape the kernel writes and some it cannot. */
 
 int main(void)
@@ -487,6 +677,7 @@ int main(void)
 	test_cache_sysconf_fallback();
 	test_cache_parsers();
 	test_sysfs_cache_walk();
+	test_cache_cpuinfo();
 
 	return jent_ut_report("unit-arch-cache");
 }

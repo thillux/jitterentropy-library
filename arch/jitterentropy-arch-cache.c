@@ -667,6 +667,210 @@ static void jent_get_cachesize_sysfs(long *l1, long *l2, long *l3)
 }
 #undef JENT_SYSFS_CPU_DIR
 
+#if defined(__aarch64__) || defined(__arm__)
+/*
+ * The largest cache sizes the Technical Reference Manual of an Arm core type
+ * allows, keyed by the "CPU implementer" and "CPU part" fields of /proc/cpuinfo
+ * - the last resort of the Linux backend on Arm.
+ *
+ * The cache ID registers CLIDR_EL1 and CCSIDR_EL1 are not readable at EL0, so
+ * userspace has only what the kernel publishes. Linux has no cache sysfs on
+ * arm64 before 4.0, and since 4.12 ("arm64: cacheinfo: Remove CCSIDR-based
+ * cache information probing") the sizes in it are what the device tree or the
+ * ACPI PPTT state - often nothing. bionic's sysconf() reports no cache size on
+ * arm64 in any Android release, and SELinux keeps an app out of the device
+ * tree. A Nexus 5X, on Linux 3.10, is left without a single cache size.
+ *
+ * Where the TRM lets the licensee choose a size, the entry is the largest it
+ * allows, and the L2 entry the largest L2 even where the L2 cache is optional:
+ * the working set derived from them is never smaller than the real caches, so
+ * the memory access still misses where the core has the largest caches its
+ * design permits. The L3 cache of a DynamIQ cluster belongs to its DSU, which
+ * the core's part number does not identify, so no L3 is known. The implementer
+ * is part of the key: 0xd49 is a Neoverse N2 under Arm's and an Azure Cobalt
+ * 100 under Microsoft's.
+ */
+struct jent_arm_core_cache {
+	unsigned long implementer;
+	unsigned long part;
+	long l1;
+	long l2;
+};
+
+static const struct jent_arm_core_cache jent_arm_core_caches[] = {
+	/* Arm Ltd */
+	{ 0x41, 0xd03, 64 << 10, 2048 << 10 },	/* Cortex-A53 */
+	{ 0x41, 0xd04, 64 << 10, 1024 << 10 },	/* Cortex-A35 */
+	{ 0x41, 0xd05, 64 << 10,  256 << 10 },	/* Cortex-A55 */
+	{ 0x41, 0xd07, 32 << 10, 2048 << 10 },	/* Cortex-A57 */
+	{ 0x41, 0xd08, 32 << 10, 4096 << 10 },	/* Cortex-A72 */
+	{ 0x41, 0xd09, 64 << 10, 8192 << 10 },	/* Cortex-A73 */
+	{ 0x41, 0xd0a, 64 << 10,  512 << 10 },	/* Cortex-A75 */
+	{ 0x41, 0xd0b, 64 << 10,  512 << 10 },	/* Cortex-A76 */
+	{ 0x41, 0xd0c, 64 << 10, 1024 << 10 },	/* Neoverse N1 */
+	{ 0x41, 0xd0d, 64 << 10,  512 << 10 },	/* Cortex-A77 */
+	{ 0x41, 0xd40, 64 << 10, 1024 << 10 },	/* Neoverse V1 */
+	{ 0x41, 0xd41, 64 << 10,  512 << 10 },	/* Cortex-A78 */
+	{ 0x41, 0xd44, 64 << 10, 1024 << 10 },	/* Cortex-X1 */
+	{ 0x41, 0xd46, 64 << 10,  512 << 10 },	/* Cortex-A510 */
+	{ 0x41, 0xd47, 64 << 10,  512 << 10 },	/* Cortex-A710 */
+	{ 0x41, 0xd48, 64 << 10, 1024 << 10 },	/* Cortex-X2 */
+	{ 0x41, 0xd49, 64 << 10, 1024 << 10 },	/* Neoverse N2 */
+	{ 0x41, 0xd4b, 64 << 10,  512 << 10 },	/* Cortex-A78C */
+	{ 0x41, 0xd4c, 64 << 10, 1024 << 10 },	/* Cortex-X1C */
+	{ 0x41, 0xd4d, 64 << 10,  512 << 10 },	/* Cortex-A715 */
+	{ 0x41, 0xd4e, 64 << 10, 1024 << 10 },	/* Cortex-X3 */
+	{ 0x41, 0xd4f, 64 << 10, 2048 << 10 },	/* Neoverse V2 */
+	{ 0x41, 0xd80, 64 << 10,  512 << 10 },	/* Cortex-A520 */
+	{ 0x41, 0xd81, 64 << 10,  512 << 10 },	/* Cortex-A720 */
+	{ 0x41, 0xd82, 64 << 10, 2048 << 10 },	/* Cortex-X4 */
+	{ 0x41, 0xd84, 64 << 10, 3072 << 10 },	/* Neoverse V3 */
+	{ 0x41, 0xd85, 64 << 10, 3072 << 10 },	/* Cortex-X925 */
+	{ 0x41, 0xd87, 64 << 10, 1024 << 10 },	/* Cortex-A725 */
+
+	/*
+	 * Qualcomm, for the Arm cores it ships under its own part numbers -
+	 * those Linux applies the Arm core's errata to (cpu_errata.c).
+	 */
+	{ 0x51, 0x801, 64 << 10, 2048 << 10 },	/* Kryo 2XX Silver: Cortex-A53 */
+	{ 0x51, 0x804, 64 << 10,  512 << 10 },	/* Kryo 4XX Gold: Cortex-A76 */
+	{ 0x51, 0x805, 64 << 10,  256 << 10 },	/* Kryo 4XX Silver: Cortex-A55 */
+};
+
+/*
+ * One line of /proc/cpuinfo. @implementer carries the "CPU implementer" of the
+ * block the line belongs to, -1 before one was seen; a "CPU part" line looks
+ * the pair up and raises @l1 and @l2 to the sizes of a core type it knows.
+ * Like the sysfs walk, the largest seen at each level is kept.
+ */
+static void jent_cpuinfo_arm_line(const char *line, long *implementer,
+				  long *l1, long *l2)
+{
+	const char *val = strchr(line, ':');
+	unsigned long v;
+	size_t keylen, i;
+	char *endptr;
+
+	if (!val)
+		return;
+
+	/* The key, without the padding the file puts before the colon. */
+	keylen = (size_t)(val - line);
+	while (keylen && (line[keylen - 1] == ' ' || line[keylen - 1] == '\t'))
+		keylen--;
+
+	/* A block per CPU; an implementer never carries over to the next. */
+	if (keylen == 9 && !strncmp(line, "processor", 9)) {
+		*implementer = -1;
+		return;
+	}
+
+	errno = 0;
+	v = strtoul(val + 1, &endptr, 0);
+	if (errno != 0 || endptr == val + 1)
+		return;
+
+	if (keylen == 15 && !strncmp(line, "CPU implementer", 15)) {
+		*implementer = (long)v;
+		return;
+	}
+
+	if (keylen != 8 || strncmp(line, "CPU part", 8) || *implementer < 0)
+		return;
+
+	for (i = 0; i < JENT_ARRAY_SIZE(jent_arm_core_caches); i++) {
+		const struct jent_arm_core_cache *c = &jent_arm_core_caches[i];
+
+		if (c->implementer != (unsigned long)*implementer ||
+		    c->part != v)
+			continue;
+
+		if (c->l1 > *l1)
+			*l1 = c->l1;
+		if (c->l2 > *l2)
+			*l2 = c->l2;
+		return;
+	}
+}
+
+/*
+ * @path is a parameter for the reason JENT_SYSFS_CPU_DIR is: pointing it at
+ * nothing lets a test reach what lies behind it.
+ */
+static void jent_get_cachesize_cpuinfo_file(const char *path,
+					    long *l1, long *l2, long *l3)
+{
+	/* Longer than any line looked at; the Features line is skipped. */
+	char chunk[512], line[64];
+	size_t len = 0;
+	long implementer = -1;
+	int fd, overlong = 0;
+
+	*l1 = 0;
+	*l2 = 0;
+	*l3 = 0;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return;
+
+	for (;;) {
+		ssize_t rlen, i;
+
+		do {
+			rlen = read(fd, chunk, sizeof(chunk));
+		} while (rlen < 0 && errno == EINTR);
+		if (rlen <= 0)
+			break;
+
+		for (i = 0; i < rlen; i++) {
+			if (chunk[i] != '\n') {
+				if (len < sizeof(line) - 1)
+					line[len++] = chunk[i];
+				else
+					overlong = 1;
+				continue;
+			}
+
+			line[len] = '\0';
+			if (!overlong)
+				jent_cpuinfo_arm_line(line, &implementer,
+						      l1, l2);
+			len = 0;
+			overlong = 0;
+		}
+	}
+	close(fd);
+
+	/* A last line without its newline. */
+	if (len && !overlong) {
+		line[len] = '\0';
+		jent_cpuinfo_arm_line(line, &implementer, l1, l2);
+	}
+}
+
+#ifndef JENT_PROC_CPUINFO
+# define JENT_PROC_CPUINFO "/proc/cpuinfo"
+#endif
+static void jent_get_cachesize_cpuinfo(long *l1, long *l2, long *l3)
+{
+	jent_get_cachesize_cpuinfo_file(JENT_PROC_CPUINFO, l1, l2, l3);
+}
+#undef JENT_PROC_CPUINFO
+#endif /* __aarch64__ || __arm__ */
+
+/* Raise each level to what a later source found, never lowering one. */
+static void jent_cache_sizes_merge(long *l1, long *l2, long *l3,
+				   long s1, long s2, long s3)
+{
+	if (s1 > *l1)
+		*l1 = s1;
+	if (s2 > *l2)
+		*l2 = s2;
+	if (s3 > *l3)
+		*l3 = s3;
+}
+
 static void jent_get_cachesize_uncached(long *l1, long *l2, long *l3)
 {
 	long s1 = 0, s2 = 0, s3 = 0;
@@ -688,12 +892,16 @@ static void jent_get_cachesize_uncached(long *l1, long *l2, long *l3)
 	 * result is never made worse.
 	 */
 	jent_get_cachesize_sysconf(&s1, &s2, &s3);
-	if (s1 > *l1)
-		*l1 = s1;
-	if (s2 > *l2)
-		*l2 = s2;
-	if (s3 > *l3)
-		*l3 = s3;
+	jent_cache_sizes_merge(l1, l2, l3, s1, s2, s3);
+
+#if defined(__aarch64__) || defined(__arm__)
+	if (*l1 > 0)
+		return;
+
+	/* Still nothing: the largest the TRMs of the core types present allow. */
+	jent_get_cachesize_cpuinfo(&s1, &s2, &s3);
+	jent_cache_sizes_merge(l1, l2, l3, s1, s2, s3);
+#endif
 }
 
 #elif defined(JENT_ARCH_CACHE_APPLE)
