@@ -14,12 +14,15 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -41,6 +44,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -85,100 +89,137 @@ fun CollectorScreen(model: CollectorViewModel = viewModel()) {
     Scaffold(
         topBar = { TopAppBar(title = { Text(stringResource(R.string.app_name)) }) }
     ) { insets ->
-        Column(
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(insets)
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .padding(horizontal = 16.dp, vertical = 8.dp)
         ) {
-            Text(
-                stringResource(R.string.version, JitterEntropy.version),
-                style = MaterialTheme.typography.titleMedium
-            )
-            Text(
-                model.state,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            // Stacked, the controls take all the height a landscape screen
+            // has and leave the output none: side by side there.
+            if (maxWidth > maxHeight) {
+                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Controls(
+                        model,
+                        Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .verticalScroll(rememberScrollState())
+                    )
+                    Output(model.output, Modifier.weight(1f))
+                }
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Controls(model)
+                    Output(model.output, Modifier.weight(1f, fill = false))
+                }
+            }
+        }
+    }
+}
 
+/** The collector's state, the buttons that replace it and those that use it. */
+@Composable
+private fun Controls(model: CollectorViewModel, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text(
+            stringResource(R.string.version, JitterEntropy.version),
+            style = MaterialTheme.typography.titleMedium
+        )
+        Text(
+            model.state,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Text(
+            stringResource(R.string.new_collector),
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        // The row is the switch, so that the label toggles it as well and
+        // TalkBack announces the two as one control.
+        Row(
+            modifier = Modifier.toggleable(
+                value = model.timerThread,
+                enabled = !model.allocating,
+                role = Role.Switch,
+                onValueChange = { model.timerThread = it }
+            ),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Switch(
+                checked = model.timerThread,
+                onCheckedChange = null,
+                enabled = !model.allocating
+            )
+            Text(stringResource(R.string.timer_thread))
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            for ((mode, label) in listOf(
+                JitterEntropy.Mode.DEFAULT to R.string.mode_default,
+                JitterEntropy.Mode.FIPS to R.string.mode_fips,
+                JitterEntropy.Mode.NTG1 to R.string.mode_ntg1
+            )) {
+                // NTG.1 forbids the timer thread; the library refuses it.
+                val refused = mode == JitterEntropy.Mode.NTG1 &&
+                    model.timerThread
+                OutlinedButton(
+                    onClick = { model.allocate(mode) },
+                    enabled = !model.allocating && !refused,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(stringResource(label))
+                }
+            }
+        }
+        if (model.timerThread || model.timerThreadUsed) {
             Text(
-                stringResource(R.string.new_collector),
-                style = MaterialTheme.typography.labelLarge,
+                stringResource(R.string.timer_thread_note),
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            FilledTonalButton(
+                onClick = model::showStatus,
+                enabled = model.ready,
+                modifier = Modifier.weight(1f)
             ) {
-                Switch(
-                    checked = model.timerThread,
-                    onCheckedChange = { model.timerThread = it },
-                    enabled = !model.allocating
-                )
-                Text(stringResource(R.string.timer_thread))
+                Text(stringResource(R.string.show_status))
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                for ((mode, label) in listOf(
-                    JitterEntropy.Mode.DEFAULT to R.string.mode_default,
-                    JitterEntropy.Mode.FIPS to R.string.mode_fips,
-                    JitterEntropy.Mode.NTG1 to R.string.mode_ntg1
-                )) {
-                    // NTG.1 forbids the timer thread; the library refuses it.
-                    val refused = mode == JitterEntropy.Mode.NTG1 &&
-                        model.timerThread
-                    OutlinedButton(
-                        onClick = { model.allocate(mode) },
-                        enabled = !model.allocating && !refused,
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(stringResource(label))
-                    }
-                }
+            Button(
+                onClick = model::generate,
+                enabled = model.ready,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(stringResource(R.string.generate))
             }
-            if (model.timerThread || model.timerThreadUsed) {
-                Text(
-                    stringResource(R.string.timer_thread_note),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+        }
+    }
+}
 
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                FilledTonalButton(
-                    onClick = model::showStatus,
-                    enabled = model.ready,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text(stringResource(R.string.show_status))
-                }
-                Button(
-                    onClick = model::generate,
-                    enabled = model.ready,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text(stringResource(R.string.generate))
-                }
-            }
+/** The status document or the output, scrolling within the space it is given. */
+@Composable
+private fun Output(text: String, modifier: Modifier = Modifier) {
+    if (text.isEmpty())
+        return
 
-            if (model.output.isNotEmpty()) {
-                OutlinedCard(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f, fill = false)
-                ) {
-                    SelectionContainer {
-                        Text(
-                            model.output,
-                            fontFamily = FontFamily.Monospace,
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier
-                                .verticalScroll(rememberScrollState())
-                                .padding(12.dp)
-                        )
-                    }
-                }
-            }
+    OutlinedCard(modifier = modifier.fillMaxWidth()) {
+        SelectionContainer {
+            Text(
+                text,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(12.dp)
+            )
         }
     }
 }
