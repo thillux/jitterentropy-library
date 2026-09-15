@@ -10,9 +10,11 @@ replace the collector with a new one - without flags, in FIPS
 (`JENT_FORCE_FIPS`) or in NTG.1 (`JENT_NTG1`) mode - after running the
 power-on tests with the same flags. Both modes require the collector's state to
 be locked and fail with EMEM where it cannot be. That is one page per collector,
-a second with the timer thread and two more while the power-on tests run, which
-the 64 KiB `RLIMIT_MEMLOCK` Android gives every app holds; the memory access
-region is never locked.
+a second with the timer thread and two more while the power-on tests run - 16 KiB
+at most, which any `RLIMIT_MEMLOCK` an Android app gets holds: 64 KiB, which
+`init.rc` sets since Android 14, and before that the kernel's default - 64 KiB
+on mainline kernels before 5.16, 8 MiB since, or whatever the vendor kernel
+chose (64 MiB on a Nexus 5X). The memory access region is never locked.
 
 The *Timer thread* switch above those buttons allocates the next collector with
 `JENT_FORCE_INTERNAL_TIMER`: its time stamps then come from the library's timer
