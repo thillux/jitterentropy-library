@@ -1320,6 +1320,108 @@ jobs:
           }
           plutil -p "$app/Info.plist"
 
+  apple-embedded:
+    name: ${{ matrix.platform }} cross-build
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: watchOS
+            device_sdk: watchos
+            sim_sdk: watchsimulator
+          - platform: tvOS
+            device_sdk: appletvos
+            sim_sdk: appletvsimulator
+          - platform: visionOS
+            device_sdk: xros
+            sim_sdk: xrsimulator
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the SDKs are installed
+        run: |
+          for sdk in '${{ matrix.device_sdk }}' '${{ matrix.sim_sdk }}'; do
+            xcrun --sdk "$sdk" --show-sdk-path || {
+              echo "::error::no $sdk SDK in $(xcode-select -p)"
+              xcodebuild -showsdks
+              exit 1
+            }
+          done
+
+      - name: Cross-build the library
+        run: |
+          platform='${{ matrix.platform }}'
+          # WATCHOS, TVOS, VISIONOS - the token vtool prints for the device
+          # SDK; the simulator SDKs append SIMULATOR to it.
+          platform_uc=$(printf '%s' "$platform" | tr '[:lower:]' '[:upper:]')
+
+          for sdk in '${{ matrix.device_sdk }}' '${{ matrix.sim_sdk }}'; do
+            case "$sdk" in
+            *simulator)	expect="${platform_uc}SIMULATOR" ;;
+            *)		expect="$platform_uc" ;;
+            esac
+
+            for shared in ON OFF; do
+              build="build-$sdk-$shared"
+              echo "::group::$platform / $sdk / shared=$shared"
+
+              #
+              # The tools and the test programs are left out: CMake makes an
+              # executable a MACOSX_BUNDLE target on every embedded Apple
+              # platform, and their install() calls name no bundle
+              # destination, so configuring with them fails before the
+              # library is reached. This is not particular to the three
+              # platforms here - CMAKE_SYSTEM_NAME=iOS fails the same way,
+              # which is why tests/ios is a project of its own.
+              #
+              cmake -S . -B "$build" \
+                -DCMAKE_SYSTEM_NAME="$platform" \
+                -DCMAKE_OSX_SYSROOT="$sdk" \
+                -DBUILD_SHARED_LIBS="$shared" \
+                -DENABLE_TOOLS=OFF -DBUILD_TESTING=OFF
+              cmake --build "$build" -j "$(sysctl -n hw.ncpu)"
+
+              if [ "$shared" = ON ]; then
+                lib="$build/libjitterentropy.dylib"
+                #
+                # The dynamic link is what makes this job worth running: the
+                # Apple back-ends reach for Mach and BSD interfaces
+                # (thread_policy_set, pthread_mach_thread_np, sysctlbyname,
+                # arc4random_buf, mlock) through a plain __APPLE__ guard that
+                # tells these platforms apart from macOS in no way at all.
+                # One of them missing here is a link error rather than a
+                # consumer's problem.
+                #
+                test -f "$lib" || {
+                  echo "::error::$sdk shared build produced no $lib"
+                  exit 1
+                }
+                xcrun vtool -show-build "$lib"
+                got=$(xcrun vtool -show-build "$lib" |
+                      awk '$1 == "platform" { print $2 }')
+                [ "$got" = "$expect" ] || {
+                  echo "::error::$lib is stamped $got, expected $expect"
+                  exit 1
+                }
+                xcrun nm -gU "$lib" | grep -q ' _jent_read_entropy$' || {
+                  echo "::error::$lib exports no jent_read_entropy"
+                  exit 1
+                }
+              else
+                lib="$build/libjitterentropy.a"
+                test -f "$lib" || {
+                  echo "::error::$sdk static build produced no $lib"
+                  exit 1
+                }
+                xcrun lipo -info "$lib"
+              fi
+
+              echo "::endgroup::"
+            done
+          done
+
   makefile:
     name: Makefile / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
