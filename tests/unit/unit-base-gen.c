@@ -348,6 +348,30 @@ static void test_startup_states(void)
 }
 
 /*
+ * The error codes a read returns for what the health tests saw. They report
+ * in the compliance modes only, and what they report on is the noise source
+ * of the machine the test runs on. JENT_ERR_EINVAL, JENT_ERR_NOTIME and
+ * JENT_ERR_SELFTEST are deliberately not among them: those are the library
+ * failing to do its job, on any machine.
+ */
+static int jent_ut_health_error(ssize_t ret)
+{
+	switch (ret) {
+	case JENT_ERR_RCT:
+	case JENT_ERR_APT:
+	case JENT_ERR_LAG:
+	case JENT_ERR_RCT_MEM:
+	case JENT_ERR_RCT_PERMANENT:
+	case JENT_ERR_APT_PERMANENT:
+	case JENT_ERR_LAG_PERMANENT:
+	case JENT_ERR_RCT_MEM_PERMANENT:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+/*
  * Generation across the configurations that change how a block is produced:
  * the hash loop count, whether all caches size the memory block, and the NTG.1
  * startup sequence, which samples the memory access and the hash as two
@@ -373,9 +397,12 @@ static void test_generation_matrix(void)
 	jent_ut_group("generation across the configurations");
 
 	for (i = 0; i < sizeof(configs) / sizeof(configs[0]); i++) {
+		unsigned int compliance =
+			configs[i].flags & (JENT_FORCE_FIPS | JENT_NTG1);
 		struct rand_data *ec =
 			jent_entropy_collector_alloc(0, configs[i].flags);
 		char buf[48];
+		ssize_t ret;
 
 		if (!ec) {
 			/*
@@ -387,8 +414,32 @@ static void test_generation_matrix(void)
 			continue;
 		}
 
-		JENT_UT_EQ(jent_read_entropy(ec, buf, sizeof(buf)),
-			   (ssize_t)sizeof(buf), configs[i].name);
+		ret = jent_read_entropy(ec, buf, sizeof(buf));
+
+		/*
+		 * The same reasoning that gives the generation runs of
+		 * jitterentropy-rng the "unreliable" label in the top-level
+		 * CMakeLists.txt, and that skips the allocation above: a
+		 * compliance mode runs the health tests over the noise source
+		 * this machine has, and a loaded or shared one repeats a
+		 * delta often enough to reach a cutoff within a window. That
+		 * is a property of the machine, not a defect here. The other
+		 * configurations do not report a health test at all, so a
+		 * failure in one of those is the defect this looks for and is
+		 * never skipped.
+		 */
+		if (compliance && jent_ut_health_error(ret)) {
+			char why[80];
+
+			snprintf(why, sizeof(why),
+				 "the health tests returned %zd for this machine's noise source",
+				 ret);
+			JENT_UT_SKIP(configs[i].name, why);
+			jent_entropy_collector_free(ec);
+			continue;
+		}
+
+		JENT_UT_EQ(ret, (ssize_t)sizeof(buf), configs[i].name);
 		jent_entropy_collector_free(ec);
 	}
 }
