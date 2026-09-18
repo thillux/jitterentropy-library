@@ -185,13 +185,23 @@ if(ENABLE_COVERAGE)
     add_link_options(--coverage)
 endif()
 
-if(BUILD_SHARED_LIBS)
-  set(JITTER_PC_LIBS "-l${CMAKE_PROJECT_NAME}")
-  set(JITTER_PC_LIBS_PRIVATE "")
-else()
-  set(JITTER_PC_LIBS "")
-  set(JITTER_PC_LIBS_PRIVATE "-l${CMAKE_PROJECT_NAME}")
-endif()
+# The library itself belongs in Libs whether it is shared or static: plain
+# "pkg-config --libs" does not print Libs.private, and a static-only install
+# must still name the archive there. Libs.private is for what the archive
+# depends on (-pthread, the stack protector flag, -lbcrypt), which only a
+# static link has to be told about; those are appended further down.
+set(JITTER_PC_LIBS "-l${CMAKE_PROJECT_NAME}")
+set(JITTER_PC_LIBS_PRIVATE "")
+
+# Requires.private: the pkg-config modules a static link has to resolve as
+# well, set only where one was found. Initialized here rather than only in the
+# branches that set it, because this project can be add_subdirectory()'d -
+# tests/ios/CMakeLists.txt does exactly that - and an unset variable in
+# configure_file() takes the parent scope's value, so a JITTER_PC_REQUIRES_PRIVATE
+# belonging to something else would be written into our .pc file. There is no
+# "Requires:" counterpart: nothing is needed to *compile* against
+# jitterentropy.h, which includes no other package's headers.
+set(JITTER_PC_REQUIRES_PRIVATE "")
 
 # Appended to the Cflags line of the .pc file. Only the Windows static build
 # has anything to put here; see the JENT_STATIC_LIB branch further down.
@@ -234,12 +244,6 @@ else()
         list(APPEND JITTER_C_FLAGS  -m64 -Kpic -errtags=yes -erroff=E_KW_IS_AN_EXTENSION_OF_ANSI,E_ASM_UNUSED_PARAM)
     else()
         list(APPEND JITTER_C_FLAGS  -fwrapv --param ssp-buffer-size=4 -fPIE -fPIC)
-    endif()
-
-    if ((NOT GCC) OR (GCC AND CMAKE_C_COMPILER_VERSION VERSION_GREATER "4.3"))
-        # Before GCC 4.3 this meant something else entirely.
-        # https://gcc.gnu.org/wiki/NewWconversion.
-        set(JITTER_COMPILE_FLAGS "${JITTER_COMPILE_FLAGS} -Wconversion")
     endif()
 endif()
 
@@ -299,10 +303,12 @@ if(STACK_PROTECTOR)
             # Every target compiled with the flag needs it on its own link
             # command, and a shared library propagates nothing to the test
             # programs. add_link_options() reaches every target created after
-            # it, tests/ included.
+            # it, tests/ included - but only in this build: it is a directory
+            # property, not a target one, and nothing of it is exported.
             add_link_options(${JITTER_SSP_FLAG})
 
-            # Kept for the .pc file only; the link itself is handled above.
+            # Kept for the static consumers, the exported CMake target and the
+            # .pc file, both handled once the library target exists below.
             set(JITTER_SSP_LINK_FLAGS ${JITTER_SSP_FLAG})
         else()
             message(WARNING
@@ -375,19 +381,43 @@ endfunction()
 # from the script just goes missing from the library. A function for the scope;
 # block() is CMake 3.25 and this project asks for 3.22.
 function(jent_check_version_script header script linktest)
+    # Every exported function is declared as a bare "JENT_PRIVATE_STATIC" line
+    # followed by the declaration. The declaration need not be on the very next
+    # line - a long return type may stand on its own - so the lines after the
+    # marker are read until one names a function, and anything that ends the
+    # declaration before that is a parse failure rather than a silent skip: a
+    # declaration this loop dropped would be compared against nothing, the two
+    # lists would still agree, and a function omitted from version.lds as well
+    # would quietly stop being exported on ELF.
     set(header_api "")
-    set(take_next FALSE)
+    set(pending "")
+    set(pending_line 0)
+    set(lineno 0)
     file(STRINGS "${header}" lines)
     foreach(line IN LISTS lines)
-        if(take_next)
-            if(line MATCHES "(jent_[A-Za-z0-9_]+)\\(")
+        math(EXPR lineno "${lineno} + 1")
+        if(pending)
+            if(line MATCHES "(jent_[A-Za-z0-9_]+)[ \t]*\\(")
                 list(APPEND header_api "${CMAKE_MATCH_1}")
+                set(pending "")
+            elseif(line MATCHES "^[ \t]*$" OR line MATCHES "^[ \t]*[#/*]" OR
+                   line MATCHES "^JENT_PRIVATE_STATIC" OR line MATCHES ";")
+                message(FATAL_ERROR
+                    "${header}:${pending_line}: JENT_PRIVATE_STATIC is not "
+                    "followed by a function declaration this parser "
+                    "understands, so it would be left out of the comparison "
+                    "with ${script}. Stopped at line ${lineno}: '${line}'")
             endif()
-            set(take_next FALSE)
         elseif(line MATCHES "^JENT_PRIVATE_STATIC$")
-            set(take_next TRUE)
+            set(pending TRUE)
+            set(pending_line "${lineno}")
         endif()
     endforeach()
+    if(pending)
+        message(FATAL_ERROR
+            "${header}:${pending_line}: JENT_PRIVATE_STATIC at the end of the "
+            "file with no function declaration after it.")
+    endif()
 
     # Only between "global:" and "local:", so the commentary above them is
     # not read as part of the list.
@@ -433,9 +463,13 @@ jent_check_version_script("${CMAKE_CURRENT_SOURCE_DIR}/jitterentropy.h"
                           "${CMAKE_CURRENT_SOURCE_DIR}/tests/linking/jitterentropy-linktest.c")
 
 # As bcrypt below: a static consumer links this archive's instrumented frames
-# and must resolve the symbols itself. The exported CMake target says so, the
-# .pc file does not.
+# and must resolve __stack_chk_fail/__stack_chk_guard itself, which on Solaris
+# means the flag on its own link command. add_link_options() above is not
+# exported, so the flag goes onto the target as an INTERFACE link option, where
+# install(EXPORT) carries it into jitterentropyTargets.cmake; the .pc file gets
+# it in Libs.private. A shared library resolved the symbols at its own link.
 if(JITTER_SSP_LINK_FLAGS AND NOT BUILD_SHARED_LIBS)
+    target_link_options(${PROJECT_NAME} INTERFACE ${JITTER_SSP_LINK_FLAGS})
     set(JITTER_PC_LIBS_PRIVATE "${JITTER_PC_LIBS_PRIVATE} ${JITTER_SSP_LINK_FLAGS}")
 endif()
 
@@ -501,16 +535,124 @@ target_include_directories(${PROJECT_NAME} PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/arch>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
 
-if(EXTERNAL_CRYPTO STREQUAL "AWSLC")
-    # Unique to AWS-LC.
-    set(EXTERNAL_CRYPTO_HEADER "openssl/base.h")
-    set(EXTERNAL_CRYPTO_LIBRARY_NAME libcrypto)
-elseif(EXTERNAL_CRYPTO STREQUAL "OPENSSL")
-    set(EXTERNAL_CRYPTO_HEADER "openssl/crypto.h")
-    set(EXTERNAL_CRYPTO_LIBRARY_NAME libcrypto)
+# The external crypto library. Found for what it is, not for how this library
+# is linked: a static jitterentropy used to go looking for a static libcrypto.a,
+# which most distributions do not install, and carried on with a NOTFOUND
+# library until generation failed. Either linkage links whatever the system
+# has, and a static archive's dependents are told what to add below.
+#
+# LIBCRYPTO_INCLUDE_DIR and LIBCRYPTO_LIBRARY are what the programs absorbing
+# the library sources (tests/gcd, tests/unit, the AMALGAMATED recording tool)
+# add for themselves. Linked PRIVATE here: jitterentropy.h includes none of
+# these headers, so a consumer needs neither them nor, for a shared library,
+# the link.
+set(JENT_CONFIG_DEPENDENCIES "")
+if(EXTERNAL_CRYPTO STREQUAL "AWSLC" OR EXTERNAL_CRYPTO STREQUAL "OPENSSL")
+    # AWS-LC installs itself as libcrypto with OpenSSL's headers, so the one
+    # module finds both; OPENSSL_ROOT_DIR chooses between them when both are
+    # installed. On Windows it finds the import library, not the DLL.
+    find_package(OpenSSL COMPONENTS Crypto)
+    if(NOT OPENSSL_FOUND OR NOT TARGET OpenSSL::Crypto)
+        message(FATAL_ERROR
+            "EXTERNAL_CRYPTO=${EXTERNAL_CRYPTO}: no libcrypto found. Install "
+            "its development files or set OPENSSL_ROOT_DIR to the prefix "
+            "holding include/openssl and the library.")
+    endif()
+    # openssl/base.h is unique to AWS-LC (and BoringSSL): without it, what was
+    # found is OpenSSL, and AWSLC would compile against the wrong API.
+    if(EXTERNAL_CRYPTO STREQUAL "AWSLC" AND
+       NOT EXISTS "${OPENSSL_INCLUDE_DIR}/openssl/base.h")
+        message(FATAL_ERROR
+            "EXTERNAL_CRYPTO=AWSLC: the libcrypto found at ${OPENSSL_INCLUDE_DIR} "
+            "is not AWS-LC (no openssl/base.h). Set OPENSSL_ROOT_DIR to the "
+            "AWS-LC installation.")
+    endif()
+    set(LIBCRYPTO_INCLUDE_DIR "${OPENSSL_INCLUDE_DIR}")
+    set(LIBCRYPTO_LIBRARY OpenSSL::Crypto)
+    message(STATUS "Found external crypto library ${OPENSSL_CRYPTO_LIBRARY}")
+
+    # A static archive exports the dependency as $<LINK_ONLY:OpenSSL::Crypto>,
+    # a target the consumer has to create again.
+    #
+    # The .pc file names the libcrypto module only once pkg-config confirms it
+    # exists, exactly as the LIBGCRYPT branch below does. FindOpenSSL does not
+    # go through pkg-config, so nothing about it says the installation found
+    # here ships a libcrypto.pc - a hand-built prefix reached through
+    # OPENSSL_ROOT_DIR, and some vcpkg and AWS-LC layouts, do not. An
+    # unresolvable name in Requires.private is not a static-link-only problem:
+    # pkg-config resolves that field for --cflags and --exists too, so every
+    # consumer of our .pc file would fail with "Package libcrypto was not
+    # found". Where there is no module, the library goes into Libs.private by
+    # its absolute path instead, which needs nothing found again.
+    if(NOT BUILD_SHARED_LIBS)
+        find_package(PkgConfig QUIET)
+        if(PKG_CONFIG_FOUND)
+            pkg_check_modules(JENT_PC_LIBCRYPTO QUIET libcrypto)
+        endif()
+        if(JENT_PC_LIBCRYPTO_FOUND)
+            set(JITTER_PC_REQUIRES_PRIVATE "libcrypto")
+        else()
+            # Filtered on EXISTS: FindOpenSSL reports the library as a plain
+            # path, but on the multi-configuration generators it can be a
+            # "optimized;<lib>;debug;<lib>" list, and those two keywords are
+            # not linker arguments. -lcrypto if that leaves nothing at all.
+            set(_jent_pc_crypto "")
+            foreach(_jent_lib IN LISTS OPENSSL_CRYPTO_LIBRARY)
+                if(EXISTS "${_jent_lib}")
+                    set(_jent_pc_crypto "${_jent_pc_crypto} ${_jent_lib}")
+                endif()
+            endforeach()
+            if(NOT _jent_pc_crypto)
+                set(_jent_pc_crypto " -lcrypto")
+            endif()
+            set(JITTER_PC_LIBS_PRIVATE
+                "${JITTER_PC_LIBS_PRIVATE}${_jent_pc_crypto}")
+        endif()
+        set(JENT_CONFIG_DEPENDENCIES "find_dependency(OpenSSL COMPONENTS Crypto)")
+    endif()
 elseif(EXTERNAL_CRYPTO STREQUAL "LIBGCRYPT")
-    set(EXTERNAL_CRYPTO_HEADER "gcrypt.h")
-    set(EXTERNAL_CRYPTO_LIBRARY_NAME libgcrypt)
+    # libgpg-error by name as well: gcrypt.h includes gpg-error.h, and a static
+    # libgcrypt.a leaves its symbols unresolved. pkg-config, where present, only
+    # adds search locations - libgcrypt shipped no .pc file before 1.9, so the
+    # enterprise distributions still in support have none.
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(JENT_PC_GCRYPT QUIET libgcrypt)
+        pkg_check_modules(JENT_PC_GPG_ERROR QUIET gpg-error)
+    endif()
+    find_path(JENT_GCRYPT_INCLUDE_DIR NAMES gcrypt.h
+              HINTS ${JENT_PC_GCRYPT_INCLUDE_DIRS})
+    find_path(JENT_GPG_ERROR_INCLUDE_DIR NAMES gpg-error.h
+              HINTS ${JENT_PC_GPG_ERROR_INCLUDE_DIRS} ${JENT_PC_GCRYPT_INCLUDE_DIRS})
+    find_library(JENT_GCRYPT_LIBRARY NAMES gcrypt libgcrypt
+                 HINTS ${JENT_PC_GCRYPT_LIBRARY_DIRS})
+    find_library(JENT_GPG_ERROR_LIBRARY NAMES gpg-error libgpg-error
+                 HINTS ${JENT_PC_GPG_ERROR_LIBRARY_DIRS} ${JENT_PC_GCRYPT_LIBRARY_DIRS})
+    foreach(_jent_var JENT_GCRYPT_INCLUDE_DIR JENT_GPG_ERROR_INCLUDE_DIR
+                      JENT_GCRYPT_LIBRARY JENT_GPG_ERROR_LIBRARY)
+        if(NOT ${_jent_var})
+            message(FATAL_ERROR
+                "EXTERNAL_CRYPTO=LIBGCRYPT: ${_jent_var} not found. Install the "
+                "libgcrypt and libgpg-error development files, or add their "
+                "prefix to CMAKE_PREFIX_PATH.")
+        endif()
+    endforeach()
+    set(LIBCRYPTO_INCLUDE_DIR
+        "${JENT_GCRYPT_INCLUDE_DIR}" "${JENT_GPG_ERROR_INCLUDE_DIR}")
+    list(REMOVE_DUPLICATES LIBCRYPTO_INCLUDE_DIR)
+    set(LIBCRYPTO_LIBRARY "${JENT_GCRYPT_LIBRARY}" "${JENT_GPG_ERROR_LIBRARY}")
+    message(STATUS "Found external crypto library ${JENT_GCRYPT_LIBRARY}")
+
+    # Exported as absolute paths, which need nothing found again. The .pc file
+    # names the module where there is one - its own Requires.private brings in
+    # gpg-error - and the libraries where there is not.
+    if(NOT BUILD_SHARED_LIBS)
+        if(JENT_PC_GCRYPT_FOUND)
+            set(JITTER_PC_REQUIRES_PRIVATE "libgcrypt")
+        else()
+            set(JITTER_PC_LIBS_PRIVATE "${JITTER_PC_LIBS_PRIVATE} -lgcrypt -lgpg-error")
+        endif()
+    endif()
 elseif(NOT EXTERNAL_CRYPTO)
     message(STATUS "Using internal functions for everything")
 else()
@@ -518,29 +660,8 @@ else()
 endif()
 
 if(EXTERNAL_CRYPTO)
-    find_path(LIBCRYPTO_INCLUDE_DIR
-            NAMES "${EXTERNAL_CRYPTO_HEADER}"
-            PATH_SUFFIXES include
-            )
-    message(STATUS "Found external crypto headers at ${LIBCRYPTO_INCLUDE_DIR}")
-    target_include_directories(${PROJECT_NAME} PUBLIC ${LIBCRYPTO_INCLUDE_DIR})
-    if(BUILD_SHARED_LIBS)
-        find_library(LIBCRYPTO_LIBRARY
-                NAMES "${EXTERNAL_CRYPTO_LIBRARY_NAME}.so" "${EXTERNAL_CRYPTO_LIBRARY_NAME}.dylib" "${EXTERNAL_CRYPTO_LIBRARY_NAME}.dll"
-                HINTS "${CMAKE_INSTALL_PREFIX}"
-                PATH_SUFFIXES build/crypto build lib64 lib
-                )
-        set(JITTER_PC_REQUIRES "${EXTERNAL_CRYPTO_LIBRARY_NAME}")
-    else()
-        find_library(LIBCRYPTO_LIBRARY
-                NAMES "${EXTERNAL_CRYPTO_LIBRARY_NAME}.a" "${EXTERNAL_CRYPTO_LIBRARY_NAME}.lib"
-                HINTS "${CMAKE_INSTALL_PREFIX}"
-                PATH_SUFFIXES build/crypto build lib64 lib
-                )
-        set(JITTER_PC_REQUIRES_PRIVATE "${EXTERNAL_CRYPTO_LIBRARY_NAME}")
-    endif()
-    message(STATUS "Found external crypto library ${LIBCRYPTO_LIBRARY}")
-    target_link_libraries(${PROJECT_NAME} PUBLIC ${LIBCRYPTO_LIBRARY})
+    target_include_directories(${PROJECT_NAME} PRIVATE ${LIBCRYPTO_INCLUDE_DIR})
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${LIBCRYPTO_LIBRARY})
 endif()
 
 # "NOT ANDROID", not "NOT ${ANDROID}": undefined, that leaves "AND NOT" with no
@@ -599,6 +720,36 @@ endif()
 if(BUILD_TESTING)
     add_subdirectory(tests/unit)
     add_subdirectory(tests/fuzz)
+endif()
+
+# Assert the export set of the built shared library against version.lds,
+# which configure already checked against jitterentropy.h. The version script
+# is not applied on macOS or Windows, where JENT_PRIVATE_STATIC on an internal
+# declaration would export it. nm needs -D for ELF and must not get it for
+# Mach-O. PE (Windows, Cygwin, MSYS) is skipped: it exports from the same
+# declarations, so a leak shows on macOS as well.
+if(BUILD_TESTING AND BUILD_SHARED_LIBS AND NOT WIN32 AND NOT CYGWIN AND NOT MSYS)
+    find_program(JENT_NM NAMES nm llvm-nm)
+    if(JENT_NM)
+        if(APPLE)
+            set(JENT_NM_ARGS -g)
+        else()
+            set(JENT_NM_ARGS -D -g)
+        endif()
+        add_test(NAME exported-symbols
+                 COMMAND ${CMAKE_COMMAND}
+                         -DJENT_LIB=$<TARGET_FILE:${PROJECT_NAME}>
+                         -DJENT_VERSION_SCRIPT=${JITTER_VERSION_SCRIPT}
+                         -DJENT_NM=${JENT_NM}
+                         "-DJENT_NM_ARGS=${JENT_NM_ARGS}"
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/JentCheckExports.cmake)
+        # An nm output format the check cannot read is a skip.
+        set_tests_properties(exported-symbols PROPERTIES
+            SKIP_REGULAR_EXPRESSION "the export check does not know the output format")
+    else()
+        message(STATUS
+            "no nm found, not checking the export set of the shared library")
+    endif()
 endif()
 
 # Tools only: nothing here is driven by the suite.
@@ -774,6 +925,8 @@ if(ENABLE_COVERAGE)
 endif()
 
 # pkg-config
+# The private dependencies are appended with a leading blank each.
+string(STRIP "${JITTER_PC_LIBS_PRIVATE}" JITTER_PC_LIBS_PRIVATE)
 configure_package_config_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/cmake/jitterentropy.pc.in
   ${CMAKE_CURRENT_BINARY_DIR}/jitterentropy.pc
