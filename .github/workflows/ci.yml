@@ -91,6 +91,58 @@ jobs:
               echo "::warning::jitterentropy-rng $opt failed on this machine"
           done
 
+  # The only job building the stub half of jitterentropy-timer.c.
+  linux-no-internal-timer:
+    name: Linux / gcc / INTERNAL_TIMER=OFF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DINTERNAL_TIMER=OFF
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Run tests
+        run: |
+          ctest --test-dir build --output-on-failure -LE unreliable
+          ./build/tests/raw-entropy/recording_userspace/jitterentropy-rng 256 > /dev/null
+
+  # acvpparser's jent backend, the CAVP test harness of the conditioner,
+  # #includes src/jitterentropy-sha3.c and builds it with -Werror. Unpinned:
+  # the current parser is the one that has to keep working.
+  linux-acvp-parser:
+    name: Linux / acvpparser / jent backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: smuellerDD/acvpparser
+          path: acvpparser
+
+      - name: Show the acvpparser revision
+        run: git -C acvpparser log -1 --format='%H %cd %s'
+
+      - name: Build the library
+        run: |
+          cmake -S . -B build -DBUILD_SHARED_LIBS=OFF
+          cmake --build build -j "$(nproc)" --target jitterentropy
+
+      # The archive supplies jent_memset_secure(), which sha3.c calls. LDFLAGS
+      # from the environment, as acvpparser's Makefile appends to it.
+      - name: Build acvpparser against this tree
+        run: |
+          LDFLAGS="$PWD/build/libjitterentropy.a" \
+            make -C acvpparser jent JENT_SRC="$PWD" -j "$(nproc)"
+
+      - name: Check its digests against hashlib
+        run: |
+          python3 .github/scripts/acvp-parser-check.py \
+            acvpparser/acvp-parser "$RUNNER_TEMP"
+
   linux-musl:
     name: Linux / musl-gcc / ${{ matrix.link }}
     runs-on: ubuntu-latest
@@ -130,7 +182,7 @@ jobs:
           bin=build/tests/gcd/gcd
           file "$bin"
 
-          if strings "$bin" | grep -q GLIBC; then
+          if grep -q GLIBC < <(strings "$bin"); then
             echo "::error::GLIBC symbol versions present, this is not musl"
             exit 1
           fi
@@ -158,9 +210,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 7.9 is the last RHEL 7 minor release; the other entries float.
-          - name: RHEL 7
-            image: registry.access.redhat.com/ubi7/ubi:7.9
+          # The RHEL 7 generation (glibc 2.17, gcc 4.8), pinned at its last
+          # minor release; the other entries float. CentOS, as the public UBI 7
+          # content no longer carries a toolchain.
+          - name: CentOS 7
+            image: quay.io/centos/centos:centos7.9.2009
             # No distro CMake meets the 3.22 floor here.
             cmake: kitware
           - name: RHEL 8
@@ -196,6 +250,16 @@ jobs:
             bash -euxo pipefail -c '
               # No apostrophes anywhere in here: the whole script is a
               # single-quoted argument to bash -c, and one would end it.
+
+              # mirrorlist.centos.org is gone: point CentOS 7 at the vault.
+              # gpgcheck stays on with the key the image ships.
+              if [ -f /etc/yum.repos.d/CentOS-Base.repo ]; then
+                sed -i \
+                  -e "s|^mirrorlist=|#mirrorlist=|" \
+                  -e "s|^#baseurl=http://mirror.centos.org/centos/\$releasever|baseurl=https://vault.centos.org/7.9.2009|" \
+                  /etc/yum.repos.d/CentOS-Base.repo
+              fi
+
               if command -v dnf > /dev/null; then
                 install="dnf -y install"
               elif command -v zypper > /dev/null; then
@@ -210,11 +274,11 @@ jobs:
               if [ "$CMAKE_SOURCE" = distro ]; then
                 $install cmake
               else
-                # tar is not in the RHEL 7 base image and the tarball needs it.
+                # The tarball needs tar, which not every base image carries.
                 $install tar
                 url=https://github.com/Kitware/CMake/releases/download
-                # Retries only: RHEL 7 ships curl 7.29, which has neither
-                # --http1.1 nor --retry-all-errors, and no HTTP/2 either.
+                # Retries only: CentOS 7 ships curl 7.29, which has neither
+                # --http1.1 nor --retry-all-errors.
                 curl -fsSL --retry 5 --retry-delay 5 \
                   "$url/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-linux-x86_64.tar.gz" \
                   -o /tmp/cmake.tar.gz
@@ -801,7 +865,7 @@ jobs:
 
           syms=$(nix shell nixpkgs#binutils -c \
             nm $nmflags --defined-only "$OUT/$file")
-          grep -E ' [TtWw] jent_' <<<"$syms" | head -20
+          grep -m 20 -E ' [TtWw] jent_' <<<"$syms" || true
           grep -qE ' [TtWw] jent_entropy_init$' <<<"$syms" || {
             echo "::error::no jitterentropy symbols in $file"
             exit 1
@@ -1179,6 +1243,166 @@ jobs:
             }
           done
 
+  # The example app in tests/android: the library built through CMake by
+  # Gradle, as an app embeds it, rather than by ndk-build as above.
+  nix-android-example:
+    name: Nix / android example app
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build
+        id: build
+        run: |
+          out=$(nix build --no-link --print-build-logs --print-out-paths .#android-example)
+          echo "out=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Check the APK
+        env:
+          OUT: ${{ steps.build.outputs.out }}
+        run: |
+          apk="$OUT/jitterentropy-example.apk"
+          unzip -l "$apk"
+          for abi in arm64-v8a x86_64; do
+            unzip -l "$apk" "lib/$abi/libjitterentropy_jni.so" > /dev/null || {
+              echo "::error::no libjitterentropy_jni.so for ABI $abi"
+              exit 1
+            }
+          done
+
+  # The example app in tests/ios, built for the simulator: no signing needed.
+  ios:
+    name: iOS example app
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S tests/ios -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS
+
+      - name: Build
+        run: |
+          cmake --build build-ios --config Debug -- \
+            -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO
+
+      - name: Check the app
+        run: |
+          app=build-ios/Debug-iphonesimulator/JitterEntropyExample.app
+          test -x "$app/JitterEntropyExample" || {
+            echo "::error::no app binary in $app"
+            exit 1
+          }
+          plutil -p "$app/Info.plist"
+
+  apple-embedded:
+    name: ${{ matrix.platform }} cross-build
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: watchOS
+            device_sdk: watchos
+            sim_sdk: watchsimulator
+          - platform: tvOS
+            device_sdk: appletvos
+            sim_sdk: appletvsimulator
+          - platform: visionOS
+            device_sdk: xros
+            sim_sdk: xrsimulator
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the SDKs are installed
+        run: |
+          for sdk in '${{ matrix.device_sdk }}' '${{ matrix.sim_sdk }}'; do
+            xcrun --sdk "$sdk" --show-sdk-path || {
+              echo "::error::no $sdk SDK in $(xcode-select -p)"
+              xcodebuild -showsdks
+              exit 1
+            }
+          done
+
+      - name: Cross-build the library
+        run: |
+          platform='${{ matrix.platform }}'
+          # WATCHOS, TVOS, VISIONOS - the token vtool prints for the device
+          # SDK; the simulator SDKs append SIMULATOR to it.
+          platform_uc=$(printf '%s' "$platform" | tr '[:lower:]' '[:upper:]')
+
+          for sdk in '${{ matrix.device_sdk }}' '${{ matrix.sim_sdk }}'; do
+            case "$sdk" in
+            *simulator)	expect="${platform_uc}SIMULATOR" ;;
+            *)		expect="$platform_uc" ;;
+            esac
+
+            for shared in ON OFF; do
+              build="build-$sdk-$shared"
+              echo "::group::$platform / $sdk / shared=$shared"
+
+              #
+              # The tools and the test programs are left out: CMake makes an
+              # executable a MACOSX_BUNDLE target on every embedded Apple
+              # platform, and their install() calls name no bundle
+              # destination, so configuring with them fails before the
+              # library is reached. This is not particular to the three
+              # platforms here - CMAKE_SYSTEM_NAME=iOS fails the same way,
+              # which is why tests/ios is a project of its own.
+              #
+              cmake -S . -B "$build" \
+                -DCMAKE_SYSTEM_NAME="$platform" \
+                -DCMAKE_OSX_SYSROOT="$sdk" \
+                -DBUILD_SHARED_LIBS="$shared" \
+                -DENABLE_TOOLS=OFF -DBUILD_TESTING=OFF
+              cmake --build "$build" -j "$(sysctl -n hw.ncpu)"
+
+              if [ "$shared" = ON ]; then
+                lib="$build/libjitterentropy.dylib"
+                #
+                # The dynamic link is what makes this job worth running: the
+                # Apple back-ends reach for Mach and BSD interfaces
+                # (thread_policy_set, pthread_mach_thread_np, sysctlbyname,
+                # arc4random_buf, mlock) through a plain __APPLE__ guard that
+                # tells these platforms apart from macOS in no way at all.
+                # One of them missing here is a link error rather than a
+                # consumer's problem.
+                #
+                test -f "$lib" || {
+                  echo "::error::$sdk shared build produced no $lib"
+                  exit 1
+                }
+                xcrun vtool -show-build "$lib"
+                got=$(xcrun vtool -show-build "$lib" |
+                      awk '$1 == "platform" { print $2 }')
+                [ "$got" = "$expect" ] || {
+                  echo "::error::$lib is stamped $got, expected $expect"
+                  exit 1
+                }
+                xcrun nm -gU "$lib" | grep -q ' _jent_read_entropy$' || {
+                  echo "::error::$lib exports no jent_read_entropy"
+                  exit 1
+                }
+              else
+                lib="$build/libjitterentropy.a"
+                test -f "$lib" || {
+                  echo "::error::$sdk static build produced no $lib"
+                  exit 1
+                }
+                xcrun lipo -info "$lib"
+              fi
+
+              echo "::endgroup::"
+            done
+          done
+
   makefile:
     name: Makefile / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -1191,6 +1415,11 @@ jobs:
 
       - name: Build
         run: make -j 4
+
+      # The unit, gcd and health tests through their own Makefiles - the
+      # fallback for a tree without CMake, which nothing else here builds.
+      - name: Run the tests
+        run: make check
 
       - name: Build and run the CPU information tool
         working-directory: tests/raw-entropy/recording_userspace
@@ -1347,6 +1576,15 @@ jobs:
             exit 1
           }
           echo "modversion: $(pkg-config --modversion jitterentropy)"
+          # The library itself is in Libs for both kinds of build, so a plain
+          # --libs names it even where only the archive is installed. What a
+          # plain --libs may lack for a static build is Libs.private, the
+          # archive's own dependencies, which is why the link below still uses
+          # --static; this is the check that --static alone would hide.
+          if ! pkg-config --libs jitterentropy | grep -qw -- -ljitterentropy; then
+            echo "::error::pkg-config --libs does not name -ljitterentropy"
+            exit 1
+          fi
           # Only --static prints Libs.private.
           if [ "${{ matrix.shared }}" = ON ]; then
             libs=$(pkg-config --libs jitterentropy)
@@ -1411,6 +1649,15 @@ jobs:
             echo "::error::no jitterentropy.pc under $PKG_CONFIG_PATH"
             exit 1
           }
+          # The library itself is in Libs for both kinds of build, so a plain
+          # --libs names it even where only the archive is installed. What a
+          # plain --libs may lack for a static build is Libs.private, the
+          # archive's own dependencies, which is why the link below still uses
+          # --static; this is the check that --static alone would hide.
+          if ! pkg-config --libs jitterentropy | grep -qw -- -ljitterentropy; then
+            echo "::error::pkg-config --libs does not name -ljitterentropy"
+            exit 1
+          fi
           if [ "${{ matrix.shared }}" = ON ]; then
             libs=$(pkg-config --libs jitterentropy)
           else
@@ -1536,26 +1783,6 @@ jobs:
             pkg install developer/build/cmake developer/build/gnu-make || [ $? -eq 4 ]
           run: |
             CC=gcc sh .github/scripts/vm-build-and-test.sh
-
-  haiku:
-    name: Haiku / cmake + make
-    runs-on: ubuntu-latest
-    # Disabled: the cached VM image and the rolling HaikuPorts repository
-    # disagree, so pkgman fails to install cmake and the build never starts.
-    # Re-enable by deleting this line, ideally with disable-cache set.
-    if: false
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build and test in a Haiku VM
-        uses: vmactions/haiku-vm@v1
-        with:
-          usesh: true
-          copyback: false
-          prepare: |
-            pkgman install -y cmake make
-          run: |
-            MAKE=make sh .github/scripts/vm-build-and-test.sh
 
   cygwin:
     name: Cygwin / cmake + make

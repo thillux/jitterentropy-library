@@ -145,3 +145,28 @@ fi
 # shellcheck disable=SC2086
 $CC -std=c11 -I. smoke.c libjitterentropy.a $smoke_libs -o smoke
 ./smoke
+
+# The Makefile test suites (make check), the fallback for a tree without CMake.
+# Gated on everywhere the suites can be linked at all, which on Cygwin is the
+# only run of them under a Windows-ish toolchain.
+#
+# Solaris and Haiku are the exception, and skipped: -fstack-protector-strong is
+# unconditional in the tests/ Makefiles, unlike the top level one which probes
+# for it, and neither guest resolves __stack_chk_fail without help (Solaris'
+# libc has no SSP runtime, Haiku none at all), so every link there fails.
+#
+# NetBSD, DragonFly BSD and Cygwin used to be reported with ::warning:: rather
+# than gated on, because the gcd and health Makefiles passed -flto and those
+# toolchains are not known to carry the GCC LTO plugin. Both dropped it - it
+# buys nothing for programs this small, one of which is a single translation
+# unit - so there is nothing left to excuse them with, and a regression there
+# now fails the job.
+case "$os" in
+SunOS|Haiku)
+	echo "==> $MAKE check skipped on $os"
+	;;
+*)
+	echo "==> $MAKE check"
+	"$MAKE" check
+	;;
+esac
