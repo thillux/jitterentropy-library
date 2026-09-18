@@ -40,7 +40,7 @@
  */
 
 /*
- * The per-instance UUID: jent_uuid_generate() formats an RFC 4122 version 4
+ * The per-instance UUID: jent_uuid_generate() formats an RFC 9562 version 4
  * UUID string over 16 bytes asked of jent_os_random_bytes(), which facility
  * answers being arch/'s business.
  *
@@ -57,9 +57,10 @@
 #endif
 
 /*
- * Generate an RFC 4122 version 4 UUID string into @out, which must hold at
- * least JENT_UUID_STRLEN bytes. Where the platform offers no CSPRNG the nil
- * UUID (all zeroes) is produced. Defined in src/jitterentropy-uuid.c.
+ * Generate an RFC 9562 version 4 UUID string into @out, which must hold at
+ * least JENT_UUID_STRLEN bytes. Where the platform offers no CSPRNG it is a
+ * version 8 UUID hashed from a process-wide counter and the current time. Defined in
+ * src/jitterentropy-uuid.c.
  */
 void jent_uuid_generate(char *out);
 

@@ -29,15 +29,12 @@
  * lost measurement: too large truncates the jitter away, too small leaves the
  * deltas un-normalized for the minimum-variation check below.
  *
- * 64 bits are not atomically accessible everywhere, so each divisor is
- * published through two 32-bit flags (see arch/jitterentropy-arch-atomic.h):
- * claimed is exchanged, so of several threads analyzing one clock exactly one
- * writes - they need not agree on the value - and set is stored with release
- * after that write and loaded with acquire before every read.
+ * 32 bits, which the bound in jent_gcd_analyze() guarantees, are atomically
+ * accessible everywhere (see arch/jitterentropy-arch-atomic.h). The first
+ * store stays, and zero reads as not established. Threads racing to establish
+ * one clock may each store - they need not agree on the value.
  */
-static uint64_t jent_common_timer_gcd[JENT_GCD_CLOCKS] = { 0 };
-static int jent_common_timer_gcd_claimed[JENT_GCD_CLOCKS] = { 0 };
-static int jent_common_timer_gcd_set[JENT_GCD_CLOCKS] = { 0 };
+static uint32_t jent_common_timer_gcd[JENT_GCD_CLOCKS] = { 0 };
 
 /* Takes enable_notime as it stands, so that no call site has to translate. */
 static inline unsigned int jent_gcd_clock(unsigned int notime)
@@ -47,7 +44,7 @@ static inline unsigned int jent_gcd_clock(unsigned int notime)
 
 static inline int jent_gcd_tested(unsigned int clock)
 {
-	return jent_atomic_load_int(&jent_common_timer_gcd_set[clock]);
+	return !!jent_atomic_load_u32(&jent_common_timer_gcd[clock]);
 }
 
 /* A straight forward implementation of the Euclidean algorithm for GCD. */
@@ -124,8 +121,18 @@ int jent_gcd_analyze(uint64_t *delta_history, size_t nelem, size_t osr,
 	int ret = jent_gcd_analyze_internal(delta_history, nelem, &running_gcd,
 					    &delta_sum);
 
+	/*
+	 * Nothing to analyze: no delta history, or no delta recorded in it
+	 * because the reading went backwards every time
+	 * (jent_entropy_init_internal() drops those).
+	 * Reported as the non-monotonic clock it is, and not as success: the
+	 * startup marks a clock it passed as tested for good, which would
+	 * leave this one marked as passed with no divisor established, and
+	 * every later collector allocation failing on jent_gcd_get() with no
+	 * way back.
+	 */
 	if (ret == -EAGAIN)
-		return 0;
+		return ENOMONOTONIC;
 
 	/*
 	 * We assume 1/osr bits of entropy per sample. On average, variations
@@ -155,12 +162,9 @@ int jent_gcd_analyze(uint64_t *delta_history, size_t nelem, size_t osr,
 	 * this point - the guard states the invariant rather than covering a
 	 * reachable case.
 	 */
-	if (running_gcd && !jent_gcd_tested(clock) &&
-	    !jent_atomic_exchange_int(&jent_common_timer_gcd_claimed[clock],
-				      1)) {
-		jent_common_timer_gcd[clock] = running_gcd;
-		jent_atomic_store_int(&jent_common_timer_gcd_set[clock], 1);
-	}
+	if (running_gcd && !jent_gcd_tested(clock))
+		jent_atomic_store_u32(&jent_common_timer_gcd[clock],
+				      (uint32_t)running_gcd);
 
 out:
 	return ret;
@@ -190,7 +194,7 @@ int jent_gcd_get(uint64_t *value, unsigned int notime)
 	if (!jent_gcd_tested(clock))
 		return 1;
 
-	*value = jent_common_timer_gcd[clock];
+	*value = jent_atomic_load_u32(&jent_common_timer_gcd[clock]);
 	return 0;
 }
 

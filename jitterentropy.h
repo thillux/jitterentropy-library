@@ -169,8 +169,10 @@ extern "C" {
 				 automatically determine the memory size for the
 				 memory access? By default it is only the L1
 				 cache size. */
-#define JENT_FORCE_SECURE_MEM (1<<8) /* Require the memory of the entropy
-				   collector to be secure memory: fail the
+#define JENT_FORCE_SECURE_MEM (1<<8) /* Require the state of the entropy
+				   collector to be secure memory - all of
+				   it but the memory access region, which
+				   is never locked: fail the
 				   allocation when the platform does not grant
 				   it - a memory lock the operating system
 				   refuses, or a secure memory arena that the
@@ -288,10 +290,13 @@ extern "C" {
  * services, and is what keeps this path building and running.
  *
  * One flag goes with them on aarch64: -mno-outline-atomics. GCC 10 and later
- * default to the opposite, which turns the read-modify-write in
- * arch/jitterentropy-arch-atomic.c into a call to a libgcc helper that a
- * freestanding link does not have. The kernel passes the same flag for the
- * same reason.
+ * default to the opposite, which turns an atomic read-modify-write into a call
+ * to a libgcc helper that a freestanding link does not have. The library needs
+ * the flag: jent_uuid_from_counter() increments the process-wide counter it
+ * derives an instance identifier from with jent_atomic_inc_u32(), and that is
+ * precisely the path taken where no CSPRNG answers - the normal EFI and
+ * baremetal case. Without the flag such a build fails to link on an undefined
+ * __aarch64_ldadd4_*. The kernel passes the same flag for the same reason.
  */
 #if !defined(JENT_BAREMETAL) &&						       \
     !defined(LINUX_KERNEL) && !defined(__KERNEL__) &&			       \
@@ -303,8 +308,25 @@ extern "C" {
 /*
  * Threading back-end for the internal timer.
  */
-#if !defined(JENT_PTHREAD) && !defined(JENT_WIN_THREADS) && \
-    !defined(LINUX_KERNEL)
+/*
+ * Only for a hosted build. The environments with a threading back-end of their
+ * own have to be excluded here, or this picks one they do not have and the
+ * jent_notime_start_routine typedef below - which keys off these same macros -
+ * ends up disagreeing with the back-end that is actually compiled: the
+ * freestanding one takes int (*)(void *), the pthread one void *(*)(void *),
+ * and struct jent_notime_thread then declares a start member of the wrong
+ * type. That is a build failure for the library and, worse, the wrong
+ * signature in the public struct for the consumer registering a handler
+ * through jent_entropy_switch_notime_impl() - on exactly the target where the
+ * builtin back-end always refuses, so registering one is mandatory.
+ *
+ * JENT_BAREMETAL is defined a few lines above, so it is already known here;
+ * the FreeBSD kernel is spelled out as its own case, as it is elsewhere.
+ */
+#if !defined(JENT_PTHREAD) && !defined(JENT_WIN_THREADS) &&		       \
+    !defined(LINUX_KERNEL) && !defined(__KERNEL__) &&			       \
+    !(defined(_KERNEL) && defined(__FreeBSD__)) &&			       \
+    !defined(JENT_BAREMETAL)
 # if defined(_MSC_VER) || defined(__MINGW32__)
 #  define JENT_WIN_THREADS
 # else
@@ -367,6 +389,21 @@ typedef int (*jent_notime_start_routine)(void *);
 /* Forward declaration of opaque value */
 struct rand_data;
 
+/*
+ * Thread safety - the library takes no locks. See jitterentropy(3).
+ *
+ * - One entropy collector belongs to one thread at a time: jent_read_entropy,
+ *   jent_read_entropy_safe and jent_status access its state unsynchronized.
+ *   Separate collectors are independent.
+ * - jent_entropy_set_notime_cpu, jent_entropy_switch_notime_impl and
+ *   jent_set_fips_failure_callback must be called before the first
+ *   jent_entropy_init* and before any thread generates; afterwards they
+ *   return -EAGAIN.
+ * - jent_entropy_init and jent_entropy_init_ex may run on several threads at
+ *   once.
+ * - jent_selftest is reentrant and may run in parallel with generation.
+ */
+
 /* Number of low bits of the time value that we want to consider */
 /* get raw entropy */
 JENT_PRIVATE_STATIC
@@ -394,7 +431,10 @@ int jent_entropy_init_ex(unsigned int osr, unsigned int flags);
  * long-running process.
  *
  * They run on stack-local state alone: callable at any time, from any thread,
- * in parallel with entropy collection, allocating nothing and never blocking.
+ * in parallel with jent_read_entropy, allocating nothing and never blocking.
+ * Not in parallel with jent_read_entropy_safe on the same instance, though:
+ * its recovery frees the instance and replaces it, and a verdict bound to the
+ * old pointer would then be written into freed memory.
  *
  * ec binds the verdict to an instance: on failure that instance permanently
  * stops producing output - jent_read_entropy and jent_read_entropy_safe
@@ -408,6 +448,13 @@ int jent_selftest(struct rand_data *ec);
 /*
  * Set a callback to run on health failure in FIPS mode.
  * This function will take an action determined by the caller.
+ *
+ * The ec it is handed is valid for the duration of the call only: the
+ * callback runs just before jent_read_entropy_safe() reallocates that
+ * instance in its recovery, which frees the pointer moments later. Anything
+ * the callback needs afterwards - the identifier from jent_uuid(), a status
+ * line - has to be read out and copied while it runs, not stored as a
+ * pointer.
  */
 typedef void (*jent_fips_failure_cb)(struct rand_data *ec,
 				     unsigned int health_failure);
@@ -428,7 +475,7 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen);
 #endif
 
 /*
- * Copy the instance UUID string (RFC 4122 version 4, JENT_UUID_STRLEN bytes
+ * Copy the instance UUID string (RFC 9562 version 4, JENT_UUID_STRLEN bytes
  * including the terminating NUL) into buf. Returns 0 on success, -1 on error.
  */
 JENT_PRIVATE_STATIC
@@ -455,7 +502,12 @@ int jent_secure_memory_supported(void);
  *
  * @var jent_notime_fini This function shall terminate the threading support.
  *	The function must dispose of all memory and resources used for the
- *	threading operation. It must also dispose of the ctx memory.
+ *	threading operation. It must also dispose of the ctx memory. It is
+ *	only called with a non-NULL ctx, the one a successful init stored: a
+ *	collector that never enabled the timer-less mode, or whose init
+ *	failed, is released without it - as is one whose init succeeded but
+ *	left ctx NULL, so such an init must not hold resources fini would
+ *	release.
  *
  * @var jent_notime_start This function is called when the Jitter RNG wants
  *	to start a thread. Besides providing a pointer to the ctx
@@ -466,7 +518,10 @@ int jent_secure_memory_supported(void);
  *
  * @var jent_notime_stop This function is invoked by the Jitter RNG when the
  *	thread should be stopped. Note, the Jitter RNG intends to start/stop
- *	the thread frequently.
+ *	the thread frequently. It is called exactly once for each start that
+ *	returned success, and never for one that failed, so it may assume the
+ *	thread its start recorded exists - it is not called to clean up after
+ *	a start that did not create one.
  *
  * An example implementation is found in the Jitter RNG itself with its
  * default thread handler of jent_notime_thread_builtin.
@@ -530,7 +585,7 @@ void jent_notime_fini(void *ctx);
 #define EVARVAR		5 /* UNUSED - Timer does not produce variations of
 			     variations (2nd derivation of time is zero) */
 #define EMINVARVAR	6 /* Timer variations of variations is too small */
-#define EPROGERR	7 /* UNUSED - Programming error */
+#define EPROGERR	7 /* Invalid argument, e.g. an osr above JENT_MAX_OSR */
 #define ESTUCK		8 /* Too many stuck results during init. */
 #define EHEALTH		9 /* Health test failed during initialization */
 #define ERCT		10 /* RCT failed during initialization */

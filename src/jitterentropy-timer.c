@@ -156,14 +156,10 @@ static struct jent_notime_thread jent_notime_thread_builtin = {
  ***************************************************************************/
 
 /*
- * Both are process-wide and one-way: the first is set by a startup that had to
- * fall back to the counting thread, the second by any startup at all, and every
- * later caller reads them from whichever thread it runs on. Atomic for the
- * reason given in arch/jitterentropy-arch-atomic.h - the store releases the
- * decision and the load acquires it, so a thread told that the internal timer
- * is forced also sees the state the forcing thread built.
+ * Process-wide and one-way: set by any startup, and read by later callers from
+ * whichever thread they run on. Atomic for the reason given in
+ * arch/jitterentropy-arch-atomic.h.
  */
-static int jent_force_internal_timer = 0;
 static int jent_notime_switch_blocked = 0;
 
 void jent_notime_block_switch(void)
@@ -203,9 +199,11 @@ static int jent_notime_sample_timer(void *arg)
 
 	/*
 	 * Best-effort pin to a dedicated CPU; a failure here is ignored as
-	 * the counter still ticks on whatever CPU the scheduler picks.
+	 * the counter still ticks on whatever CPU the scheduler picks. Only
+	 * the builtin handler's ctx has this layout - an external one's is
+	 * its own.
 	 */
-	if (thread_ctx)
+	if (thread_ctx && notime_thread == &jent_notime_thread_builtin)
 		(void)jent_thread_pin_to_cpu(thread_ctx->notime_cpu);
 
 	ec->notime_timer = 0;
@@ -234,6 +232,8 @@ out:
  */
 int jent_notime_settick(struct rand_data *ec)
 {
+	int ret;
+
 	if (!ec->enable_notime || !notime_thread)
 		return 0;
 
@@ -241,17 +241,27 @@ int jent_notime_settick(struct rand_data *ec)
 	ec->notime_prev_timer = 0;
 	ec->notime_timer = 0;
 
-	return notime_thread->jent_notime_start(ec->notime_thread_ctx,
-					       jent_notime_sample_timer, ec);
+	ret = notime_thread->jent_notime_start(ec->notime_thread_ctx,
+					      jent_notime_sample_timer, ec);
+	if (!ret)
+		ec->notime_running = 1;
+
+	return ret;
 }
 
+/*
+ * Stops only a thread a start created, once: the stop callback is promised
+ * exactly that (jitterentropy.h), while this is called on every path that may
+ * have left one running, the free included.
+ */
 void jent_notime_unsettick(struct rand_data *ec)
 {
-	if (!ec->enable_notime || !notime_thread)
+	if (!ec->enable_notime || !notime_thread || !ec->notime_running)
 		return;
 
 	ec->notime_interrupt = 1;
 	notime_thread->jent_notime_stop(ec->notime_thread_ctx);
+	ec->notime_running = 0;
 }
 
 void jent_get_nstime_internal(struct rand_data *ec, uint64_t *out)
@@ -297,30 +307,24 @@ static inline int jent_notime_enable_thread(struct rand_data *ec,
 
 void jent_notime_disable(struct rand_data *ec)
 {
-	if (notime_thread)
+	/* Only a context an init handed back is torn down. */
+	if (notime_thread && ec->notime_thread_ctx) {
 		notime_thread->jent_notime_fini(ec->notime_thread_ctx);
+		ec->notime_thread_ctx = NULL;
+	}
 }
 
 int jent_notime_enable(struct rand_data *ec, unsigned int flags)
 {
-	/*
-	 * Read once and used twice: the two tests below are the same question
-	 * - has a startup already established the internal timer - and a
-	 * second load could answer them differently if another thread forces
-	 * it in between, which would run the startup a second time.
-	 */
-	int forced = jent_atomic_load_int(&jent_force_internal_timer);
+	int ret;
 
 	/* Use internal timer */
-	if (forced || (flags & JENT_FORCE_INTERNAL_TIMER)) {
-		/* Self test not run yet */
-		if (!forced &&
-		    jent_time_entropy_init(ec->osr,
-					   flags | JENT_FORCE_INTERNAL_TIMER))
-			return EHEALTH;
-
+	if (flags & JENT_FORCE_INTERNAL_TIMER) {
+		/* Marked only once the handler holds a context. */
+		ret = jent_notime_enable_thread(ec, flags);
+		if (ret)
+			return ret;
 		ec->enable_notime = 1;
-		return jent_notime_enable_thread(ec, flags);
 	}
 
 	return 0;
@@ -345,16 +349,6 @@ int jent_notime_switch(struct jent_notime_thread *new_thread)
 
 	notime_thread = new_thread;
 	return 0;
-}
-
-void jent_notime_force(void)
-{
-	jent_atomic_store_int(&jent_force_internal_timer, 1);
-}
-
-int jent_notime_forced(void)
-{
-	return jent_atomic_load_int(&jent_force_internal_timer);
 }
 
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */

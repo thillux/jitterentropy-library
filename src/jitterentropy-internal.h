@@ -187,20 +187,6 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 #endif /* LINUX_KERNEL */
 
 /*
- * An instance that measures a clock rather than generating entropy from it:
- * the startup's own collector, and the raw noise recording. Both want the
- * deltas as the clock produces them, and the first of them is what
- * establishes the common divisor the others are normalized by - so these are
- * the only instances allowed to run without one.
- *
- * Internal, and not in jitterentropy.h: the library sets it on the flags it
- * passes down, a caller never does. The public allocation clears it. The bit
- * is above the public flags and below the hash loop field; internal flags
- * grow downwards from here.
- */
-#define JENT_INT_MEASURE_CLOCK	(UINT32_C(1) << 23)
-
-/*
  * JENT_-prefixed, and defined outside the LINUX_KERNEL split above, for the
  * same reason JENT_FALLTHROUGH is: the bare names belong to the environment,
  * not to this library.
@@ -335,11 +321,11 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
  * On a 64-bit target this is JENT_MAX_MEMSIZE_MAX, i.e. no additional limit.
  * On a 32-bit target the address space is the binding constraint rather than
  * the cache: a two-socket machine with a large L3 makes JENT_CACHE_ALL derive
- * the full 512 MB, which the collector then both maps and mlock()s. That is a
- * sixth of the usable address space of a 32-bit process and well beyond a
- * typical RLIMIT_MEMLOCK, so jent_zalloc() fails and the whole collector
- * allocation fails with it. Capping the derived value at 64 MB keeps the
- * automatic path working on i686, armv7, RV32 and 31-bit s390.
+ * the full 512 MB, which the collector then maps. That is a sixth of the
+ * usable address space of a 32-bit process, where a contiguous mapping of that
+ * size may not be had, and the whole collector allocation fails with it.
+ * Capping the derived value at 64 MB keeps the automatic path working on i686,
+ * armv7, RV32 and 31-bit s390.
  *
  * UINTPTR_MAX is the pointer-width test; where it is unavailable (the Linux
  * kernel build does not define it) the 64-bit branch is taken, which leaves
@@ -455,6 +441,32 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 #define JENT_SHA3_256_SIZE_DIGEST_BITS	256
 #define JENT_SHA3_256_SIZE_DIGEST	(JENT_SHA3_256_SIZE_DIGEST_BITS >> 3)
 
+#define JENT_SHA3_SIZE_BLOCK(bits)	((1600 - 2 * bits) >> 3)
+
+#define JENT_SHA3_256_SIZE_BLOCK                                               \
+	JENT_SHA3_SIZE_BLOCK(JENT_SHA3_256_SIZE_DIGEST_BITS)
+
+#define JENT_XDRBG_SIZE_STATE		64
+
+/* Here, not in jitterentropy-sha3.h: struct rand_data embeds it. */
+struct jent_sha_ctx {
+	uint64_t state[25];
+	uint8_t partial[JENT_SHA3_256_SIZE_BLOCK];
+	size_t msg_len;
+	uint8_t r;
+	uint8_t rword;
+	/*
+	 * This implementation only supports up to rate-size digests for XOFs,
+	 * thus the data type can be appropriately small.
+	 */
+	uint8_t digestsize;
+	uint8_t padding;
+	uint8_t initially_seeded:1;
+
+	/* XDRBG scratch, in the collector's secure memory, not on the stack. */
+	uint8_t xdrbg_block[JENT_XDRBG_SIZE_STATE + JENT_SHA3_256_SIZE_DIGEST];
+};
+
 /*
  * The output 256 bits can receive more than 256 bits of min entropy,
  * of course, but the 256-bit output of XDRBG-256(M) can only
@@ -489,7 +501,7 @@ struct rand_data
 	 * of the RNG are marked as SENSITIVE. A user must not
 	 * access that information while the RNG executes its loops to
 	 * calculate the next random value. */
-	void *hash_state;		/* SENSITIVE hash state entropy pool */
+	struct jent_sha_ctx hash_state;	/* SENSITIVE hash state entropy pool */
 	uint64_t prev_time;		/* SENSITIVE Previous time stamp */
 #define DATA_SIZE_BITS (JENT_SHA3_256_SIZE_DIGEST_BITS)
 
@@ -501,13 +513,14 @@ struct rand_data
 	unsigned int flags;		/* Flags used to initialize */
 	unsigned int osr;		/* Oversampling rate */
 
-	/* RFC 4122 version 4 identifier, stable for the collector's lifetime. */
+	/* RFC 9562 version 4 or 8 identifier, stable for the collector's
+	 * lifetime. */
 	char uuid[JENT_UUID_STRLEN];
 
 	/*
 	 * Number of times this instance has been reinitialized (reallocated on
-	 * health-test recovery). Carried over, incremented, across the identity-
-	 * preserving reallocation in jent_health_failure_reset().
+	 * health-test recovery). The memory size and hash loop count grow with
+	 * it.
 	 */
 	unsigned int reinit_count;
 
@@ -533,7 +546,6 @@ struct rand_data
 #ifndef JENT_MEMORY_BLOCKSIZE
 # define JENT_MEMORY_BLOCKSIZE 128
 #endif
-#define JENT_MEMORY_BLOCKS(ec) ((ec->memmask + 1) / JENT_MEMORY_BLOCKSIZE)
 
 	unsigned char *mem;		/* Memory access location with size of
 					 * memmask + 1 */
@@ -561,6 +573,7 @@ struct rand_data
 					 * window. */
 	uint64_t apt_base;		/* APT base reference */
 	unsigned int health_failure;	/* Permanent health failure */
+	unsigned int health_failure_reported; /* Bits the callback saw */
 
 	/* RCT with memory */
 	unsigned short rct_mem_ctr;	/* Loop iteration for generating random bytes */
@@ -572,8 +585,15 @@ struct rand_data
 	unsigned int apt_base_set:1;	/* APT base reference set? */
 	unsigned int is_fips_enabled:1;
 	unsigned int enable_notime:1;	/* Use internal high-res timer */
-	unsigned int max_mem_set:1;	/* Maximum memory configured by user */
 	unsigned int in_recovery:1;	/* Flag to indicate a recovery op. */
+
+	/*
+	 * A collection loop returned without collecting: the noise source
+	 * stopped delivering usable measurements. Kept apart from
+	 * health_failure, which reports only under FIPS: an unfed pool must
+	 * stop the output in every mode. Set by jent_random_data_one().
+	 */
+	unsigned int noise_stopped:1;
 
 	/*
 	 * A jent_selftest() run bound to this instance failed. Deliberately
@@ -582,13 +602,14 @@ struct rand_data
 	 * mode. A full word rather than a bitfield: the self test may run on
 	 * another thread, and setting a bitfield would rewrite its neighbors.
 	 */
-	unsigned int selftest_failed:1;
+	int selftest_failed;
 
 #ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
 	volatile uint8_t notime_interrupt;	/* indicator to interrupt ctr */
 	volatile uint64_t notime_timer;		/* high-res timer mock-up */
 	uint64_t notime_prev_timer;		/* previous timer value */
 	void *notime_thread_ctx;		/* register thread data */
+	unsigned int notime_running;		/* a started thread to stop */
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 
 	uint64_t jent_common_timer_gcd;	/* Common divisor for all time deltas */
@@ -652,6 +673,40 @@ struct rand_data
 	unsigned int lag_scoreboard[JENT_LAG_HISTORY_SIZE];
 #endif /* JENT_HEALTH_LAG_PREDICTOR */
 };
+
+/*
+ * The window of the RCT with memory: the measurements of one output block.
+ * Used by jent_random_data_one() and jent_health_init().
+ */
+#define JENT_MEASURE_JITTER_LOOP_CTR(_osr, _safety_factor)                     \
+	((DATA_SIZE_BITS + (_safety_factor)) * (_osr))
+
+/*
+ * The health test RCT with memory operates on multiples of three time deltas.
+ * Therefore, round up the jitter loop counter to the nearest multiple of three.
+ */
+#define JENT_ROUNDUP_TO_THREE(x)                                               \
+	(jent_udiv64((x) + 2, 3) * 3)
+#define JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR(_osr, _safety_factor)            \
+	JENT_ROUNDUP_TO_THREE(                                                 \
+		JENT_MEASURE_JITTER_LOOP_CTR(_osr, _safety_factor))
+
+/*
+ * Returns 0 when the window does not fit the unsigned short counters or would
+ * not cover one output block.
+ */
+static inline unsigned short jent_rct_mem_window(const struct rand_data *ec)
+{
+	unsigned int safety_factor = ec->is_fips_enabled ?
+				     ENTROPY_SAFETY_FACTOR : 0;
+	uint64_t nosr = JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR((uint64_t)ec->osr,
+							      safety_factor);
+
+	if (nosr > USHRT_MAX || nosr < DATA_SIZE_BITS)
+		return 0;
+
+	return (unsigned short)nosr;
+}
 
 #ifdef __cplusplus
 }

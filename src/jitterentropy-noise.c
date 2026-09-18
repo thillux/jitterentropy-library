@@ -94,8 +94,8 @@ static void jent_hash_insert(struct rand_data *ec, uint64_t time_delta,
 	 * seed ← (intermediary_0 || intermediary_1 || ... ||
 	 *	   intermediary_[(osr + safety_factor)*256])
 	 */
-	jent_sha3_update(ec->hash_state, intermediary,
-			 jent_sha3_rate(ec->hash_state));
+	jent_sha3_update(&ec->hash_state, intermediary,
+			 jent_sha3_rate(&ec->hash_state));
 	jent_memset_secure(intermediary, JENT_SIZEOF_INTERMEDIARY);
 }
 
@@ -542,14 +542,11 @@ unsigned int jent_measure_jitter(struct rand_data *ec,
 	((DATA_SIZE_BITS + (_safety_factor)) * (_osr))
 
 /*
- * The health test RCT with memory operates on multiples of three time deltas.
- * Therefore, round up the jitter loop counter to the nearest multiple of three.
+ * Consecutive stuck measurements after which the noise source is taken to have
+ * stopped. Far above any run a working one can produce, so it only ends a
+ * collection loop that would otherwise never end. See jent_random_data_one().
  */
-#define JENT_ROUNDUP_TO_THREE(x)                                               \
-	(jent_udiv64((x) + 2, 3) * 3)
-#define JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR(_osr, _safety_factor)            \
-	JENT_ROUNDUP_TO_THREE(                                                 \
-		JENT_MEASURE_JITTER_LOOP_CTR(_osr, _safety_factor))
+#define JENT_NOISE_DEAD_THRESHOLD	(1U << 16)
 
 static void jent_random_data_one(
 	struct rand_data *ec,
@@ -557,11 +554,8 @@ static void jent_random_data_one(
 			               uint64_t loop_cnt,
 				       uint64_t *ret_current_delta))
 {
-	unsigned int safety_factor = 0, ctr = 0;
-	uint64_t nosr;
-
-	if (ec->is_fips_enabled)
-		safety_factor = ENTROPY_SAFETY_FACTOR;
+	unsigned int ctr = 0, dead = 0;
+	unsigned short nosr;
 
 	/* RCT with memory: start a new iteration loop */
 	ec->rct_mem_ctr = 0;
@@ -569,29 +563,113 @@ static void jent_random_data_one(
 	/*
 	 * Obtain number of loop iterations.
 	 *
-	 * Safety measure against wrapping: compute in 64 bits and verify the
-	 * count fits the unsigned short window counters and covers at least
-	 * one output block. With the default JENT_MAX_OSR of 20 this cannot
-	 * trigger, but JENT_MAX_OSR is a compile-time tunable and a truncated
-	 * count would silently shrink the RCT-with-memory window below what
-	 * the cutoff tables assume, disabling the health test.
+	 * Safety measure against wrapping: jent_rct_mem_window() answers 0
+	 * unless the count fits the unsigned short window counters and covers
+	 * at least one output block. A truncated count would silently shrink
+	 * the RCT-with-memory window below what the cutoff tables assume.
 	 */
-	nosr = JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR((uint64_t)ec->osr,
-						     safety_factor);
-	if (nosr > USHRT_MAX || nosr < DATA_SIZE_BITS) {
+	JENT_BUILD_BUG_ON(JENT_MEASURE_JITTER_LOOP_CTR(JENT_MAX_OSR,
+						       ENTROPY_SAFETY_FACTOR)
+			  + 2 > USHRT_MAX);
+
+	nosr = jent_rct_mem_window(ec);
+	if (!nosr) {
 		ec->health_failure |= JENT_RCT_MEM_FAILURE_PERMANENT;
 		return;
 	}
-	ec->rct_mem_nosr = (unsigned short)nosr;
+	ec->rct_mem_nosr = nosr;
 
 	/* Entropy collection loop */
 	while (!jent_health_failure(ec)) {
+		/*
+		 * The delta itself is not needed here - the stuck verdict is
+		 * what both the liveness bound and the progress test below
+		 * key on - so the test-interface out-parameter stays NULL.
+		 */
+		unsigned int stuck = measure_jitter(ec, 0, NULL);
+
+		/*
+		 * Liveness bound: jent_health_failure() reports only under
+		 * FIPS, so a noise source that stopped delivering usable
+		 * measurements after startup would spin here forever.
+		 *
+		 * The bound counts consecutive stuck measurements, not zero
+		 * deltas. A zero delta is only one of the three ways
+		 * jent_stuck() rejects a measurement - it also rejects a zero
+		 * 2nd or 3rd derivative - and it is the stuck verdict, not the
+		 * delta, that decides whether this iteration makes progress
+		 * towards ->rct_mem_nosr below. A clock that degenerated into
+		 * a constant non-zero step (an emulated TSC advanced by a
+		 * fixed amount per exit, say) leaves every delta non-zero
+		 * while delta2 is zero for every sample after the first, so a
+		 * bound on zero deltas alone never fires and neither does
+		 * anything else: the RCT and APT bits are set in
+		 * ->health_failure, but jent_health_failure() returns 0
+		 * outside FIPS, so the loop condition stays true forever.
+		 *
+		 * This is not a health test verdict, hence ->noise_stopped
+		 * rather than a health_failure bit.
+		 */
+		if (!stuck) {
+			dead = 0;
+		} else if (++dead >= JENT_NOISE_DEAD_THRESHOLD) {
+			ec->noise_stopped = 1;
+			return;
+		}
+
 		/* If a stuck measurement is received, repeat measurement */
-		if (measure_jitter(ec, 0, NULL))
+		if (stuck)
 			continue;
 
 		if (++ctr >= ec->rct_mem_nosr)
 			break;
+	}
+}
+
+/**
+ * Generate the additional blocks of an RCT-with-memory recovery loop
+ *
+ * Unlike jent_random_data(), this does not advance ->startup_state.
+ *
+ * @param[in] ec Reference to entropy collector
+ * @param[in] loops Number of blocks to generate
+ */
+void jent_random_data_recovery(struct rand_data *ec, unsigned int loops)
+{
+	unsigned int i;
+
+	/*
+	 * Every block below leaves the RCT-with-memory window closed behind it
+	 * - jent_random_data_one() returns once the counter reached
+	 * ->rct_mem_nosr - so the priming measurement of the next one is out
+	 * of the window and judged against nothing, just as the first one is:
+	 * the caller in jent_rct_mem_insert() closes the outer window before
+	 * entering here. The window bookkeeping lives there, in one place.
+	 */
+	for (i = 0; i < loops; i++) {
+		/*
+		 * A failure ends the recovery; further blocks prove nothing.
+		 * So does a source that stopped delivering, which no further
+		 * block would get anything out of either.
+		 */
+		if (jent_health_failure(ec) || ec->noise_stopped)
+			break;
+
+		switch (ec->startup_state) {
+		case jent_startup_memory:
+			jent_random_data_one(ec,
+					     jent_measure_jitter_ntg1_memaccess);
+			break;
+		case jent_startup_sha3:
+			jent_random_data_one(ec, jent_measure_jitter_ntg1_sha3);
+			break;
+		case jent_startup_completed:
+		default:
+			/* priming of the ->prev_time value */
+			jent_measure_jitter(ec, 0, NULL);
+			jent_random_data_one(ec, jent_measure_jitter);
+			break;
+		}
 	}
 }
 
@@ -622,9 +700,12 @@ void jent_random_data(struct rand_data *ec)
 		 * Initialize the health tests as we fall through to
 		 * independently invoke the next noise source.
 		 */
-		jent_health_init(ec, ec->flags & JENT_NTG1 ?
-				     jent_health_init_type_ntg1 :
-				     jent_health_init_type_common);
+		if (jent_health_init(ec, ec->flags & JENT_NTG1 ?
+					 jent_health_init_type_ntg1 :
+					 jent_health_init_type_common)) {
+			ec->health_failure |= JENT_RCT_MEM_FAILURE_PERMANENT;
+			return;
+		}
 
 		JENT_FALLTHROUGH;
 	case jent_startup_sha3:
@@ -635,9 +716,12 @@ void jent_random_data(struct rand_data *ec)
 		 * Initialize the health tests as we fall through to
 		 * independently invoke the next noise source.
 		 */
-		jent_health_init(ec, ec->flags & JENT_NTG1 ?
-				     jent_health_init_type_ntg1 :
-				     jent_health_init_type_common);
+		if (jent_health_init(ec, ec->flags & JENT_NTG1 ?
+					 jent_health_init_type_ntg1 :
+					 jent_health_init_type_common)) {
+			ec->health_failure |= JENT_RCT_MEM_FAILURE_PERMANENT;
+			return;
+		}
 
 		break;
 	case jent_startup_completed:
@@ -650,5 +734,5 @@ void jent_random_data(struct rand_data *ec)
 
 void jent_read_random_block(struct rand_data *ec, char *dst, size_t dst_len)
 {
-	jent_drbg_generate_block(ec->hash_state, (uint8_t*)dst, dst_len);
+	jent_drbg_generate_block(&ec->hash_state, (uint8_t*)dst, dst_len);
 }
