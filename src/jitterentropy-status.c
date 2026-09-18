@@ -44,6 +44,7 @@
 int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 {
 	size_t used;
+	int written, truncated = 0;
 
 	if (!buf || buflen == 0)
 		return -1;
@@ -57,16 +58,26 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 	 * below, walking the rest of the document one useless snprintf() at a
 	 * time. The output is the same either way - an snprintf() with a size
 	 * of one writes only the NUL that is already there.
+	 *
+	 * Truncation is taken from the snprintf() return value: the length
+	 * cannot tell an exactly filled buffer from a truncated one.
 	 */
 	#define jent_add_to_status(...)					\
 	{								\
 		used = strlen(buf);					\
-		if (used + 1 < buflen)					\
-			snprintf(buf + used, buflen - used, __VA_ARGS__);\
+		if (used + 1 < buflen) {				\
+			written = snprintf(buf + used, buflen - used,	\
+					   __VA_ARGS__);		\
+			if (written < 0 ||				\
+			    (size_t)written >= buflen - used)		\
+				truncated = 1;				\
+		} else {						\
+			truncated = 1;					\
+		}							\
 	}
 
-	/* needed as plain snprintf to make jent_add_to_status len calculation usable */
-	snprintf(buf, buflen, "{\n");
+	buf[0] = '\0';
+	jent_add_to_status("{\n")
 
 	jent_add_to_status("\t\"version\": \"%d.%d.%d\"",
 			   JENT_MAJVERSION, JENT_MINVERSION, JENT_PATCHLEVEL)
@@ -158,11 +169,18 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 	jent_add_to_status( "\t\"configuration\": {\n");
 
 	jent_add_to_status( "\t\t\"osr\": %u,\n", ec->osr);
-	jent_add_to_status( "\t\t\"memoryBlockSizeBytes\": %u,\n", jent_memsize(ec->flags));
+	/* Compile-time tunable bounds of the rate. */
+	jent_add_to_status( "\t\t\"osrMin\": %u,\n",
+			   (unsigned int)JENT_MIN_OSR);
+	jent_add_to_status( "\t\t\"osrMax\": %u,\n",
+			   (unsigned int)JENT_MAX_OSR);
+	/* The region actually allocated, none with JENT_DISABLE_MEMORY_ACCESS. */
+	jent_add_to_status( "\t\t\"memoryBlockSizeBytes\": %u,\n",
+			   ec->memmask ? (unsigned int)(ec->memmask + 1) : 0);
 
 	jent_add_to_status("\t\t\"hashLoopCount\": {\n");
-	jent_add_to_status("\t\t\t\"runtime\": %u,\n", jent_hashloop_cnt(ec->flags));
-	jent_add_to_status("\t\t\t\"initialization\": %u\n", jent_hashloop_cnt(ec->flags) * JENT_HASH_LOOP_INIT);
+	jent_add_to_status("\t\t\t\"runtime\": %u,\n", ec->hashloopcnt);
+	jent_add_to_status("\t\t\t\"initialization\": %u\n", ec->hashloopcnt * JENT_HASH_LOOP_INIT);
 	jent_add_to_status("\t\t},\n");
 
 	jent_add_to_status("\t\t\"memoryLoopCount\": {\n");
@@ -209,8 +227,7 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 out:
 	jent_add_to_status("}\n");
 
-	used = strlen(buf);
-	return (used >= buflen - 1) ? -1 : 0;
+	return truncated ? -1 : 0;
 #undef jent_add_to_status
 }
 
