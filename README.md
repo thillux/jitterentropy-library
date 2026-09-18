@@ -55,6 +55,7 @@ prevention.
 | `STACK_PROTECTOR` | `ON` | Compile with the stack protector enabled |
 | `AARCH64_NSTIME_REGISTER` | unset | Name of the register `jent_get_nstime()` should read on AArch64 |
 | `ENABLE_SANITIZERS` | `OFF` | Address and undefined behavior sanitizers (development only) |
+| `ENABLE_THREAD_SANITIZER` | `OFF` | Thread sanitizer, which `unit-concurrency` is written for (development only; see `tests/README.md`) |
 | `ENABLE_COVERAGE` | `OFF` | Instrument for code coverage and add the `coverage` target (development only) |
 | `ENABLE_FUZZING` | `OFF` | Instrument for libFuzzer and build the coverage-guided harness under `tests/fuzz` (Clang only, development) |
 | `MOCK_TIMER` | `OFF` | Let the caller replace the time source with a callback (testing only - such a build produces no entropy of its own) |
@@ -94,8 +95,10 @@ ctest --test-dir build --output-on-failure
 ```
 
 The suite has two halves. The deterministic tests - the GCD self test, the unit
-tests for `src/` and `arch/`, and the induced failure tests of the health tests
-- compute over fixed inputs and answer the same everywhere. The entropy
+tests for `src/` and `arch/`, the induced failure tests of the health tests,
+and `exported-symbols`, which reads the built shared library and asserts that
+it exports the functions of `version.lds` and nothing else - compute over
+fixed inputs and answer the same everywhere. The entropy
 generation tests exercise the real noise source and can fail for reasons that
 are properties of the machine rather than defects in the code: a memory lock
 limit lower than the collector needs, or a startup whose health tests do not
@@ -171,12 +174,56 @@ Please keep the following aspects regarding jitterentropy's usage in mind:
 * While jitterentropy is a rather fast noise source, don't expect multiple MB/s or GB/s. Use it as seed
   source for another deterministic RNG if such speeds are needed.
 
-# Android
+# Support Tiers
 
-To compile the code on Android, use the following Makefile:
+The tiers say how much CI covers a platform and how quickly a breakage there
+is addressed.
 
-arch/android/Android.mk	-- NDK make file template that can be used to directly
-			   compile the CPU Jitter RNG code into Android binaries
+**Tier 1** - the platforms the library is developed against. The test suite
+runs on every push; on Android and iOS CI only builds the example app, so the
+suite is run by hand on a device there. A regression blocks a release.
+
+| Platform | Toolchain |
+| --- | --- |
+| Linux x86-64 | gcc, clang |
+| Windows x86-64 | MSVC, clang-cl |
+| macOS arm64 | clang |
+
+**Tier 2** - built and tested in CI, but not developed against day to day.
+Breakage is fixed, possibly not immediately.
+
+| Platform | Notes |
+| --- | --- |
+| macOS x86-64 | clang |
+| Linux arm64 | gcc, clang |
+| Linux x86-64 musl, 32 bit | |
+| Linux kernel module | out-of-tree, DKMS and in-tree, every non-EOL kernel.org release |
+| FreeBSD, OpenBSD, NetBSD, DragonFly BSD | in a VM |
+| Windows arm64 | MSVC |
+| Android arm64 | NDK |
+| iOS arm64 | Xcode |
+| Solaris | in a VM |
+| Cygwin, MinGW-w64 | |
+| Freestanding / EFI | x86-64 and aarch64, booted under OVMF |
+
+**Tier 3** - compiled and linked in CI, but not run there, or not covered at
+all. Best effort; a report should come with the test results from the machine.
+
+| Platform | Notes |
+| --- | --- |
+| Linux s390x, ppc64, riscv64, loongarch64, armv7, i686 | cross-build only |
+| watchOS, tvOS, visionOS | cross-build only |
+| FreeBSD kernel | no CI |
+| Everything else | no CI |
+
+# Android and iOS
+
+The library builds for both with its `CMakeLists.txt`, included into the app's
+own build. `tests/android` and `tests/ios` hold an example app for each that
+does exactly that, with the build commands in their READMEs.
+
+For ndk-build, `tests/android/Android.mk` compiles the library alone into
+Android binaries.
 
 ## Direct CPU instructions
 
@@ -299,7 +346,7 @@ The following test evidence must be provided to the German BSI for proving the c
 
 	* Common behavior (SP800-90B restart + runtime tests)
 
-- If the selected OSR after applying the methodology is larger than 20, the Jitter RNG cannot be used on the particular system.
+- If the selected OSR after applying the methodology is larger than `JENT_MAX_OSR` - 20 in a default build, the highest oversampling rate the Jitter RNG is allowed to run at - the Jitter RNG cannot be used on the particular system.
 
 # Version Numbers
 
