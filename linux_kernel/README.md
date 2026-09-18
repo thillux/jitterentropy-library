@@ -58,6 +58,9 @@ Compilation:
 The module offers the following load-time parameters:
 
 * `osr`: OSR applied to all Jitter RNG instances (0 selects the default).
+  The library accepts `JENT_MIN_OSR` to `JENT_MAX_OSR`, 3 to 20 in a
+  default build: a lower value is raised to the minimum, a higher one is
+  refused and takes the module load with it.
 
 * `flags`: numeric flags value applied to all Jitter RNG instances, using the
   `JENT_*` flag bits from `jitterentropy.h`.
@@ -77,9 +80,62 @@ The module offers the following load-time parameters:
 
 * `selftest_interval`: seconds between two runs of the cryptographic self test
   of each Jitter RNG instance (default `0`, no periodic runs; maximum
-  2592000). See
+  2592000, i.e. 30 days, lower on 32-bit kernels with `HZ` of 500 or more,
+  where the delay in jiffies would overflow the timer wheel: 1073741 at
+  `HZ=1000`). See
   [Periodic Cryptographic Self Test](#linux-kernel-jitter-rng-periodic-cryptographic-self-test)
   below.
+
+* `max_instances`: maximum number of concurrently open `/dev/jitterentropy`
+  instances an unprivileged caller is allowed (default `256`, `0` for
+  unlimited). The device is world readable and every `open()` allocates a
+  Jitter RNG instance whose memory access region is hundreds of kB - up to
+  512 MB with `cache_all=1` - so the cap bounds what an unprivileged caller
+  can allocate through opens alone. An `open()` beyond it fails with `ENFILE`.
+  The kernel allocations are also charged to the caller's memory cgroup.
+
+  It bounds the number of instances, not the memory one of them ends up with:
+  a reallocation on health-test recovery doubles the memory access region, so
+  a dozen recoveries take an instance to the 512 MB ceiling whatever it
+  started at and with `cache_all` unset. Recovery runs in a compliance mode
+  only (`fips=1`, `force_fips=1` or `ntg1=1`), the only one whose health tests
+  report a failure to recover from. Use `max_memsize` below to bound it.
+
+  A caller with `CAP_SYS_RESOURCE` is not held to the cap, which keeps a full
+  device administrable and diagnosable. The cap is global rather than per
+  user, so one unprivileged caller holding every slot does keep the next one
+  out: that trades a memory bound for an availability one. Where local users
+  must not be able to lock each other out at all, restrict the device to a
+  group with a udev rule, or set `max_instances=0` and let each caller's
+  memory cgroup be the bound.
+
+* `max_kcapi_instances`: maximum number of concurrently instantiated kernel
+  crypto API tfms each unprivileged user is allowed (default `256`, `0` for
+  unlimited). Any local user can instantiate the RNG through `AF_ALG` - a
+  `bind()` to `rng`/`jitter_rng`, or to a DRBG where that seeds from this
+  module - and each tfm
+  allocates a Jitter RNG instance like an `open()` of `/dev/jitterentropy`
+  does. An instantiation beyond the cap fails with `ENFILE`, which the
+  `AF_ALG` `bind()` returns. The count is separate from `max_instances`, so
+  filling one interface does not lock the other out. A caller with
+  `CAP_SYS_RESOURCE` is not held to it, and neither are kernel threads. The cap
+  is per user because an in-kernel user such as the DRBG, which seeds from
+  `jitterentropy_rng` when built with `CONFIG_BUILTIN_JITTERENTROPY` and
+  refuses to instantiate without it under `fips=1`, allocates in its caller's
+  context: one user filling the cap must not refuse it to everyone else. In
+  user namespaces, the outermost owner that is not root is charged, so the uids
+  a user maps there share that user's cap; namespaces only root created
+  (container runtimes) charge the caller's uid as mapped.
+
+* `max_memsize`: size of the memory access region of every instance, in kB - a
+  power of two up to `524288` (512 MB). The default `0` leaves the size to the
+  library, which derives it from the CPU cache size and doubles it on every
+  health-test recovery. Setting it pins the size against both: the derivation
+  is skipped and a recovery keeps the size it finds, raising only the
+  oversampling rate and the hash loop count. A value that is not a power of
+  two the field can hold refuses the module load. It takes precedence over a
+  size given through `flags`, and the effective size is reported by
+  `/proc/jitterentropy/config/flags`.
 
 * `verbose`: enable verbose logging.
 
@@ -166,8 +222,11 @@ steps have to be taken:
    option `CONFIG_BUILTIN_JITTERENTROPY`.
    
 At this point, the Jitter RNG will now be built statically into the Linux kernel
-when compiling it. Naturally, all Linux kernel options can be set as
-the Jitter RNG does not depend on specific kernel options.
+when compiling it. It depends on no specific kernel option; only its hwrng
+interface needs the `hw_random` core, and built into the kernel image it needs
+it built in as well (`CONFIG_HW_RANDOM=y`) - with `hw_random` only a module the
+interface is left out. Built as a module itself, the Jitter RNG also takes
+`CONFIG_HW_RANDOM=m` (see the hwrng section below).
 
 # Linux Kernel Jitter RNG Character Device
 
@@ -300,8 +359,10 @@ framework.
 
 This interface is controlled by the `CONFIG_EXTERNAL_JITTERENTROPY_HWRNG`
 option in `Kbuild.config`. It is enabled by default and can be disabled at
-compile time by commenting the option out. It requires the running kernel to
-provide the `hw_random` core (`CONFIG_HW_RANDOM`).
+compile time by commenting the option out. It needs the `hw_random` core
+(`CONFIG_HW_RANDOM`): built against a kernel without it, the interface is left
+out, and so it is for a build into the kernel image when `hw_random` is only a
+module.
 
 When enabled, the Jitter RNG appears under the name `jitterentropy` in
 `/sys/class/misc/hw_random/rng_available`. Once selected as the current hwrng
@@ -314,12 +375,35 @@ The amount of entropy the Jitter RNG declares to the kernel is controlled by
 the `hwrng_quality` module parameter (bits of estimated entropy per 1024 bits
 of output, range 0..1024):
 
-* `0` (default): the device is registered but does not automatically feed the
-  kernel random pool. The output remains available via `/dev/hwrng`.
+* `0` (default): the module declares no entropy of its own. **What the kernel
+  then does with that depends on the kernel version, and on 6.2 and newer it is
+  not what the value suggests** - see the note below.
 
 * non-zero (e.g. `1024`): the in-kernel hwrng thread uses the Jitter RNG to
   feed the kernel random pool. As the Jitter RNG is designed to deliver
   conditioned, full-entropy output, `1024` is a reasonable choice.
+
+> **`hwrng_quality=0` does not mean "do not credit" on kernels >= 6.2.**
+>
+> Since the 6.2 commit *hwrng: core - treat default_quality as a maximum and
+> default to 1024*, the hw_random core computes the device's quality as
+> `min(min(rng_core.default_quality, 1024), rng->quality ?: 1024)`. A device
+> registering with `0` is therefore promoted to `rng_core.default_quality`,
+> which itself defaults to 1024 - so the Jitter RNG is credited with full
+> entropy, and, having a non-zero quality, is also auto-selected as the current
+> rng when the user has not chosen one. The in-kernel hwrng thread then seeds
+> the kernel CSPRNG from it and credits every bit.
+>
+> The module reports the promotion with a `pr_notice` at load time, and
+> `/proc/jitterentropy/hwrng_status` shows the quality actually in effect.
+>
+> To genuinely not credit the output on such a kernel, boot with
+> `rng_core.default_quality=0` (or set it at runtime via
+> `/sys/module/rng_core/parameters/default_quality`). The device stays
+> registered and readable through `/dev/hwrng` either way.
+>
+> On kernels before 6.2 the parameter means what the list above says: `0`
+> registers the device without feeding the pool.
 
 Example usage:
 
@@ -366,8 +450,12 @@ When the kernel provides `CONFIG_PROC_FS`, the module creates the directory
 			JENT_FORCE_FIPS:             on
 			JENT_NTG1:                   on
 			JENT_CACHE_ALL:              off
+			JENT_FORCE_SECURE_MEM:       off
 			max memory size:             auto (derived from cache size)
 			hash loop count:             default
+
+      The library itself adds `JENT_FORCE_SECURE_MEM` for FIPS and NTG.1, so
+      those modes require secure memory although the bit reads `off` here.
 
     * `config/flags_raw`: the effective flags value as a plain hexadecimal
       number (e.g. `0x00000060`), directly reusable as the `flags=` module
@@ -429,7 +517,14 @@ When the kernel provides `CONFIG_PROC_FS`, the module creates the directory
   Files appear on `open()` of `/dev/jitterentropy` and disappear on `close()`
   (only present when the character device interface is enabled).
 
-Every Jitter RNG instance is assigned a stable RFC 4122 version 4 UUID at
+`statistics`, `hwrng_status` and the `instances/` directory with the files
+below it are readable by root only: they report how the device is being used -
+a specific instance's health state and how many bytes it has delivered, the
+number of instances open, and, through the file names, the UUIDs of those
+instances. The remaining files describe the module's own configuration and are
+world readable.
+
+Every Jitter RNG instance is assigned a stable RFC 9562 version 4 UUID at
 allocation. It is reported in the JSON status output as the `uuid` field and,
 for the character device, used as the `instances/<uuid>` file name. The UUID is
 preserved when an instance's collector is reallocated (e.g. on health-test
@@ -528,6 +623,13 @@ measurements of the open instance: 0 (the default) selects the loop count the
 instance was configured with, any other value overrides the hash and memory
 access loop counts of every subsequent measurement (`getrawentropy --loopcnt
 <NUM>` uses it). See `jitterentropy_uapi.h` for the ABI of both ioctls.
+
+The loop count is bounded by `JENT_LOOPCNT_MAX` (`1 << 18`); above it the
+ioctl fails with `EINVAL`. One measurement carries no reschedule point, so it
+is a single uninterruptible stretch of kernel CPU whose length this count
+drives - a recording yields and takes signals per measurement, and one
+measurement is what a signal waits for. At the ceiling that is around 2.3
+seconds on contemporary x86, proportionally longer on a slower machine.
 
 ## Test Execution
 

@@ -31,7 +31,16 @@ ifeq ($(CONFIG_EXTERNAL_JITTERENTROPY_CHARDEV),y)
 jitter_rng_c_args += -DCONFIG_EXTERNAL_JITTERENTROPY_CHARDEV
 endif
 
-ifeq ($(CONFIG_EXTERNAL_JITTERENTROPY_HWRNG),y)
+# hwrng only against a kernel with hw_random: <linux/hw_random.h> has no stubs,
+# and a DKMS rebuild on such a kernel must not fail on the enabled default.
+# Built into vmlinux it needs hw_random built in too, not rng-core.ko.
+ifeq ($(CONFIG_HW_RANDOM),y)
+jent_hwrng := $(CONFIG_EXTERNAL_JITTERENTROPY_HWRNG)
+else ifeq ($(CONFIG_HW_RANDOM)$(CONFIG_EXTERNAL_JITTERENTROPY),mm)
+jent_hwrng := $(CONFIG_EXTERNAL_JITTERENTROPY_HWRNG)
+endif
+
+ifeq ($(jent_hwrng),y)
 jitter_rng_c_args += -DCONFIG_EXTERNAL_JITTERENTROPY_HWRNG
 endif
 
@@ -62,7 +71,8 @@ jitter_rng-y += ../src/jitterentropy-base.o				       \
 		jitterentropy_mod.o					       \
 		jitterentropy_ioctl.o					       \
 		jitterentropy_proc.o					       \
-		jitterentropy_selftest.o
+		jitterentropy_selftest.o				       \
+		jitterentropy_status.o
 
 jitter_rng_c_args_zero = -O0 $(jitter_rng_c_args)
 
@@ -101,6 +111,7 @@ CFLAGS_jitterentropy_mod.o = $(jitter_rng_c_args)
 CFLAGS_jitterentropy_ioctl.o = $(jitter_rng_c_args)
 CFLAGS_jitterentropy_proc.o = $(jitter_rng_c_args)
 CFLAGS_jitterentropy_selftest.o = $(jitter_rng_c_args)
+CFLAGS_jitterentropy_status.o = $(jitter_rng_c_args)
 
 ################### Kernel Crypto API Interface Compilation ####################
 
@@ -118,7 +129,7 @@ CFLAGS_jitterentropy_chardev.o = $(jitter_rng_c_args)
 
 ############################# HW RNG Compilation ###############################
 
-jitter_rng-$(CONFIG_EXTERNAL_JITTERENTROPY_HWRNG)			       \
+jitter_rng-$(jent_hwrng)						       \
 	+= jitterentropy_hwrng.o
 
 CFLAGS_jitterentropy_hwrng.o = $(jitter_rng_c_args)

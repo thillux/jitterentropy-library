@@ -20,9 +20,11 @@
 #endif
 #include <linux/fips.h>
 #include <linux/kernel.h>
+#include <linux/log2.h>
 #include <linux/module.h>
 
 #include "jitterentropy.h"
+#include "jitterentropy-internal.h"	/* JENT_MAX_OSR */
 #include "jitterentropy_chardev.h"
 #include "jitterentropy_compat.h"
 #include "jitterentropy_hwrng.h"
@@ -53,6 +55,18 @@ static bool ntg1 = false;
 static bool force_fips = false;
 static bool cache_all = false;
 
+/*
+ * Size of the memory access region of every instance, in kB: a power of two
+ * up to 524288 (512 MB), 0 (the default) leaving it to the library.
+ *
+ * Unset, the size follows the cache size (hundreds of MB with cache_all) and
+ * doubles on every health-test recovery in a compliance mode, up to 512 MB;
+ * max_instances bounds neither. Setting it pins the size: the recovery raises
+ * only the oversampling rate and the hash loop count. It takes precedence
+ * over a size given through the flags parameter.
+ */
+static unsigned int max_memsize;
+
 module_param(osr, uint, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(osr, "Jitter RNG OSR parameter");
 module_param(flags, uint, S_IRUSR | S_IRGRP | S_IROTH);
@@ -65,6 +79,9 @@ module_param(force_fips, bool, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(force_fips, "Force FIPS compliant operation (shortcut for the JENT_FORCE_FIPS bit in flags)");
 module_param(cache_all, bool, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(cache_all, "Derive the memory access region from the size of all caches instead of L1 only (shortcut for the JENT_CACHE_ALL bit in flags)");
+module_param(max_memsize, uint, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(max_memsize,
+		 "Memory access region of an instance in kB, a power of two up to 524288 (shortcut for the JENT_MAX_MEMSIZE_* bits in flags; 0: derived from the cache size and grown by health-test recovery)");
 
 static int __init jent_mod_init(void)
 {
@@ -82,6 +99,48 @@ static int __init jent_mod_init(void)
 		flags |= JENT_FORCE_FIPS;
 	if (cache_all)
 		flags |= JENT_CACHE_ALL;
+
+	/*
+	 * Refused here: jent_entropy_init_ex() would report it as a failed
+	 * startup, which panics a fips=1 kernel over a configuration error. A
+	 * rate below the minimum is raised by the library.
+	 */
+	if (osr > JENT_MAX_OSR) {
+		pr_err("jitterentropy: osr %u is above the maximum of %u\n",
+		       osr, (unsigned int)JENT_MAX_OSR);
+		return -EINVAL;
+	}
+
+	/* As above: the kernel build has no internal timer to force. */
+	if (flags & JENT_FORCE_INTERNAL_TIMER) {
+		pr_err("jitterentropy: the internal timer is not available in the kernel\n");
+		return -EINVAL;
+	}
+
+	/* As above: the compliance startup needs the memory access source. */
+	if ((flags & JENT_DISABLE_MEMORY_ACCESS) &&
+	    ((flags & (JENT_NTG1 | JENT_FORCE_FIPS)) || fips_enabled)) {
+		pr_err("jitterentropy: memory access cannot be disabled in FIPS or NTG.1 mode\n");
+		return -EINVAL;
+	}
+
+	if (max_memsize) {
+		/*
+		 * The field encodes 1 kB << (field - 1). Other sizes refuse the
+		 * load rather than being rounded to one nobody asked for.
+		 */
+		unsigned int max_kb = 1U <<
+			(JENT_FLAGS_TO_MAX_MEMSIZE(JENT_MAX_MEMSIZE_MAX) - 1);
+
+		if (!is_power_of_2(max_memsize) || max_memsize > max_kb) {
+			pr_err("jitterentropy: max_memsize %u kB is not a power of two of at most %u kB\n",
+			       max_memsize, max_kb);
+			return -EINVAL;
+		}
+
+		flags &= ~(unsigned int)JENT_MAX_MEMSIZE_MASK;
+		flags |= JENT_MAX_MEMSIZE_TO_FLAGS(ilog2(max_memsize) + 1);
+	}
 
 	ret = jent_entropy_init_ex(osr, flags);
 	if (ret) {
@@ -105,44 +164,69 @@ static int __init jent_mod_init(void)
 	if (ret)
 		return ret;
 
-	ret = jent_kcapi_init();
+	ret = jent_hwrng_init();
 	if (ret)
 		goto err;
 
-	ret = jent_hwrng_init();
-	if (ret)
-		goto err_crypto;
-
 	/*
-	 * Of the two userspace-visible interfaces, the debugfs one is the
-	 * safer to unwind: its proxy fails all file operations after
-	 * debugfs_remove_recursive(), and nothing opens it automatically the
-	 * way udev opens /dev/jitterentropy. So it goes first and the
-	 * character device below is the last fallible step.
+	 * Neither of the last two registrations can be undone under a user:
+	 * crypto_register_rng() lets crypto_alloc_rng() (e.g. an AF_ALG bind)
+	 * instantiate a tfm immediately, and crypto_unregister_rng() of an
+	 * algorithm with a live tfm hits BUG_ON() on 5.10 (a WARN on newer
+	 * kernels), with the module text freed under the tfm either way.
+	 * misc_register() makes /dev/jitterentropy openable immediately and
+	 * misc_deregister() does not wait for open files. So both come after
+	 * every other fallible step, and nothing that can still fail the load
+	 * follows them: neither is ever unwound under a user.
 	 */
-	ret = jent_testing_init();
+	ret = jent_kcapi_init();
 	if (ret)
 		goto err_hwrng;
 
 	/*
-	 * The very last step: misc_register() makes /dev/jitterentropy
-	 * openable immediately and misc_deregister() does not wait for open
-	 * files, so a later init failure could free the module under an
-	 * already-open file. The hwrng may precede it - hwrng_unregister()
-	 * drains its readers.
+	 * The character device's failure is not the module's, for the reason
+	 * the crypto API registration above must not be unwound: a local
+	 * process can bind an AF_ALG rng socket the moment
+	 * crypto_register_rng() returns, and unwinding the algorithm under that
+	 * tfm is the BUG_ON() described above. The device is a second way to
+	 * reach the entropy the crypto API and the hwrng already serve, so a
+	 * module that otherwise came up correctly keeps running without it.
+	 * jent_chardev_init() has already logged what went wrong, and
+	 * jent_chardev_exit() knows not to undo a registration that never
+	 * happened.
 	 */
-	ret = jent_chardev_init();
-	if (ret)
-		goto err_testing;
+	if (jent_chardev_init())
+		pr_warn("jitterentropy: character device unavailable, continuing without it\n");
+
+	/*
+	 * The debugfs test interface last, and its failure is not the module's.
+	 *
+	 * It has to come after every step that can still fail the load. Creating
+	 * the file earlier opened a window in which a root process could open it
+	 * while a later registration was still running - crypto_register_rng()
+	 * sleeps waiting on the larval test, so the window is not instantaneous.
+	 * open_proxy_open() takes a module reference through fops_get(), and
+	 * try_module_get() grants it because module_is_live() is true for a
+	 * module still in MODULE_STATE_COMING; the fd's f_op then points into
+	 * module text. If the load then failed, do_init_module()'s failure path
+	 * calls module_put() and free_module() without waiting for that
+	 * reference to drain, and the next read(), ioctl() or close() on the fd
+	 * dispatched through a freed function table. debugfs_remove_recursive()
+	 * in the unwind does not help: the fd already holds its own reference.
+	 *
+	 * With nothing fallible left after it the window is gone, which is why
+	 * the failure is only reported here. The interface is a pure debugging
+	 * aid - it already returns success and skips itself when debugfs is
+	 * absent, disabled or the kernel is locked down - so a module that
+	 * otherwise came up correctly must not be refused over it.
+	 */
+	if (jent_testing_init())
+		pr_warn("jitterentropy: raw entropy test interface unavailable, continuing without it\n");
 
 	return 0;
 
-err_testing:
-	jent_testing_exit();
 err_hwrng:
 	jent_hwrng_exit();
-err_crypto:
-	jent_kcapi_exit();
 err:
 	jent_proc_exit();
 	return ret;
@@ -159,9 +243,9 @@ static void __exit jent_mod_exit(void)
 	 * instances as it tears them down.
 	 */
 	jent_chardev_exit();
+	jent_kcapi_exit();
 	jent_testing_exit();
 	jent_hwrng_exit();
-	jent_kcapi_exit();
 	jent_proc_exit();
 }
 

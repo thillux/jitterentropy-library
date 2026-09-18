@@ -14,7 +14,8 @@
 /*
  * Create/remove the debugfs test interface. A creation failure is returned
  * as an error after removing anything already created; a kernel without
- * debugfs or with lockdown active skips the interface and succeeds.
+ * debugfs, booted with debugfs=off or with lockdown active skips the
+ * interface and succeeds.
  */
 int __init jent_testing_init(void);
 void jent_testing_exit(void);

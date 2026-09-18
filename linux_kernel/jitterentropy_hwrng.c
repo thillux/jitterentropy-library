@@ -33,6 +33,7 @@
 #include "jitterentropy_hwrng.h"
 #include "jitterentropy_proc.h"
 #include "jitterentropy_selftest.h"
+#include "jitterentropy_status.h"
 
 /*
  * The OSR and flags used to allocate the Jitter RNG instance are shared with
@@ -139,44 +140,14 @@ static struct hwrng jent_hwrng = {
  * and configuration) for the single instance backing /dev/hwrng.
  */
 #define JENT_HWRNG_PROC_NAME	"hwrng_status"
-#define JENT_HWRNG_STATUS_BUF_SIZE 4096
 
 static struct proc_dir_entry *jent_hwrng_proc;
 
 static int jent_hwrng_proc_status_show(struct seq_file *m, void *v)
 {
 	struct jent_hwrng_ctx *ctx = &jent_hwrng_ctx;
-	char *buf;
-	int ret;
 
-	buf = kvzalloc(JENT_HWRNG_STATUS_BUF_SIZE, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	/*
-	 * The status is derived from the collector state; hold the same lock as
-	 * the read path, which may reallocate the collector on health-test
-	 * recovery, so it cannot be freed underneath jent_status().
-	 */
-	if (mutex_lock_interruptible(&ctx->lock)) {
-		kvfree(buf);
-		return -ERESTARTSYS;
-	}
-	if (ctx->entropy_collector)
-		ret = jent_status(ctx->entropy_collector, buf,
-				  JENT_HWRNG_STATUS_BUF_SIZE);
-	else
-		ret = -1;
-	mutex_unlock(&ctx->lock);
-
-	if (ret) {
-		kvfree(buf);
-		return -EIO;
-	}
-
-	seq_puts(m, buf);
-	kvfree(buf);
-	return 0;
+	return jent_status_seq_show(m, &ctx->lock, &ctx->entropy_collector);
 }
 
 int __init jent_hwrng_init(void)
@@ -232,7 +203,8 @@ int __init jent_hwrng_init(void)
 	 * where jent_proc_dir is NULL) must not abort registration.
 	 */
 	if (jent_proc_dir) {
-		jent_hwrng_proc = proc_create_single(JENT_HWRNG_PROC_NAME, 0444,
+		/* Root only: it reports other users' activity on /dev/hwrng. */
+		jent_hwrng_proc = proc_create_single(JENT_HWRNG_PROC_NAME, 0400,
 						     jent_proc_dir,
 						     jent_hwrng_proc_status_show);
 		if (!jent_hwrng_proc)
