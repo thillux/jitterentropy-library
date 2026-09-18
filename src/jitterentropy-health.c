@@ -29,10 +29,6 @@
  * reads it. Whose registration wins is the caller's business - registering
  * from two threads at once names no winner - but the access has to be atomic
  * or it is a data race, and a torn function pointer is one the reader calls.
- *
- * Held as a jent_fnptr, which is what the atomic accessors are typed on, and
- * converted back to its own type before it is called. See
- * arch/jitterentropy-arch-atomic.h for why that is the shape.
  */
 static jent_fnptr fips_cb = NULL;
 
