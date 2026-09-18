@@ -45,6 +45,14 @@
  * DAMAGE.
  */
 
+/*
+ * The feature-test macros that make glibc declare O_CLOEXEC, and the Windows
+ * SDK version that declares BCryptGetFipsAlgorithmMode(). Must be the first
+ * line: both have to precede every system header, the <windows.h> included
+ * below among them.
+ */
+#include "jitterentropy-arch-compat.h"
+
 #include "jitterentropy.h"
 #include "jitterentropy-internal.h"
 
@@ -86,8 +94,31 @@ int jent_fips_enabled(void)
 # define JENT_ARCH_FIPS_PROC
 #endif
 
+/*
+ * The Windows FIPS mode is the system policy "System cryptography: Use FIPS
+ * compliant algorithms", reported by BCryptGetFipsAlgorithmMode() - the
+ * counterpart of the Linux indicator. A compiled-in crypto library still
+ * answers first. bcrypt is linked by the pragma (MSVC) or by CMakeLists.txt
+ * (MinGW).
+ */
+#if !defined(LIBGCRYPT) && !defined(AWSLC) && !defined(OPENSSL) && \
+    !defined(JENT_BAREMETAL) && (defined(_MSC_VER) || defined(__MINGW32__))
+# include <windows.h>
+# include <bcrypt.h>
+# if defined(_MSC_VER)
+#  pragma comment(lib, "bcrypt.lib")
+# endif
+# define JENT_ARCH_FIPS_WINDOWS
+#endif
+
 #ifdef JENT_ARCH_FIPS_PROC
 #define FIPS_MODE_SWITCH_FILE "/proc/sys/crypto/fips_enabled"
+
+/*
+ * The branch that selected JENT_ARCH_FIPS_PROC included <fcntl.h>, so
+ * JENT_O_CLOEXEC can be settled now - for the descriptor opened below.
+ */
+#include "jitterentropy-arch-compat.h"
 
 /*
  * Read the kernel's FIPS indicator out of @file. The path is a parameter so
@@ -104,7 +135,7 @@ static int jent_fips_enabled_file(const char *file)
 	int fd = 0;
 	ssize_t rlen;
 
-	if ((fd = open(file, O_RDONLY)) >= 0) {
+	if ((fd = open(file, O_RDONLY | JENT_O_CLOEXEC)) >= 0) {
 		do {
 			rlen = read(fd, buf, sizeof(buf));
 		} while (rlen < 0 && errno == EINTR);
@@ -130,11 +161,18 @@ int jent_fips_enabled(void)
 #elif defined(JENT_ARCH_FIPS_PROC)
 	return jent_fips_enabled_file(FIPS_MODE_SWITCH_FILE);
 #undef FIPS_MODE_SWITCH_FILE
+#elif defined(JENT_ARCH_FIPS_WINDOWS)
+	/* A failed query means not enabled. */
+	BOOLEAN enabled = FALSE;
+
+	if (!BCRYPT_SUCCESS(BCryptGetFipsAlgorithmMode(&enabled)))
+		return 0;
+	return enabled ? 1 : 0;
 #else
 	/*
-	 * No system-wide FIPS indicator on this platform (Windows, the BSDs,
-	 * macOS, AIX, Solaris, ...). Callers that need FIPS behaviour there ask
-	 * for it explicitly with the JENT_FORCE_FIPS flag.
+	 * No system-wide FIPS indicator on this platform (the BSDs, macOS,
+	 * AIX, Solaris, ...). Callers that need FIPS behaviour there ask for it
+	 * explicitly with the JENT_FORCE_FIPS flag.
 	 */
 	return 0;
 #endif

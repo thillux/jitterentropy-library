@@ -52,7 +52,9 @@
  * discovery once and answers from a cache afterwards.
  *
  * Dispatch:
- *   - Linux            -> /sys/devices/system/cpu walk with sysconf(_SC_LEVEL{1,2,3}_*) fallback
+ *   - Linux            -> /sys/devices/system/cpu walk with sysconf(_SC_LEVEL{1,2,3}_*) fallback,
+ *                         on Arm then the core types of /proc/cpuinfo,
+ *                         on x86 then CPUID for the levels still unknown
  *   - macOS            -> sysctlbyname("hw.l{1d,2,3}cachesize")
  *   - Windows / Cygwin -> GetLogicalProcessorInformation
  *   - {Open,Free,Net}BSD x86 -> CPUID deterministic cache parameters

@@ -40,43 +40,15 @@
  */
 
 /*
- * Atomic load and store of the library's process-wide state - the
- * implementation. What these are for and what they promise is in
- * arch/jitterentropy-arch-atomic.h; this file is only which primitive each
- * platform reaches for.
- *
- * One translation unit rather than the inline functions in a header this
- * whole library includes, and that is the point of the arrangement: the kernel
- * primitives arrive with <asm/barrier.h> and <linux/atomic.h> and the Windows
- * ones with <intrin.h>, and a header pulling those in everywhere puts every
- * source in the project one include away from a kernel or a Windows namespace
- * it has no business seeing. Every other back end under arch/ is split this
- * way; this one now is too.
- *
- * The cost is a call where an inline access stood. It is not on any measured
- * path: every one of these runs at initialization, at configuration or once
- * per collector allocation, never inside the loops the noise source times.
- *
- * The dispatch is:
+ * Dispatch:
  *   - Linux kernel                -> smp_load_acquire() / smp_store_release()
- *                                    and xchg()
- *   - GCC / Clang (any target,    -> __atomic_load_n() / __atomic_store_n() /
- *     the FreeBSD kernel and the      __atomic_exchange_n() with
- *     baremetal builds included)      __ATOMIC_ACQUIRE / _RELEASE / _ACQ_REL
+ *   - GCC / Clang (any target,    -> __atomic_load_n() / __atomic_store_n()
+ *     the FreeBSD kernel and the      with __ATOMIC_ACQUIRE / _RELEASE
+ *     baremetal builds included)
  *   - MSVC                        -> the Interlocked intrinsics
  *   - anything else               -> volatile access
- *
- * The last is what the code did before these helpers existed: a compiler with
- * neither the builtins nor the intrinsics gets no ordering guarantee beyond
- * the natural width of the access, which is the guarantee these latches were
- * relying on all along. It is a fallback, not a supported concurrency model.
  */
 
-/*
- * As every other back end under arch/: the public header for the integer
- * types the kernel and a hosted build spell differently, and the internal one
- * for the declarations these definitions have to match.
- */
 #include "jitterentropy.h"
 #include "jitterentropy-internal.h"
 
@@ -100,14 +72,20 @@ uint32_t jent_atomic_load_u32(uint32_t *ptr)
 	return smp_load_acquire(ptr);
 }
 
+uint32_t jent_atomic_inc_u32(uint32_t *ptr)
+{
+	uint32_t old;
+
+	do {
+		old = READ_ONCE(*ptr);
+	} while (cmpxchg(ptr, old, old + 1) != old);
+
+	return old + 1;
+}
+
 void jent_atomic_store_u32(uint32_t *ptr, uint32_t val)
 {
 	smp_store_release(ptr, val);
-}
-
-int jent_atomic_exchange_int(int *ptr, int val)
-{
-	return xchg(ptr, val);
 }
 
 jent_fnptr jent_atomic_load_fnptr(jent_fnptr *ptr)
@@ -137,24 +115,14 @@ uint32_t jent_atomic_load_u32(uint32_t *ptr)
 	return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
 }
 
+uint32_t jent_atomic_inc_u32(uint32_t *ptr)
+{
+	return __atomic_add_fetch(ptr, 1, __ATOMIC_SEQ_CST);
+}
+
 void jent_atomic_store_u32(uint32_t *ptr, uint32_t val)
 {
 	__atomic_store_n(ptr, val, __ATOMIC_RELEASE);
-}
-
-/*
- * The one read-modify-write, and on aarch64 the one place a freestanding build
- * can come apart: GCC 10 and later default to -moutline-atomics there, which
- * compiles this into a call to a libgcc helper - __aarch64_swp4_acq_rel - that
- * chooses between the LSE and the LL/SC form at run time through an ifunc. A
- * -nostdlib link has no libgcc, the symbol stays undefined, and the first call
- * jumps into nothing. Such a build wants -mno-outline-atomics, as the kernel
- * uses for the same reason; see the note beside JENT_BAREMETAL in
- * jitterentropy.h.
- */
-int jent_atomic_exchange_int(int *ptr, int val)
-{
-	return __atomic_exchange_n(ptr, val, __ATOMIC_ACQ_REL);
 }
 
 /* The builtins take any scalar, a pointer to a function included. */
@@ -172,21 +140,6 @@ void jent_atomic_store_fnptr(jent_fnptr *ptr, jent_fnptr val)
 
 #include <intrin.h>
 
-/*
- * MSVC has no __atomic builtins; the Interlocked intrinsics are the primitives
- * and they are typed on long, which is the 32-bit type on every Windows ABI -
- * the same width as the int and the uint32_t latched on here, so the pointer is
- * cast rather than the state being widened. MSVC performs no type-based alias
- * analysis, which is what makes that cast the documented way to use these.
- *
- * Both intrinsics are full barriers, which is stronger than the acquire and
- * release this back end promises. Nothing here is on a path where that costs
- * anything: every one of them runs at initialization, at configuration or once
- * per collector allocation.
- *
- * _InterlockedOr(ptr, 0) is the load - Windows offers no plain interlocked
- * read, and an OR of zero returns the value without changing it.
- */
 int jent_atomic_load_int(int *ptr)
 {
 	return (int)_InterlockedOr((volatile long *)ptr, 0);
@@ -202,28 +155,16 @@ uint32_t jent_atomic_load_u32(uint32_t *ptr)
 	return (uint32_t)_InterlockedOr((volatile long *)ptr, 0);
 }
 
+uint32_t jent_atomic_inc_u32(uint32_t *ptr)
+{
+	return (uint32_t)_InterlockedIncrement((volatile long *)ptr);
+}
+
 void jent_atomic_store_u32(uint32_t *ptr, uint32_t val)
 {
 	(void)_InterlockedExchange((volatile long *)ptr, (long)val);
 }
 
-int jent_atomic_exchange_int(int *ptr, int val)
-{
-	return (int)_InterlockedExchange((volatile long *)ptr, (long)val);
-}
-
-/*
- * The pointer-width pair. _InterlockedCompareExchangePointer() against NULL
- * for NULL is the load, for the reason _InterlockedOr(ptr, 0) is above: it
- * returns the value and, unless it already was NULL, writes nothing.
- *
- * The address is cast directly - it is an object pointer whichever type it
- * points to - while the value goes through uintptr_t in both directions. A
- * function pointer and a data pointer are one width on every Windows ABI, but
- * casting between them is what C4054 and C4055 are about, and this build is
- * compiled with /W4. Through an integer wide enough to hold either, MSVC says
- * nothing, and there is no conversion left for it to have an opinion on.
- */
 jent_fnptr jent_atomic_load_fnptr(jent_fnptr *ptr)
 {
 	return (jent_fnptr)(uintptr_t)_InterlockedCompareExchangePointer(
@@ -237,6 +178,18 @@ void jent_atomic_store_fnptr(jent_fnptr *ptr, jent_fnptr val)
 }
 
 #else /* no atomics available */
+
+/*
+ * The one read-modify-write: the latches below tolerate a plain volatile
+ * access, a counter handed out to concurrent callers does not. C11 atomics
+ * where the compiler has them (xlc, Oracle Studio); the cast assumes a
+ * lock-free 32-bit atomic shares the plain type's representation.
+ */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && \
+    !defined(__STDC_NO_ATOMICS__)
+# include <stdatomic.h>
+# define JENT_ATOMIC_C11_INC
+#endif
 
 int jent_atomic_load_int(int *ptr)
 {
@@ -253,19 +206,21 @@ uint32_t jent_atomic_load_u32(uint32_t *ptr)
 	return *(volatile uint32_t *)ptr;
 }
 
+uint32_t jent_atomic_inc_u32(uint32_t *ptr)
+{
+#ifdef JENT_ATOMIC_C11_INC
+	return atomic_fetch_add((_Atomic uint32_t *)ptr, 1) + 1;
+#else
+	uint32_t val = *(volatile uint32_t *)ptr + 1;
+
+	*(volatile uint32_t *)ptr = val;
+	return val;
+#endif
+}
+
 void jent_atomic_store_u32(uint32_t *ptr, uint32_t val)
 {
 	*(volatile uint32_t *)ptr = val;
-}
-
-/* Not atomic at all here - see the note on this fallback above. */
-int jent_atomic_exchange_int(int *ptr, int val)
-{
-	int old = *(volatile int *)ptr;
-
-	*(volatile int *)ptr = val;
-
-	return old;
 }
 
 jent_fnptr jent_atomic_load_fnptr(jent_fnptr *ptr)

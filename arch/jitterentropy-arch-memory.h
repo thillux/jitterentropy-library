@@ -48,14 +48,23 @@
  *     secure heap, ...). Of the collector flags only JENT_FORCE_SECURE_MEM is
  *     consulted: it turns secure memory the environment does not grant from a
  *     silent fallback to ordinary memory into an allocation failure.
- *   - jent_zfree(ptr, len): zero and release such an allocation.
+ *   - jent_zalloc_unlocked(len): what jent_zalloc() falls back to - zeroed,
+ *     guard-paged and excluded from core dumps where the backend does so, but
+ *     neither locked nor from a secure arena. For the memory access region,
+ *     which holds no collector state.
+ *   - jent_zfree(ptr, len): zero and release either kind of allocation.
  *   - jent_memset_secure(s, n): wipe a buffer in a way the compiler may
  *     not optimize away.
  *   - jent_secure_memory_supported(): whether the active path locks and wipes.
  *
  * The dispatch order is:
  *   - LIBGCRYPT     -> gcry_malloc_secure / gcry_free
- *   - AWSLC         -> OPENSSL_malloc / OPENSSL_free (auto-wipe)
+ *   - AWSLC         -> OPENSSL_malloc / OPENSSL_free (auto-wipe), with the
+ *                      payload pages locked (mlock / VirtualLock) and,
+ *                      where madvise() offers it (Linux, FreeBSD), excluded
+ *                      from core dumps by this library; without
+ *                      a memory lock on the platform an allocation that
+ *                      carries JENT_FORCE_SECURE_MEM is refused
  *   - OPENSSL       -> OPENSSL_secure_malloc / OPENSSL_secure_free
  *   - Windows       -> VirtualAlloc + VirtualLock with PAGE_NOACCESS guard
  *                      pages around the payload
@@ -68,22 +77,24 @@
  *                      user space core dumps and is wiped on free
  *   - other         -> plain malloc
  *
- * Four backends can be denied secure memory at runtime: the two mlock ones
- * when the operating system refuses the lock, libgcrypt and OpenSSL when their
- * secure arena is absent or exhausted. All four then fall back to ordinary
- * memory unless JENT_FORCE_SECURE_MEM makes the same situation fail the
- * allocation. Only that differs - the guard pages and the dump exclusion are
- * established either way, and the free path tells the two kinds of pointer
+ * Five backends can be denied secure memory at runtime: the two mlock ones and
+ * AWS-LC when the operating system refuses the lock, libgcrypt and OpenSSL when
+ * their secure arena is absent or exhausted. All five then fall back to
+ * ordinary memory unless JENT_FORCE_SECURE_MEM makes the same situation fail
+ * the allocation. Only that differs - the guard pages and the dump exclusion
+ * are established either way, and the free path tells the two kinds of pointer
  * apart itself, which is why jent_zfree() does not take the flags.
  *
  * How much memory may be locked (RLIMIT_MEMLOCK, the Windows working set
  * quota) and how large the libgcrypt and OpenSSL arenas are is process-wide
  * state belonging to the application, which the library does not change: a
  * size chosen here would bound every other user of those libraries in the
- * process. An application that needs a large collector locked raises the
- * limits and configures the arena itself, as the test programs do in
- * tests/jitterentropy-memlock.h; jent_zalloc() only checks that the allocation
- * came out of a configured arena.
+ * process. A collector locks one page of state whatever its memory size, one
+ * more with the internal timer and two more while its startup runs, so the
+ * defaults cover several collectors. An application that needs more raises
+ * the limits and configures the arena itself, as the test programs do in
+ * tests/jitterentropy-memlock.h; jent_zalloc() only checks that the
+ * allocation came out of a configured arena.
  */
 
 #ifndef _JITTERENTROPY_ARCH_MEMORY_H
@@ -91,6 +102,7 @@
 
 void jent_memset_secure(void *s, size_t n);
 void *jent_zalloc(size_t len, unsigned int flags);
+void *jent_zalloc_unlocked(size_t len);
 
 /*
  * Releases what jent_zalloc() returned, wiping @len bytes first. @len must be

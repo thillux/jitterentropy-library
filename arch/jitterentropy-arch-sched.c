@@ -2,9 +2,6 @@
 /*
  * Architecture / OS-specific scheduler yield.
  *
- * Definition of jent_yield() (declared in arch/jitterentropy-arch-sched.h). It
- * combines a CPU-level pause hint with an OS-level scheduler yield; see that
- * header for the dispatch rationale.
  *
  * Copyright Stephan Mueller <smueller@chronox.de>, 2014 - 2026
  *

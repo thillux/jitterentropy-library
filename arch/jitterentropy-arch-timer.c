@@ -2,9 +2,6 @@
 /*
  * Architecture-specific high-resolution timestamp source.
  *
- * Definition of jent_get_nstime() (declared in
- * arch/jitterentropy-arch-timer.h); see that header for the dispatch
- * rationale.
  *
  * Every backend lives here rather than inline in the header so that the
  * platform headers they need - <windows.h>, <x86intrin.h>, the Mach headers,
@@ -58,21 +55,26 @@
  */
 
 /*
- * _DEFAULT_SOURCE exposes clock_gettime()/CLOCK_* (POSIX.1b) on glibc under a
- * strict -std=c11. The generic fallback below uses them on architectures
- * without a counter instruction. The macro is defined here rather than in the
- * public jitterentropy.h so the header imposes no feature-test macro on
- * consumers; it must precede every system header.
+ * The feature-test macros that make glibc declare clock_gettime() and the
+ * CLOCK_* identifiers - POSIX.1b (__USE_POSIX199309), and so hidden by the
+ * strict -std=c11 the Makefile uses. The generic fallback below uses them on
+ * architectures without a counter instruction. Must be the first line: they
+ * have to precede every system header.
  */
-#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
-# define _DEFAULT_SOURCE
-#endif
+#include "jitterentropy-arch-compat.h"
 
 #include "jitterentropy.h"
 #include "jitterentropy-arch-timer.h"
 
+/*
+ * MSVC names the Arm architectures _M_ARM and _M_ARM64 only; clang and GCC
+ * targeting MinGW (llvm-mingw's aarch64-w64-mingw32 and armv7-w64-mingw32)
+ * define __aarch64__ and __arm__ instead, and without them here such a build
+ * would fall through to the bare cntvct_el0 read below.
+ */
 #if (defined(_MSC_VER) || defined(__MINGW32__)) && \
-    (defined(_M_ARM) || defined(_M_ARM64))
+    (defined(_M_ARM) || defined(_M_ARM64) || \
+     defined(__arm__) || defined(__aarch64__))
 # include <windows.h>
 # include <profileapi.h>
 # define JENT_ARCH_TIMER_WINDOWS_QPC
