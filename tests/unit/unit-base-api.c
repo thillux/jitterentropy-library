@@ -140,6 +140,48 @@ static void test_collector_alloc(void)
 	ec = jent_entropy_collector_alloc(JENT_MAX_OSR + 1, 0);
 	JENT_UT_TRUE(ec == NULL, "an osr above the maximum is refused");
 	jent_entropy_collector_free(ec);
+	JENT_UT_EQ(jent_entropy_init_ex(JENT_MAX_OSR + 1, 0), EPROGERR,
+		   "and by the initialization as an invalid argument");
+	JENT_UT_EQ(jent_entropy_init_ex(0, JENT_DISABLE_MEMORY_ACCESS |
+					   JENT_NTG1), EPROGERR,
+		   "as is memory access disabled for a compliance mode");
+
+	/*
+	 * The maximum allocates with cutoffs of its own rate. Compared with the
+	 * rate below, as the tables rise strictly until capped (the APT is
+	 * capped by then, so it is not checked).
+	 */
+	ec = jent_entropy_collector_alloc(JENT_MAX_OSR, 0);
+	if (ec) {
+		struct rand_data *below =
+			jent_entropy_collector_alloc(JENT_MAX_OSR - 1, 0);
+		char buf[32];
+
+		JENT_UT_EQ(ec->osr, (unsigned int)JENT_MAX_OSR,
+			   "the highest osr the tables cover allocates");
+		JENT_UT_EQ(jent_read_entropy(ec, buf, sizeof(buf)),
+			   (ssize_t)sizeof(buf), "and generates from it");
+
+		if (below) {
+			JENT_UT_TRUE(ec->rct_mem_cutoff >
+				     below->rct_mem_cutoff,
+				     "its RCT-with-memory cutoff is its own");
+#ifdef JENT_HEALTH_LAG_PREDICTOR
+			JENT_UT_TRUE(ec->lag_local_cutoff >
+				     below->lag_local_cutoff,
+				     "as is its lag predictor cutoff");
+#endif
+			jent_entropy_collector_free(below);
+		} else {
+			JENT_UT_SKIP("the cutoffs of the highest osr",
+				     "no collector one rate below it");
+		}
+
+		jent_entropy_collector_free(ec);
+	} else {
+		JENT_UT_SKIP("the highest osr the tables cover",
+			     "no collector on this machine");
+	}
 
 	/* With the memory access disabled there is no block to size. */
 	ec = jent_entropy_collector_alloc(0, JENT_DISABLE_MEMORY_ACCESS);
@@ -211,6 +253,25 @@ static void test_status(void)
 	}
 
 	/*
+	 * The OSR bounds are the build's own, so a consumer can tell what the
+	 * reported rate may range over. Both are compile-time tunable, hence
+	 * the values are formatted from the macros rather than hardcoded.
+	 */
+	{
+		char expect[64];
+
+		snprintf(expect, sizeof(expect), "\"osrMin\": %u,",
+			 (unsigned int)JENT_MIN_OSR);
+		JENT_UT_TRUE(strstr(buf, expect) != NULL,
+			     "the status reports the minimum osr");
+
+		snprintf(expect, sizeof(expect), "\"osrMax\": %u,",
+			 (unsigned int)JENT_MAX_OSR);
+		JENT_UT_TRUE(strstr(buf, expect) != NULL,
+			     "and the maximum osr");
+	}
+
+	/*
 	 * A buffer that cannot hold the document is reported as an error
 	 * rather than handed back as a truncated one a consumer would fail to
 	 * parse - and the truncation stays inside the buffer. `tiny` is
@@ -231,6 +292,28 @@ static void test_status(void)
 				touched++;
 		}
 		JENT_UT_EQ(touched, 0, "nothing was written past the buffer");
+	}
+
+	/*
+	 * An instance without a memory access region reports none, not what
+	 * its unnormalized memory size field decodes to.
+	 */
+	{
+		struct rand_data *nomem =
+			jent_entropy_collector_alloc(0,
+						     JENT_DISABLE_MEMORY_ACCESS);
+
+		if (!nomem) {
+			JENT_UT_SKIP("an instance without a memory region",
+				     "no collector: a FIPS host refuses the combination");
+		} else {
+			JENT_UT_EQ(jent_status(nomem, buf, sizeof(buf)), 0,
+				   "the status of an instance without a memory region renders");
+			JENT_UT_TRUE(strstr(buf,
+					    "\"memoryBlockSizeBytes\": 0,") != NULL,
+				     "and reports no region rather than a default size");
+			jent_entropy_collector_free(nomem);
+		}
 	}
 
 	/*
@@ -485,10 +568,11 @@ static void test_selftest(void)
 
 	JENT_UT_EQ(jent_selftest(ec), 0,
 		   "they pass bound to a collector");
-	JENT_UT_EQ(ec->selftest_failed, 0u,
+	JENT_UT_EQ(jent_atomic_load_int(&ec->selftest_failed), 0,
 		   "a passing run leaves the instance in service");
-	JENT_UT_EQ(jent_selftest_run, 1,
-		   "the startup self test remains recorded as run");
+	JENT_UT_TRUE(jent_startup_passed(JENT_CLOCK_PLATFORM) ||
+		     jent_startup_passed(JENT_CLOCK_NOTIME),
+		     "the startup self test remains recorded as run");
 	JENT_UT_EQ(jent_read_entropy(ec, buf, sizeof(buf)), (ssize_t)sizeof(buf),
 		   "the collector still delivers afterwards");
 
@@ -518,7 +602,7 @@ static void test_selftest_failure_stops_output(void)
 	memset(buf, 0, sizeof(buf));
 	memset(zero, 0, sizeof(zero));
 
-	ec->selftest_failed = 1;
+	jent_atomic_store_int(&ec->selftest_failed, 1);
 
 	JENT_UT_EQ(jent_read_entropy(ec, (char *)buf, sizeof(buf)),
 		   JENT_ERR_SELFTEST,

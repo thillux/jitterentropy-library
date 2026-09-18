@@ -29,9 +29,9 @@
  *
  * The allocator is interposed rather than the library being given a test hook.
  * These programs absorb the library sources (see CMakeLists.txt here), so
- * renaming jent_zalloc() through the preprocessor while
- * arch/jitterentropy-arch-memory.c is compiled hides that definition under a
- * private name and lets this file supply jent_zalloc() itself. Every absorbed
+ * renaming jent_zalloc() and jent_zalloc_unlocked() through the preprocessor
+ * while arch/jitterentropy-arch-memory.c is compiled hides those definitions
+ * under private names and lets this file supply both itself. Every absorbed
  * caller reaches the interposed one, and the shipped library carries no
  * testing conditional.
  */
@@ -81,6 +81,13 @@ static int fi_fail_mmap;
 static int fi_fail_mprotect;
 static unsigned int fi_mprotect_calls;
 static int fi_fail_mlock;
+static unsigned int fi_mlock_calls;
+
+/*
+ * A per-call lock quota in bytes, zero for none. Enough to tell the memory
+ * access region from the state around it.
+ */
+static size_t fi_mlock_quota;
 
 #ifdef FI_WINDOWS
 
@@ -116,7 +123,8 @@ static JENT_UT_MAYBE_UNUSED BOOL fi_VirtualProtect(LPVOID addr, SIZE_T len,
  */
 static JENT_UT_MAYBE_UNUSED BOOL fi_VirtualLock(LPVOID addr, SIZE_T len)
 {
-	if (fi_fail_mlock) {
+	fi_mlock_calls++;
+	if (fi_fail_mlock || (fi_mlock_quota && len > fi_mlock_quota)) {
 		SetLastError(ERROR_WORKING_SET_QUOTA);
 		return FALSE;
 	}
@@ -150,8 +158,13 @@ static JENT_UT_MAYBE_UNUSED int fi_mprotect(void *addr, size_t len, int prot)
 
 static JENT_UT_MAYBE_UNUSED int fi_mlock(const void *addr, size_t len)
 {
+	fi_mlock_calls++;
 	if (fi_fail_mlock) {
 		errno = fi_mlock_errno;
+		return -1;
+	}
+	if (fi_mlock_quota && len > fi_mlock_quota) {
+		errno = ENOMEM;
 		return -1;
 	}
 	return mlock(addr, len);
@@ -161,10 +174,12 @@ static JENT_UT_MAYBE_UNUSED int fi_mlock(const void *addr, size_t len)
 
 /*
  * Compile the real allocator under a private name, with its kernel calls
- * redirected. The header it includes declares jent_zalloc(), which is renamed
- * with it, so the declaration and the definition still agree.
+ * redirected. The header it includes declares jent_zalloc() and
+ * jent_zalloc_unlocked(), which are renamed with them, so the declarations and
+ * the definitions still agree.
  */
 #define jent_zalloc jent_fi_real_zalloc
+#define jent_zalloc_unlocked jent_fi_real_zalloc_unlocked
 #ifdef FI_WINDOWS
 # define VirtualAlloc fi_VirtualAlloc
 # define VirtualProtect fi_VirtualProtect
@@ -191,25 +206,40 @@ static JENT_UT_MAYBE_UNUSED int fi_mlock(const void *addr, size_t len)
 # undef mprotect
 # undef mmap
 #endif
+#undef jent_zalloc_unlocked
 #undef jent_zalloc
 
 /*
  * Fail the n-th allocation from now on, counting from 1. Zero disables the
  * injection. Only one allocation is failed per arming, so that the collector
  * is built up to a chosen point and only then denied its next allocation -
- * which is what walks the cleanup paths one stage at a time.
+ * which is what walks the cleanup paths one stage at a time. Both allocators
+ * count, the memory access region being one of the stages.
  */
 static unsigned int fi_fail_alloc;
 static unsigned int fi_alloc_count;
 
-void *jent_zalloc(size_t len, unsigned int flags)
+static int fi_deny_alloc(void)
 {
 	fi_alloc_count++;
 
-	if (fi_fail_alloc && fi_alloc_count == fi_fail_alloc)
+	return fi_fail_alloc && fi_alloc_count == fi_fail_alloc;
+}
+
+void *jent_zalloc(size_t len, unsigned int flags)
+{
+	if (fi_deny_alloc())
 		return NULL;
 
 	return jent_fi_real_zalloc(len, flags);
+}
+
+void *jent_zalloc_unlocked(size_t len)
+{
+	if (fi_deny_alloc())
+		return NULL;
+
+	return jent_fi_real_zalloc_unlocked(len);
 }
 
 static void fi_arm(unsigned int nth)
@@ -240,10 +270,9 @@ static unsigned int fi_count_allocs(void (*op)(void))
  * The real ones are captured in wrappers defined before the names are taken
  * over, so the fakes can still forward.
  *
- * sysconf() and the affinity query are the POSIX backends' sources. The
- * Windows ones have no "cannot tell" reply to fake - jent_ncpu() there cannot
- * return an error at all - so there is nothing to interpose and the cases
- * below skip.
+ * sysconf() and the affinity query are the POSIX backends' sources. On
+ * Windows they are GetThreadGroupAffinity() and GetActiveProcessorCount(),
+ * which fail with FALSE and with a count of zero.
  */
 #ifndef FI_WINDOWS
 #include <sched.h>
@@ -293,6 +322,43 @@ static long fi_sysconf(int name)
 	default:
 		return fi_sysconf_real(name);
 	}
+}
+#else /* FI_WINDOWS */
+
+static int fi_fail_affinity;
+static int fi_empty_affinity;
+static int fi_fail_processor_count;
+
+static BOOL fi_GetThreadGroupAffinity_real(HANDLE thread, PGROUP_AFFINITY ga)
+{
+	return GetThreadGroupAffinity(thread, ga);
+}
+
+static BOOL fi_GetThreadGroupAffinity(HANDLE thread, PGROUP_AFFINITY ga)
+{
+	if (fi_fail_affinity) {
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
+	if (!fi_GetThreadGroupAffinity_real(thread, ga))
+		return FALSE;
+	/* Succeeds, but names no CPU - not a usable count either. */
+	if (fi_empty_affinity)
+		ga->Mask = 0;
+	return TRUE;
+}
+
+static DWORD fi_GetActiveProcessorCount_real(WORD group)
+{
+	return GetActiveProcessorCount(group);
+}
+
+static DWORD fi_GetActiveProcessorCount(WORD group)
+{
+	/* Zero is the documented failure reply. */
+	if (fi_fail_processor_count)
+		return 0;
+	return fi_GetActiveProcessorCount_real(group);
 }
 #endif /* FI_WINDOWS */
 
@@ -384,9 +450,17 @@ static void *fi_cpu_alloc(size_t count)
  * one CPU and a machine that has run out of threads are both configurations
  * the library has to handle and neither is one a test can be run on.
  */
+#ifdef FI_WINDOWS
+# define GetThreadGroupAffinity fi_GetThreadGroupAffinity
+# define GetActiveProcessorCount fi_GetActiveProcessorCount
+#endif
 #define jent_ncpu jent_fi_real_ncpu
 #include "jitterentropy-arch-ncpu.c"
 #undef jent_ncpu
+#ifdef FI_WINDOWS
+# undef GetActiveProcessorCount
+# undef GetThreadGroupAffinity
+#endif
 
 /*
  * The whole thread back-end - the context type, the start routine type and
@@ -492,6 +566,42 @@ int jent_fips_enabled(void);
 #include "jitterentropy-status.c"
 
 #include "jitterentropy-arch-cache.c"
+/* The Windows FIPS policy query, faked to report "on" or to fail. */
+#if defined(FI_WINDOWS) && !defined(LIBGCRYPT) && !defined(AWSLC) && \
+    !defined(OPENSSL)
+# include <bcrypt.h>
+# define FI_HAVE_BCRYPT_FIPS
+
+enum fi_bcrypt_fips_mode {
+	FI_BCRYPT_FIPS_REAL = 0,
+	FI_BCRYPT_FIPS_FAIL,	/* an error status, with TRUE written anyway */
+	FI_BCRYPT_FIPS_ON,	/* the policy is enabled */
+};
+
+static enum fi_bcrypt_fips_mode fi_bcrypt_fips_mode;
+
+static NTSTATUS fi_BCryptGetFipsAlgorithmMode_real(BOOLEAN *enabled)
+{
+	return BCryptGetFipsAlgorithmMode(enabled);
+}
+
+static NTSTATUS fi_BCryptGetFipsAlgorithmMode(BOOLEAN *enabled)
+{
+	switch (fi_bcrypt_fips_mode) {
+	case FI_BCRYPT_FIPS_FAIL:
+		*enabled = TRUE;
+		return (NTSTATUS)0xC0000001L;	/* STATUS_UNSUCCESSFUL */
+	case FI_BCRYPT_FIPS_ON:
+		*enabled = TRUE;
+		return 0;
+	case FI_BCRYPT_FIPS_REAL:
+	default:
+		return fi_BCryptGetFipsAlgorithmMode_real(enabled);
+	}
+}
+# define BCryptGetFipsAlgorithmMode fi_BCryptGetFipsAlgorithmMode
+#endif
+
 /*
  * The rename is scoped to this one include: the sources above call
  * jent_fips_enabled() and must reach the override below, not the real one.
@@ -499,6 +609,9 @@ int jent_fips_enabled(void);
 #define jent_fips_enabled jent_fi_real_fips_enabled
 #include "jitterentropy-arch-fips.c"
 #undef jent_fips_enabled
+#ifdef FI_HAVE_BCRYPT_FIPS
+# undef BCryptGetFipsAlgorithmMode
+#endif
 
 int jent_fips_enabled(void)
 {
@@ -569,7 +682,7 @@ static void test_collector_alloc_failures(void)
 	jent_ut_group("every allocation of the collector is denied in turn");
 
 	for (c = 0; c < sizeof(configs) / sizeof(configs[0]); c++) {
-		unsigned int total, nth, survived = 0;
+		unsigned int total, nth, survived = 0, usable = 0, expect;
 
 		alloc_flags = configs[c].flags;
 		total = fi_count_allocs(op_collector_alloc);
@@ -579,28 +692,62 @@ static void test_collector_alloc_failures(void)
 			continue;
 		}
 
+		/*
+		 * What the configuration implies: the struct rand_data, and
+		 * the memory access region unless that noise source is turned
+		 * off. Asserted rather than printed, so that an allocation
+		 * appearing or disappearing - a denial arm that then walks
+		 * past the end of the sequence and tests nothing - is noticed
+		 * here and not in a number nobody reads.
+		 */
+		expect = (configs[c].flags & JENT_DISABLE_MEMORY_ACCESS) ?
+			 1 : 2;
+
 		for (nth = 1; nth <= total; nth++) {
 			struct rand_data *ec;
+			char buf[32];
 
 			fi_arm(nth);
 			ec = jent_entropy_collector_alloc(0, configs[c].flags);
 			fi_disarm();
 
-			if (ec) {
-				/*
-				 * Not a failure in itself: an allocation the
-				 * collector can do without (the GCD history of
-				 * the startup test, say) leaves a usable
-				 * collector. It must still be intact.
-				 */
-				survived++;
-				jent_entropy_collector_free(ec);
-			}
+			if (!ec)
+				continue;
+
+			/*
+			 * Not a failure in itself: an allocation the collector
+			 * can do without (the GCD history of the startup test,
+			 * say) leaves a usable collector. But usable is the
+			 * claim, and it has to be made good on - a half-built
+			 * collector handed back to the caller would land here
+			 * just the same, and used to be counted as a pass.
+			 */
+			survived++;
+			if ((!(configs[c].flags & JENT_DISABLE_MEMORY_ACCESS) &&
+			     !ec->mem))
+				printf("  %s: the collector surviving denial "
+				       "%u of %u has no memory access region\n",
+				       configs[c].name, nth, total);
+			else if (jent_read_entropy(ec, buf, sizeof(buf)) !=
+				 (ssize_t)sizeof(buf))
+				printf("  %s: the collector surviving denial "
+				       "%u of %u produces no entropy\n",
+				       configs[c].name, nth, total);
+			else
+				usable++;
+
+			jent_entropy_collector_free(ec);
 		}
 
 		printf("  %-22s %2u allocations, %u survived a denial\n",
 		       configs[c].name, total, survived);
-		jent_ut_checks++;
+
+		JENT_UT_EQ(total, expect,
+			   "the collector makes the allocations its "
+			   "configuration implies");
+		JENT_UT_EQ(usable, survived,
+			   "a denied allocation gives back NULL or a working "
+			   "collector, never a half-built one");
 	}
 }
 
@@ -608,13 +755,29 @@ static void test_collector_alloc_failures(void)
  * The same for the startup self test, which allocates its own collector and a
  * GCD history and has to release both on every exit.
  */
+static void op_time_entropy_init(void)
+{
+	(void)jent_time_entropy_init(JENT_MIN_OSR,
+				     JENT_DISABLE_INTERNAL_TIMER);
+}
+
 static void test_init_failures(void)
 {
-	unsigned int nth, emem = 0, other = 0;
+	unsigned int nth, total, emem = 0, other = 0, swallowed = 0;
 
 	jent_ut_group("the startup self test under allocation failure");
 
-	for (nth = 1; nth <= 8; nth++) {
+	/*
+	 * Exactly as many arms as the startup makes allocations. A fixed
+	 * range covered the ones past the end with nothing at all - the
+	 * denial never fired - and every one of those counted as a pass,
+	 * which is also how the loop below would have read a denial the
+	 * startup swallowed and reported success for.
+	 */
+	total = fi_count_allocs(op_time_entropy_init);
+	JENT_UT_NE(total, 0, "the startup self test allocates");
+
+	for (nth = 1; nth <= total; nth++) {
 		int ret;
 
 		fi_arm(nth);
@@ -626,10 +789,13 @@ static void test_init_failures(void)
 			emem++;
 		else if (ret)
 			other++;
+		else
+			swallowed++;
 	}
 
-	JENT_UT_NE(emem, 0, "a denied allocation is reported as EMEM");
+	JENT_UT_EQ(emem, total, "every denied allocation is reported as EMEM");
 	JENT_UT_EQ(other, 0, "and never as some other failure");
+	JENT_UT_EQ(swallowed, 0, "and never reported as success");
 
 	/* And that it still passes once nothing is denied. */
 	fi_disarm();
@@ -657,21 +823,55 @@ static void test_gcd_failures(void)
 		   "and passes again with the allocator restored");
 }
 
-/* The hash state allocation, which the collector cannot do without. */
-static void test_sha3_alloc_failure(void)
+/*
+ * The mark that records "a startup has passed in this process" is written once
+ * and never taken back: it is set only by a startup that passed, and a failing
+ * one neither sets nor clears it.
+ *
+ * Both halves matter, and they used to be one bug each. The mark was set on
+ * entry to the startup, as a guard against a startup allocating a collector
+ * that runs another startup - so a failure had to clear it again, and that
+ * store retracted a verdict a concurrent thread had already established,
+ * sending it to redo the work and possibly fail on a transient condition its
+ * own process had already passed. The recursion is handled where it happens
+ * now (the measure_clock argument of the internal allocation), which leaves
+ * this mark free to mean only what it says.
+ *
+ * main() establishes the mark before any case runs, so what this program
+ * reaches is the retraction half: whatever the mark is on entry, a failed
+ * initialization leaves it exactly so. That a failure cannot set it is
+ * structural - jent_entropy_init_common_post() stores only for ret == 0.
+ */
+static void test_failed_init_unmarks_selftest(void)
 {
-	void *hash_state = (void *)0x1;
+	struct rand_data *ec;
+	int marked = jent_startup_passed(JENT_CLOCK_PLATFORM);
+	int marked_notime = jent_startup_passed(JENT_CLOCK_NOTIME);
 
-	jent_ut_group("the hash state under allocation failure");
+	jent_ut_group("a failed initialization does not change the mark");
 
 	fi_arm(1);
-	JENT_UT_NE(jent_sha3_alloc(&hash_state, 0), 0,
-		   "jent_sha3_alloc reports the denial");
+	JENT_UT_EQ(jent_entropy_init_ex(0, JENT_DISABLE_INTERNAL_TIMER), EMEM,
+		   "a denied GCD self test fails the initialization");
 	fi_disarm();
+	JENT_UT_EQ(jent_startup_passed(JENT_CLOCK_PLATFORM), marked,
+		   "and leaves the mark as it found it");
+	JENT_UT_EQ(jent_startup_passed(JENT_CLOCK_NOTIME), marked_notime,
+		   "on both clocks");
 
-	JENT_UT_EQ(jent_sha3_alloc(&hash_state, 0), 0,
-		   "and succeeds again with the allocator restored");
-	jent_sha3_dealloc(hash_state);
+	fi_arm(1);
+	JENT_UT_EQ(jent_entropy_init(), EMEM,
+		   "the same through jent_entropy_init");
+	fi_disarm();
+	JENT_UT_EQ(jent_startup_passed(JENT_CLOCK_PLATFORM), marked,
+		   "which leaves it untouched just as well");
+	JENT_UT_EQ(jent_startup_passed(JENT_CLOCK_NOTIME), marked_notime,
+		   "on both clocks");
+
+	ec = jent_entropy_collector_alloc(0, JENT_DISABLE_INTERNAL_TIMER);
+	JENT_UT_TRUE(ec != NULL,
+		     "and an allocation afterwards still succeeds");
+	jent_entropy_collector_free(ec);
 }
 
 /*
@@ -760,12 +960,8 @@ static void test_still_usable_afterwards(void)
 		 * came back: an allocation here runs the whole self test again
 		 * - test_alloc_runs_failing_selftest() cleared the flag that
 		 * would have skipped it - and reports neither of the two paths
-		 * it tries in turn. This being the last case in the program,
-		 * the one-way global that asking for the internal timer sets
-		 * has nothing left to affect.
+		 * it tries in turn.
 		 */
-		printf("  note: internal timer already forced: %d\n",
-		       jent_notime_forced());
 		printf("  note: startup without the internal timer gives %d\n",
 		       jent_entropy_init_ex(0, JENT_DISABLE_INTERNAL_TIMER));
 		printf("  note: startup with the internal timer gives %d\n",
@@ -788,11 +984,18 @@ static void test_still_usable_afterwards(void)
  */
 static void test_secure_memory_failures(void)
 {
-#ifdef JENT_ARCH_MEM_POSIX_MLOCK
+/* libgcrypt and OpenSSL allocate from their own secure heap. */
+#if defined(LIBGCRYPT) || defined(OPENSSL)
+	jent_ut_group("the secure allocator when the kernel refuses");
+	JENT_UT_SKIP("the secure allocator", "the crypto library's secure heap");
+#elif defined(JENT_ARCH_MEM_POSIX_MLOCK)
+	int lockable = jent_ut_memlock_available();
 	void *p;
 
 	jent_ut_group("the secure allocator when the kernel refuses");
 
+# ifndef AWSLC
+	/* AWS-LC allocates the memory: no mapping and no guard pages here. */
 	fi_fail_mmap = 1;
 	p = jent_fi_real_zalloc(4096, JENT_FORCE_SECURE_MEM);
 	fi_fail_mmap = 0;
@@ -814,6 +1017,7 @@ static void test_secure_memory_failures(void)
 	p = jent_fi_real_zalloc(4096, JENT_FORCE_SECURE_MEM);
 	fi_fail_mprotect = 0;
 	JENT_UT_TRUE(p == NULL, "a refused trailing guard page is reported");
+# endif
 
 	/*
 	 * A refused lock is fatal only when the caller demanded secure memory.
@@ -845,17 +1049,32 @@ static void test_secure_memory_failures(void)
 	p = jent_fi_real_zalloc(4096, 0);
 	JENT_UT_TRUE(p == NULL, "but an unexpected errno is not");
 
+	/* The unlocked allocation does not ask for the lock at all. */
+	fi_mlock_calls = 0;
+	p = jent_fi_real_zalloc_unlocked(4096);
+	JENT_UT_TRUE(p != NULL && fi_mlock_calls == 0,
+		     "the unlocked allocation does not ask for the lock");
+	jent_zfree(p, 4096);
+
 	fi_fail_mlock = 0;
 	fi_mlock_errno = EPERM;
 
+	if (!lockable) {
+		JENT_UT_SKIP("the allocator afterwards",
+			     "this machine locks no memory (RLIMIT_MEMLOCK)");
+		return;
+	}
 	p = jent_fi_real_zalloc(4096, JENT_FORCE_SECURE_MEM);
 	JENT_UT_TRUE(p != NULL, "and the allocator works again afterwards");
 	jent_zfree(p, 4096);
 #elif defined(JENT_ARCH_MEM_WINDOWS)
+	int lockable = jent_ut_memlock_available();
 	void *p;
 
 	jent_ut_group("the secure allocator when the kernel refuses");
 
+# ifndef AWSLC
+	/* AWS-LC allocates the memory: no reservation to refuse here. */
 	fi_fail_mmap = 1;
 	p = jent_fi_real_zalloc(4096, JENT_FORCE_SECURE_MEM);
 	fi_fail_mmap = 0;
@@ -871,6 +1090,7 @@ static void test_secure_memory_failures(void)
 	p = jent_fi_real_zalloc(4096, JENT_FORCE_SECURE_MEM);
 	fi_fail_mprotect = 0;
 	JENT_UT_TRUE(p == NULL, "a refused payload protection is reported");
+# endif
 
 	/*
 	 * A refused lock is fatal only when the caller demanded secure memory.
@@ -886,14 +1106,64 @@ static void test_secure_memory_failures(void)
 	p = jent_fi_real_zalloc(4096, 0);
 	JENT_UT_TRUE(p != NULL, "and tolerated without that demand");
 	jent_zfree(p, 4096);
+
+	/* The unlocked allocation does not ask for the lock at all. */
+	fi_mlock_calls = 0;
+	p = jent_fi_real_zalloc_unlocked(4096);
+	JENT_UT_TRUE(p != NULL && fi_mlock_calls == 0,
+		     "the unlocked allocation does not ask for the lock");
+	jent_zfree(p, 4096);
 	fi_fail_mlock = 0;
 
+	if (!lockable) {
+		JENT_UT_SKIP("the allocator afterwards",
+			     "this machine locks no memory (RLIMIT_MEMLOCK)");
+		return;
+	}
 	p = jent_fi_real_zalloc(4096, JENT_FORCE_SECURE_MEM);
 	JENT_UT_TRUE(p != NULL, "and the allocator works again afterwards");
 	jent_zfree(p, 4096);
 #else
 	jent_ut_group("the secure allocator when the kernel refuses");
 	JENT_UT_SKIP("the secure allocator", "not a mapping backend");
+#endif
+}
+
+/*
+ * A lock quota below the memory access region but above the collector state,
+ * such as Android's 64 KiB RLIMIT_MEMLOCK. The region is never locked, so a
+ * compliance-mode collector is still allocated.
+ */
+static void test_lock_quota_below_region(void)
+{
+#if defined(JENT_ARCH_MEM_POSIX_MLOCK) || defined(JENT_ARCH_MEM_WINDOWS)
+	/* Pinned well above the quota, whatever the cache geometry derives. */
+	const unsigned int flags = JENT_FORCE_FIPS | JENT_MAX_MEMSIZE_1MB;
+	struct rand_data *ec;
+	char buf[32];
+
+	jent_ut_group("a lock quota below the memory access region");
+
+	if (!jent_ut_memlock_available()) {
+		JENT_UT_SKIP("the lock quota",
+			     "this machine locks no memory (RLIMIT_MEMLOCK)");
+		return;
+	}
+
+	fi_mlock_quota = 64 * 1024;
+	ec = jent_entropy_collector_alloc(0, flags);
+	JENT_UT_TRUE(ec != NULL, "a FIPS collector is allocated under it");
+	if (ec) {
+		JENT_UT_TRUE(ec->memmask + 1 > fi_mlock_quota,
+			     "with a region the quota would refuse");
+		JENT_UT_TRUE(jent_read_entropy_safe(&ec, buf, sizeof(buf)) ==
+			     (ssize_t)sizeof(buf), "and generates");
+		jent_entropy_collector_free(ec);
+	}
+	fi_mlock_quota = 0;
+#else
+	jent_ut_group("a lock quota below the memory access region");
+	JENT_UT_SKIP("the lock quota", "not a mapping backend");
 #endif
 }
 
@@ -954,6 +1224,100 @@ static void test_startup_rejects_bad_timers(void)
 		   "the real timer passes again");
 }
 
+#if defined(JENT_ARCH_CACHE_LINUX)
+/*
+ * A two-CPU sysfs cache tree for the walk to read, so that the CPU count it
+ * bounds itself with has something to be right or wrong about. cpu1 carries
+ * the larger caches, the way the performance cores of a hybrid part do.
+ */
+#include <dirent.h>
+#include <sys/stat.h>
+
+static char fi_cpu_tree[] = "/tmp/jent-fault-cpu-XXXXXX";
+
+static int fi_cpu_attr(const char *cache, unsigned int idx, const char *name,
+		       const char *value)
+{
+	char path[256];
+	FILE *f;
+
+	snprintf(path, sizeof(path), "%s/index%u", cache, idx);
+	if (mkdir(path, 0700) && errno != EEXIST)
+		return -1;
+
+	snprintf(path, sizeof(path), "%s/index%u/%s", cache, idx, name);
+	f = fopen(path, "w");
+	if (!f)
+		return -1;
+	fputs(value, f);
+	fclose(f);
+	return 0;
+}
+
+static void fi_rm_cpu_tree(void)
+{
+	unsigned int cpu, idx;
+	char path[256];
+	static const char *attrs[] = { "type", "level", "size" };
+	size_t a;
+
+	for (cpu = 0; cpu < 2; cpu++) {
+		for (idx = 0; idx < 2; idx++) {
+			for (a = 0; a < JENT_ARRAY_SIZE(attrs); a++) {
+				snprintf(path, sizeof(path),
+					 "%s/cpu%u/cache/index%u/%s",
+					 fi_cpu_tree, cpu, idx, attrs[a]);
+				unlink(path);
+			}
+			snprintf(path, sizeof(path),
+				 "%s/cpu%u/cache/index%u", fi_cpu_tree, cpu,
+				 idx);
+			rmdir(path);
+		}
+		snprintf(path, sizeof(path), "%s/cpu%u/cache", fi_cpu_tree, cpu);
+		rmdir(path);
+		snprintf(path, sizeof(path), "%s/cpu%u", fi_cpu_tree, cpu);
+		rmdir(path);
+	}
+	rmdir(fi_cpu_tree);
+}
+
+/* 0 when the tree stands, nonzero when it could not be built. */
+static int fi_build_cpu_tree(void)
+{
+	unsigned int cpu;
+
+	if (!mkdtemp(fi_cpu_tree))
+		return -1;
+
+	for (cpu = 0; cpu < 2; cpu++) {
+		char cache[192];
+
+		snprintf(cache, sizeof(cache), "%s/cpu%u", fi_cpu_tree, cpu);
+		if (mkdir(cache, 0700))
+			goto err;
+		snprintf(cache, sizeof(cache), "%s/cpu%u/cache", fi_cpu_tree,
+			 cpu);
+		if (mkdir(cache, 0700))
+			goto err;
+
+		if (fi_cpu_attr(cache, 0, "type", "Data\n") ||
+		    fi_cpu_attr(cache, 0, "level", "1\n") ||
+		    fi_cpu_attr(cache, 0, "size", cpu ? "64K\n" : "32K\n") ||
+		    fi_cpu_attr(cache, 1, "type", "Unified\n") ||
+		    fi_cpu_attr(cache, 1, "level", "2\n") ||
+		    fi_cpu_attr(cache, 1, "size", cpu ? "2M\n" : "512K\n"))
+			goto err;
+	}
+
+	return 0;
+
+err:
+	fi_rm_cpu_tree();
+	return -1;
+}
+#endif /* JENT_ARCH_CACHE_LINUX */
+
 /*
  * The platform queries when the platform will not answer. Each of these has a
  * fallback behind it, and the fallback is the whole point: a container that
@@ -965,12 +1329,24 @@ static void test_platform_query_failures(void)
 	jent_ut_group("the platform queries when they cannot answer");
 
 #ifdef FI_WINDOWS
-	/*
-	 * GetActiveProcessorCount() has no failure reply, so there is no
-	 * unanswerable count to produce here - only the real one to confirm.
-	 */
-	JENT_UT_SKIP("the unanswerable CPU count",
-		     "the Windows backend has no query that can decline");
+	/* The thread's affinity first, the processors of the machine second. */
+	fi_fail_affinity = 1;
+	JENT_UT_TRUE(jent_ncpu() > 0,
+		     "an unreadable thread affinity falls back to the system count");
+	JENT_UT_EQ(jent_cpu_highest(), jent_ncpu() - 1,
+		   "and the highest CPU to the count minus one");
+
+	fi_fail_processor_count = 1;
+	JENT_UT_TRUE(jent_ncpu() < 0,
+		     "an unanswerable CPU count is reported as an error");
+	JENT_UT_TRUE(jent_cpu_highest() < 0, "and so is the highest CPU");
+	fi_fail_processor_count = 0;
+	fi_fail_affinity = 0;
+
+	fi_empty_affinity = 1;
+	JENT_UT_TRUE(jent_ncpu() > 0,
+		     "an empty affinity mask falls back to the system count");
+	fi_empty_affinity = 0;
 #else
 	/* The CPU count. Whatever it says, it must be a count or an error. */
 	fi_fail_affinity = 1;
@@ -1035,21 +1411,55 @@ static void test_platform_query_failures(void)
 		JENT_UT_EQ(l3, 0, "an unanswerable L3 size is zero");
 
 		/*
-		 * And the CPU count the sysfs walk bounds itself with: neither
-		 * an unusable answer nor an implausible one may let it run
-		 * away.
+		 * And the CPU count the sysfs walk bounds itself with. Against
+		 * a tree that does not exist this said nothing at all: the
+		 * walk answers zero for a directory it cannot open whatever
+		 * the count was, so the clamp it names went untested. Against
+		 * a real tree of two CPUs, where only the second reports the
+		 * larger caches, the answer says how far the walk got.
 		 */
+		fi_sysconf_mode = FI_SYSCONF_REAL;
+		if (fi_build_cpu_tree()) {
+			JENT_UT_SKIP("the CPU count of the cache walk",
+				     "no temporary sysfs tree");
+		} else {
+			/*
+			 * Zero is not a usable count. It becomes one, and the
+			 * walk then goes on past it for as long as a cpuN
+			 * directory exists - which is what musl needs, its
+			 * _SC_NPROCESSORS_CONF being the affinity mask rather
+			 * than the topology.
+			 */
+			fi_sysconf_mode = FI_SYSCONF_ZERO;
+			l1 = l2 = -1;
+			jent_get_cachesize_sysfs_dir(fi_cpu_tree, &l1, &l2,
+						     &l3);
+			JENT_UT_EQ(l1, 65536,
+				   "a CPU count of zero still reaches the "
+				   "CPUs behind it");
+			JENT_UT_EQ(l2, 2097152, "at every level");
+
+			/*
+			 * And an implausible one is capped rather than walked:
+			 * a million snprintf/access pairs is not a bound.
+			 */
+			fi_sysconf_mode = FI_SYSCONF_HUGE;
+			l1 = l2 = -1;
+			jent_get_cachesize_sysfs_dir(fi_cpu_tree, &l1, &l2,
+						     &l3);
+			JENT_UT_EQ(l1, 65536,
+				   "an implausible CPU count is capped and the "
+				   "walk still answers");
+
+			fi_rm_cpu_tree();
+		}
+
+		/* A tree that is not there is still no L1, whatever the count. */
 		fi_sysconf_mode = FI_SYSCONF_ZERO;
 		l1 = -1;
 		jent_get_cachesize_sysfs_dir("/nonexistent/jent/cpu",
 					     &l1, &l2, &l3);
-		JENT_UT_EQ(l1, 0, "a CPU count of zero is handled");
-
-		fi_sysconf_mode = FI_SYSCONF_HUGE;
-		l1 = -1;
-		jent_get_cachesize_sysfs_dir("/nonexistent/jent/cpu",
-					     &l1, &l2, &l3);
-		JENT_UT_EQ(l1, 0, "an implausible CPU count is capped");
+		JENT_UT_EQ(l1, 0, "an absent tree reports no L1");
 
 		fi_sysconf_mode = FI_SYSCONF_REAL;
 	}
@@ -1110,6 +1520,29 @@ static void test_system_fips_mode(void)
 	jent_entropy_collector_free(ec);
 }
 
+/* How the Windows backend reads the FIPS policy query. */
+static void test_windows_fips_policy(void)
+{
+	jent_ut_group("the Windows FIPS policy query");
+
+#ifdef FI_HAVE_BCRYPT_FIPS
+	fi_bcrypt_fips_mode = FI_BCRYPT_FIPS_ON;
+	JENT_UT_EQ(jent_fi_real_fips_enabled(), 1,
+		   "a policy that is on is reported as FIPS mode");
+
+	fi_bcrypt_fips_mode = FI_BCRYPT_FIPS_FAIL;
+	JENT_UT_EQ(jent_fi_real_fips_enabled(), 0,
+		   "a failed query means disabled, whatever it wrote");
+
+	fi_bcrypt_fips_mode = FI_BCRYPT_FIPS_REAL;
+	JENT_UT_EQ(jent_fi_real_fips_enabled(), jent_fips_enabled(),
+		   "the real query comes back afterwards");
+#else
+	JENT_UT_SKIP("the Windows FIPS policy query",
+		     "not the Windows FIPS backend");
+#endif
+}
+
 /* The allocator's own bounds, which no ordinary request comes near. */
 static void test_allocator_bounds(void)
 {
@@ -1131,7 +1564,7 @@ static void test_allocator_bounds(void)
 	 * to zero. Only the mapping backends have one - the malloc fallback
 	 * rounds to nothing.
 	 */
-#ifdef JENT_ARCH_MEM_POSIX_MLOCK
+#if defined(JENT_ARCH_MEM_POSIX_MLOCK) && !defined(LIBGCRYPT) && !defined(OPENSSL)
 	fi_sysconf_mode = FI_SYSCONF_FAIL;
 	JENT_UT_TRUE(jent_pagesize() > 0,
 		     "an unreportable page size falls back to a usable one");
@@ -1172,7 +1605,8 @@ static void test_alloc_runs_failing_selftest(void)
 	 * there is: without it the initialization falls back to the counting
 	 * thread, which is a real timer and would rightly succeed.
 	 */
-	jent_selftest_run = 0;
+	jent_selftest_run[JENT_CLOCK_PLATFORM] = 0;
+	jent_selftest_run[JENT_CLOCK_NOTIME] = 0;
 	fi_time_set(FI_TIME_ZERO);
 	ec = jent_entropy_collector_alloc(0, JENT_DISABLE_INTERNAL_TIMER);
 	fi_time_set(FI_TIME_REAL);
@@ -1182,53 +1616,16 @@ static void test_alloc_runs_failing_selftest(void)
 	jent_entropy_collector_free(ec);
 
 	/* And that a collector can be had again once the timer works. */
-	jent_selftest_run = 0;
+	jent_selftest_run[JENT_CLOCK_PLATFORM] = 0;
+	jent_selftest_run[JENT_CLOCK_NOTIME] = 0;
 	ec = jent_entropy_collector_alloc(0, 0);
 	if (!ec) {
-		/*
-		 * Same reasoning as in test_still_usable_afterwards(), and the
-		 * same limitation: only the path that does not force the
-		 * internal timer is asked, because forcing it is a one-way
-		 * global and there is still a case to run after this one.
-		 */
-		printf("  note: internal timer already forced: %d\n",
-		       jent_notime_forced());
+		/* Same reasoning as in test_still_usable_afterwards(). */
 		printf("  note: startup without the internal timer gives %d\n",
 		       jent_entropy_init_ex(0, JENT_DISABLE_INTERNAL_TIMER));
 	}
 	JENT_UT_TRUE(ec != NULL, "and one can be had again afterwards");
 	jent_entropy_collector_free(ec);
-}
-
-/*
- * The startup self test once the internal timer has been forced. A collector
- * that disables it cannot be allocated then, and that refusal used to be
- * reported as EMEM - a machine out of memory rather than a process that has
- * settled on the other timer.
- *
- * Runs last and forces the timer itself: the flag is one-way, so anything
- * after this would see a library that can no longer produce a collector on the
- * platform clock.
- */
-static void test_forced_notime_reports_no_timer(void)
-{
-#ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
-	jent_ut_group("the startup self test once the internal timer is forced");
-
-	if (jent_entropy_init_ex(0, JENT_FORCE_INTERNAL_TIMER)) {
-		JENT_UT_SKIP("the forced internal timer",
-			     "it does not initialise on this machine");
-		return;
-	}
-
-	JENT_UT_TRUE(jent_notime_forced(),
-		     "asking for the internal timer records the choice");
-
-	JENT_UT_EQ(jent_time_entropy_init(JENT_MIN_OSR,
-					  JENT_DISABLE_INTERNAL_TIMER),
-		   ENOTIME,
-		   "a startup that disables it reports no timer, not no memory");
-#endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 }
 
 int main(void)
@@ -1257,20 +1654,21 @@ int main(void)
 	test_startup_rejects_bad_timers();
 
 	test_injection_works();
-	test_sha3_alloc_failure();
 	test_gcd_failures();
+	test_failed_init_unmarks_selftest();
 	test_collector_alloc_failures();
 	test_init_failures();
 	test_recovery_alloc_failure();
 	test_secure_memory_failures();
+	test_lock_quota_below_region();
 	test_platform_query_failures();
 	test_system_fips_mode();
+	test_windows_fips_policy();
 	test_allocator_bounds();
 	test_alloc_runs_failing_selftest();
 	test_still_usable_afterwards();
 
 	/* Last: it forces the internal timer, which cannot be undone. */
-	test_forced_notime_reports_no_timer();
 
 	return jent_ut_report("unit-fault");
 }

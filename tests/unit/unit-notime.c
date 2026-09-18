@@ -135,10 +135,12 @@ static JENT_UT_MAYBE_UNUSED int fi_mlock(const void *addr, size_t len)
 
 /*
  * Compile the real allocator under a private name, with its kernel calls
- * redirected. The header it includes declares jent_zalloc(), which is renamed
- * with it, so the declaration and the definition still agree.
+ * redirected. The header it includes declares jent_zalloc() and
+ * jent_zalloc_unlocked(), which are renamed with them, so the declarations and
+ * the definitions still agree.
  */
 #define jent_zalloc jent_fi_real_zalloc
+#define jent_zalloc_unlocked jent_fi_real_zalloc_unlocked
 #ifdef FI_WINDOWS
 # define VirtualAlloc fi_VirtualAlloc
 # define VirtualProtect fi_VirtualProtect
@@ -165,25 +167,40 @@ static JENT_UT_MAYBE_UNUSED int fi_mlock(const void *addr, size_t len)
 # undef mprotect
 # undef mmap
 #endif
+#undef jent_zalloc_unlocked
 #undef jent_zalloc
 
 /*
  * Fail the n-th allocation from now on, counting from 1. Zero disables the
  * injection. Only one allocation is failed per arming, so that the collector
  * is built up to a chosen point and only then denied its next allocation -
- * which is what walks the cleanup paths one stage at a time.
+ * which is what walks the cleanup paths one stage at a time. Both allocators
+ * count, the memory access region being one of the stages.
  */
 static unsigned int fi_fail_alloc;
 static unsigned int fi_alloc_count;
 
-void *jent_zalloc(size_t len, unsigned int flags)
+static int fi_deny_alloc(void)
 {
 	fi_alloc_count++;
 
-	if (fi_fail_alloc && fi_alloc_count == fi_fail_alloc)
+	return fi_fail_alloc && fi_alloc_count == fi_fail_alloc;
+}
+
+void *jent_zalloc(size_t len, unsigned int flags)
+{
+	if (fi_deny_alloc())
 		return NULL;
 
 	return jent_fi_real_zalloc(len, flags);
+}
+
+void *jent_zalloc_unlocked(size_t len)
+{
+	if (fi_deny_alloc())
+		return NULL;
+
+	return jent_fi_real_zalloc_unlocked(len);
 }
 
 /*
@@ -521,26 +538,64 @@ int jent_notime_thread_create(struct jent_notime_ctx *ctx,
 static unsigned int fi_custom_init_calls;
 static unsigned int fi_custom_fini_calls;
 
+/*
+ * A context of the handler's own, smaller than the built-in one: the library
+ * must not read it as the built-in layout (ASan catches it if it does).
+ */
+struct fi_custom_ctx {
+	void *builtin;
+};
+
+static unsigned int fi_custom_starts, fi_custom_stops;
+
 static int fi_custom_init(void **ctx)
 {
+	struct fi_custom_ctx *c = malloc(sizeof(*c));
+
 	fi_custom_init_calls++;
-	return jent_notime_thread_builtin.jent_notime_init(ctx);
+	if (!c)
+		return -1;
+	if (jent_notime_thread_builtin.jent_notime_init(&c->builtin)) {
+		free(c);
+		return -1;
+	}
+	*ctx = c;
+	return 0;
 }
+
+static unsigned int fi_custom_fini_null_calls;
 
 static void fi_custom_fini(void *ctx)
 {
+	struct fi_custom_ctx *c = ctx;
+
 	fi_custom_fini_calls++;
-	jent_notime_thread_builtin.jent_notime_fini(ctx);
+	/* A handler is only ever handed back the context its init stored. */
+	if (!c) {
+		fi_custom_fini_null_calls++;
+		return;
+	}
+	jent_notime_thread_builtin.jent_notime_fini(c->builtin);
+	free(c);
 }
 
 static int fi_custom_start(void *ctx, jent_notime_start_routine r, void *arg)
 {
-	return jent_notime_thread_builtin.jent_notime_start(ctx, r, arg);
+	struct fi_custom_ctx *c = ctx;
+	int ret = jent_notime_thread_builtin.jent_notime_start(c->builtin, r,
+								arg);
+
+	if (!ret)
+		fi_custom_starts++;
+	return ret;
 }
 
 static void fi_custom_stop(void *ctx)
 {
-	jent_notime_thread_builtin.jent_notime_stop(ctx);
+	struct fi_custom_ctx *c = ctx;
+
+	fi_custom_stops++;
+	jent_notime_thread_builtin.jent_notime_stop(c->builtin);
 }
 
 static struct jent_notime_thread fi_custom_thread = {
@@ -587,6 +642,17 @@ static void test_notime_impl_switch(void)
 	JENT_UT_EQ(jent_entropy_set_notime_cpu(1), 0,
 		   "the counting thread CPU can be configured beforehand");
 
+	/*
+	 * First a collector that never enables the internal timer - before
+	 * the one below forces it for the process. Its release, and that of
+	 * the startup's own collectors, has no context to tear down.
+	 */
+	ec = jent_entropy_collector_alloc(0, JENT_DISABLE_INTERNAL_TIMER);
+	jent_entropy_collector_free(ec);
+	JENT_UT_EQ(fi_custom_fini_calls, 0,
+		   "a collector without the internal timer is not torn down "
+		   "through the handler");
+
 	ec = jent_entropy_collector_alloc(0, JENT_FORCE_INTERNAL_TIMER);
 	if (ec) {
 		JENT_UT_NE(fi_custom_init_calls, 0,
@@ -597,6 +663,8 @@ static void test_notime_impl_switch(void)
 		jent_entropy_collector_free(ec);
 		JENT_UT_NE(fi_custom_fini_calls, 0,
 			   "and is torn down with the collector");
+		JENT_UT_EQ(fi_custom_stops, fi_custom_starts,
+			   "stopping each thread it started exactly once");
 	} else {
 		JENT_UT_SKIP("the registered implementation",
 			     "the internal timer does not start here");
@@ -607,6 +675,9 @@ static void test_notime_impl_switch(void)
 	 * initialized the library, which is the point at which a caller must
 	 * not be able to pull its timer out from under it.
 	 */
+	JENT_UT_EQ(fi_custom_fini_null_calls, 0,
+		   "the handler's fini is never called without a context");
+
 	JENT_UT_EQ(jent_entropy_switch_notime_impl(&jent_notime_thread_builtin),
 		   -EAGAIN, "switching afterwards is denied");
 	JENT_UT_EQ(jent_entropy_set_notime_cpu(0), -EAGAIN,

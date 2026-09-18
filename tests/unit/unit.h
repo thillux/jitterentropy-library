@@ -132,13 +132,11 @@ static inline void jent_ut_group(const char *name)
  * that never asks for locked memory has no reason to claim any.
  *
  * The compliance modes - JENT_NTG1 and JENT_FORCE_FIPS - imply
- * JENT_FORCE_SECURE_MEM, so the collector's memory has to be locked into RAM
- * or the allocation fails, and the operating system's default bound is below
- * what a collector maps: RLIMIT_MEMLOCK on POSIX, on Windows the process
- * minimum working set, which starts at 200 kB and makes VirtualLock() refuse
- * even the 256 kB block of a default collector. Every compliance-mode
- * allocation then returns NULL and every check needing one is skipped - which
- * on Windows was most of unit-error and both hard failures of unit-mock.
+ * JENT_FORCE_SECURE_MEM, so the collector's state has to be locked into RAM
+ * or the allocation fails. That is one page per collector, but a suite that
+ * allocates collectors in numbers can exceed a tight RLIMIT_MEMLOCK or the
+ * Windows minimum working set, and the libgcrypt and OpenSSL builds need a
+ * secure arena only the process owner can create.
  *
  * Raising those bounds is process-wide state and not the library's to touch
  * (see arch/jitterentropy-arch-memory.h) but the process owner's, here the
@@ -153,6 +151,26 @@ static inline void jent_ut_setup(void)
 {
 	jent_raise_memlock_limit(JENT_FORCE_SECURE_MEM);
 	jent_init_secure_memory(JENT_FORCE_SECURE_MEM);
+}
+
+/*
+ * Whether this machine lets the process lock the few pages a compliance-mode
+ * collector needs (RLIMIT_MEMLOCK 0 does not; below 16 KiB the checks fail).
+ * Asked of the platform, not of the allocator under test: a broken secure
+ * allocator must fail its checks, not skip them. Solaris and Cygwin have no
+ * RLIMIT_MEMLOCK.
+ */
+static inline int jent_ut_memlock_available(void)
+{
+#ifdef RLIMIT_MEMLOCK
+	struct rlimit rl;
+
+	if (getrlimit(RLIMIT_MEMLOCK, &rl))
+		return 1;
+	return rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur >= 16384;
+#else
+	return 1;
+#endif
 }
 
 static inline int jent_ut_report(const char *suite)

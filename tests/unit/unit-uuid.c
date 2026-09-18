@@ -61,19 +61,22 @@
 #include "jitterentropy-arch-thread.c"
 #include "jitterentropy-arch-timer.c"
 #include "jitterentropy-arch-random.c"
+#include "jitterentropy-sha3.c"
 #include "jitterentropy-uuid.c"
 
-/* What jent_uuid_generate() formats when it has no bytes to format. */
+/* What jent_uuid_generate() must never produce - see below. */
 #define JENT_UT_NIL_UUID "00000000-0000-0000-0000-000000000000"
 
 /*
  * The UUID naming a collector instance in the status output. Checked against
- * the canonical 8-4-4-4-12 form and RFC 4122's version and variant nibbles,
+ * the canonical 8-4-4-4-12 form and RFC 9562's version and variant nibbles,
  * and for being different every time - it identifies an instance.
  */
 static void test_uuid(void)
 {
 	char a[JENT_UUID_STRLEN], b[JENT_UUID_STRLEN];
+	/* Without a CSPRNG a version 8 UUID hashed from a counter. */
+	char version = jent_os_random_supported() ? '4' : '8';
 	size_t i;
 
 	jent_ut_group("jent_uuid_generate");
@@ -101,22 +104,10 @@ static void test_uuid(void)
 	}
 	jent_ut_checks++;
 
-	/*
-	 * What the rest may assert depends on what the platform can answer.
-	 * Without a CSPRNG jent_uuid_generate() has no bytes to format and
-	 * says so with the nil UUID, which carries neither version nor variant
-	 * nibble and repeats.
-	 */
-	if (!jent_os_random_supported()) {
-		JENT_UT_TRUE(!strcmp(a, JENT_UT_NIL_UUID),
-			     "the nil UUID is generated where none exists");
-		return;
-	}
-
 	JENT_UT_TRUE(strcmp(a, JENT_UT_NIL_UUID),
-		     "a UUID is generated where a CSPRNG exists");
+		     "a generated UUID is never the nil UUID");
 
-	JENT_UT_EQ(a[14], '4', "the version nibble says version 4");
+	JENT_UT_EQ(a[14], version, "the version nibble says version 4 or 8");
 	jent_ut_checks++;
 	if (a[19] != '8' && a[19] != '9' && a[19] != 'a' && a[19] != 'b')
 		JENT_UT_FAIL("the variant nibble is '%c'", a[19]);
@@ -124,6 +115,24 @@ static void test_uuid(void)
 	jent_ut_checks++;
 	if (!strcmp(a, b))
 		JENT_UT_FAIL("%s", "two UUIDs in a row are identical");
+}
+
+/* The counter-derived UUID, which a platform with a CSPRNG never reaches. */
+static void test_uuid_counter(void)
+{
+	uint8_t a[16], b[16];
+	char out[JENT_UUID_STRLEN];
+
+	jent_ut_group("the counter-derived UUID");
+
+	jent_uuid_from_counter(a);
+	jent_uuid_from_counter(b);
+	JENT_UT_TRUE(memcmp(a, b, sizeof(a)) != 0,
+		     "two in a row differ");
+
+	a[8] = (uint8_t)((a[8] & 0x3f) | 0x80);
+	jent_uuid_format(a, out);
+	JENT_UT_EQ(out[14], '8', "the version nibble says version 8");
 }
 
 #if defined(JENT_RANDOM_GETRANDOM) || defined(JENT_RANDOM_DEVURANDOM)
@@ -240,6 +249,7 @@ static void test_uuid_read_paths(void)
 int main(void)
 {
 	test_uuid();
+	test_uuid_counter();
 	test_uuid_helpers();
 	test_uuid_read_paths();
 

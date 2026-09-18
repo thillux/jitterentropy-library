@@ -45,6 +45,10 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifndef _MSC_VER
+# include <dirent.h>
+# include <unistd.h>
+#endif
 
 /*
  * The root of the sysfs cache walk, a variable here so that
@@ -57,6 +61,28 @@
 #ifdef __linux__
 static const char *jent_test_sysfs_root = "/sys/devices/system/cpu";
 # define JENT_SYSFS_CPU_DIR jent_test_sysfs_root
+#endif
+
+/* And /proc/cpuinfo, the last resort behind sysconf on Arm, for the same. */
+#if defined(__linux__) && (defined(__aarch64__) || defined(__arm__))
+static const char *jent_test_cpuinfo = "/proc/cpuinfo";
+# define JENT_PROC_CPUINFO jent_test_cpuinfo
+/* The backend undefines the macro after use; this one is the tests' own. */
+# define JENT_UT_CPUINFO
+#endif
+
+/*
+ * And CPUID, the last resort behind sysconf on x86, which is replaced rather
+ * than pointed elsewhere: a null pointer asks the real instruction.
+ */
+#if defined(__linux__) && (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+static int (*jent_test_cpuid)(unsigned int leaf, unsigned int subleaf,
+			      unsigned int *eax, unsigned int *ebx,
+			      unsigned int *ecx, unsigned int *edx);
+# define JENT_CACHE_CPUID_COUNT \
+	(jent_test_cpuid ? jent_test_cpuid : jent_cpuid_count_user)
+# define JENT_UT_CPUID
 #endif
 
 /*
@@ -276,6 +302,19 @@ static void test_cache_helpers(void)
 		     "an unreadable sysfs attribute is reported as an error");
 }
 
+#ifdef JENT_UT_CPUID
+/* A CPU without the cache leaves, as a hypervisor hiding them presents. */
+static int cpuid_none(unsigned int leaf, unsigned int subleaf,
+		      unsigned int *eax, unsigned int *ebx,
+		      unsigned int *ecx, unsigned int *edx)
+{
+	(void)leaf;
+	(void)subleaf;
+	*eax = *ebx = *ecx = *edx = 0;
+	return 0;
+}
+#endif
+
 /*
  * Where sysfs answers, the walk finds an L1 and the function returns before
  * the fallback; taking sysfs away is the only way to reach it.
@@ -290,9 +329,22 @@ static void test_cache_sysconf_fallback(void)
 
 	jent_get_cachesize_sysconf(&s1, &s2, &s3);
 
+	/* On Arm the core types would answer next; they are not asked here. */
 	jent_test_sysfs_root = "/nonexistent/jent/sys/devices/system/cpu";
+#ifdef JENT_UT_CPUINFO
+	jent_test_cpuinfo = "/nonexistent/jent/proc/cpuinfo";
+#endif
+#ifdef JENT_UT_CPUID
+	jent_test_cpuid = cpuid_none;
+#endif
 	jent_get_cachesize_uncached(&l1, &l2, &l3);
 	jent_test_sysfs_root = saved;
+#ifdef JENT_UT_CPUINFO
+	jent_test_cpuinfo = "/proc/cpuinfo";
+#endif
+#ifdef JENT_UT_CPUID
+	jent_test_cpuid = NULL;
+#endif
 
 	/* Zeros included: musl has no _SC_LEVEL* and none may be invented. */
 	JENT_UT_EQ(l1, s1, "the L1 size falls back to sysconf");
@@ -365,6 +417,42 @@ static int sysfs_index(const char *dir, unsigned int idx, const char *type,
 	return 0;
 }
 
+/*
+ * The trees above live under /tmp and were left there: one directory per run,
+ * a few hundred files each, on every machine and every CI job that runs the
+ * suite. Removed depth first; the trees hold nothing but directories and
+ * regular files, and nothing follows a symlink because none is created.
+ */
+static void sysfs_rmtree(const char *path)
+{
+	DIR *d = opendir(path);
+	struct dirent *e;
+
+	if (!d) {
+		unlink(path);
+		return;
+	}
+
+	while ((e = readdir(d))) {
+		char sub[512];
+		struct stat st;
+
+		if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+			continue;
+
+		snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
+		if (lstat(sub, &st))
+			continue;
+		if (S_ISDIR(st.st_mode))
+			sysfs_rmtree(sub);
+		else
+			unlink(sub);
+	}
+
+	closedir(d);
+	rmdir(path);
+}
+
 static void test_sysfs_cache_walk(void)
 {
 	char dir[128];
@@ -392,12 +480,19 @@ static void test_sysfs_cache_walk(void)
 	 * index0 an instruction cache (skipped), index1 the L1 data cache,
 	 * index2 a unified L2, index3 an L3 whose size does not parse, index4
 	 * an L1 larger than index1 so the larger must win, index5 a level that
-	 * does not parse. index6 is absent, which ends the scan.
-	 */
-	/*
+	 * does not parse.
+	 *
 	 * index6 has a type but no level attribute and index7 no size, both of
-	 * which the walk has to skip rather than read past; index8 has an
-	 * empty type attribute, which reads as no attribute at all.
+	 * which the walk has to skip rather than read past.
+	 *
+	 * index8 is the L3 that does parse, and index9 a level 4 cache - the
+	 * eDRAM victim cache of a Crystal Well or Broadwell part, which sysfs
+	 * lists at level 4 beside the L3. It is far larger than the L3, so a
+	 * walk that dropped it into the L3 slot would be plain to see here:
+	 * doing that is what once sized JENT_CACHE_ALL at 256 MiB.
+	 *
+	 * index10 has an empty type attribute, which reads as no attribute at
+	 * all and ends the scan.
 	 */
 	if (sysfs_index(dir, 0, "Instruction\n", "1\n", "32K\n") ||
 	    sysfs_index(dir, 1, "Data\n", "1\n", "16K\n") ||
@@ -407,7 +502,9 @@ static void test_sysfs_cache_walk(void)
 	    sysfs_index(dir, 5, "Data\n", "no-level\n", "8K\n") ||
 	    sysfs_index(dir, 6, "Data\n", NULL, "8K\n") ||
 	    sysfs_index(dir, 7, "Data\n", "1\n", NULL) ||
-	    sysfs_index(dir, 8, "", "1\n", "8K\n")) {
+	    sysfs_index(dir, 8, "Unified\n", "3\n", "8M\n") ||
+	    sysfs_index(dir, 9, "Unified\n", "4\n", "128M\n") ||
+	    sysfs_index(dir, 10, "", "1\n", "8K\n")) {
 		JENT_UT_SKIP("the sysfs cache walk", "the tree is not writable");
 		return;
 	}
@@ -416,7 +513,9 @@ static void test_sysfs_cache_walk(void)
 
 	JENT_UT_EQ(l1, 49152, "the largest L1 data cache is taken");
 	JENT_UT_EQ(l2, 1048576, "the unified L2 is taken");
-	JENT_UT_EQ(l3, 0, "an L3 whose size does not parse is skipped");
+	JENT_UT_EQ(l3, 8388608,
+		   "the unified L3 is taken, and neither the L3 whose size "
+		   "does not parse nor the 128M level 4 beside it");
 
 	/* A tree that does not exist leaves every level at zero. */
 	l1 = l2 = l3 = -1;
@@ -441,8 +540,15 @@ static void test_sysfs_cache_walk(void)
 		snprintf(full, sizeof(full), "%s/many/cpu0/cache", sysfs_root);
 		mkdir(full, 0700);
 
+		/*
+		 * The indices past the sixteenth carry a different size, so
+		 * the answer says where the walk stopped. They all used to
+		 * read 4K, which is what a walk reading all twenty would have
+		 * reported just the same.
+		 */
 		for (idx = 0; idx < 20; idx++) {
-			if (sysfs_index(full, idx, "Data\n", "1\n", "4K\n")) {
+			if (sysfs_index(full, idx, "Data\n", "1\n",
+					idx < 16 ? "4K\n" : "64K\n")) {
 				ok = 0;
 				break;
 			}
@@ -455,7 +561,59 @@ static void test_sysfs_cache_walk(void)
 			l1 = -1;
 			jent_get_cachesize_sysfs_dir(root, &l1, &l2, &l3);
 			JENT_UT_EQ(l1, 4096,
-				   "a tree with more indices than are scanned is handled");
+				   "the walk stops after sixteen cache indices");
+		}
+	}
+
+	/*
+	 * More than one CPU. Every tree above has a cpu0 and nothing else, so
+	 * neither the enumeration of the other CPUs nor the largest-wins rule
+	 * across them was reached: on a hybrid part (P-cores and E-cores,
+	 * big.LITTLE) the per-core data caches differ, and the collector runs
+	 * on whichever core it is scheduled to.
+	 */
+	{
+		char many[160];
+		unsigned int cpu;
+		int ok = 1;
+
+		snprintf(many, sizeof(many), "%s/cpus", sysfs_root);
+		mkdir(many, 0700);
+
+		for (cpu = 0; cpu < 4 && ok; cpu++) {
+			char cache[192];
+
+			snprintf(cache, sizeof(cache), "%s/cpus/cpu%u",
+				 sysfs_root, cpu);
+			mkdir(cache, 0700);
+			snprintf(cache, sizeof(cache), "%s/cpus/cpu%u/cache",
+				 sysfs_root, cpu);
+			if (mkdir(cache, 0700)) {
+				ok = 0;
+				break;
+			}
+
+			/* cpu2 is the big core: the largest L1 and the L3. */
+			if (sysfs_index(cache, 0, "Data\n", "1\n",
+					cpu == 2 ? "64K\n" : "32K\n") ||
+			    sysfs_index(cache, 1, "Unified\n", "2\n",
+					cpu == 2 ? "2M\n" : "512K\n") ||
+			    (cpu == 2 &&
+			     sysfs_index(cache, 2, "Unified\n", "3\n", "16M\n")))
+				ok = 0;
+		}
+
+		if (ok) {
+			l1 = l2 = l3 = -1;
+			jent_get_cachesize_sysfs_dir(many, &l1, &l2, &l3);
+			JENT_UT_EQ(l1, 65536,
+				   "the largest L1 across the CPUs is taken");
+			JENT_UT_EQ(l2, 2097152, "and the largest L2");
+			JENT_UT_EQ(l3, 16777216,
+				   "and an L3 only one of them reports");
+		} else {
+			JENT_UT_SKIP("the multi-CPU cache walk",
+				     "the tree is not writable");
 		}
 	}
 
@@ -469,11 +627,386 @@ static void test_sysfs_cache_walk(void)
 		jent_get_cachesize_sysfs_dir(empty, &l1, &l2, &l3);
 		JENT_UT_EQ(l1, 0, "a tree with no cache directory reports no L1");
 	}
+
+	sysfs_rmtree(sysfs_root);
 }
 #else
 static void test_sysfs_cache_walk(void)
 {
 	JENT_UT_SKIP("the sysfs cache walk", "not the sysfs cache backend");
+}
+#endif
+
+/*
+ * CPUID, the last resort of the Linux backend on x86 - the only one that
+ * answers on musl in a container without /sys. A made-up geometry is served in
+ * place of the instruction, under the Intel leaf or the AMD one.
+ */
+#if defined(JENT_ARCH_CACHE_LINUX_CPUID) && defined(JENT_UT_CPUID)
+
+/* 32 KB L1 data: 8 ways * 1 partition * 64 byte lines * 64 sets. */
+#define CPUID_L1	32768
+/* 1 MB unified L2: 16 * 1 * 64 * 1024. */
+#define CPUID_L2	1048576
+/* 8 MB unified L3: 16 * 1 * 64 * 8192. */
+#define CPUID_L3	8388608
+
+static unsigned int cpuid_fake_leaf;
+
+static int cpuid_fake(unsigned int leaf, unsigned int subleaf,
+		      unsigned int *eax, unsigned int *ebx,
+		      unsigned int *ecx, unsigned int *edx)
+{
+	*eax = *ebx = *ecx = *edx = 0;
+	if (leaf != cpuid_fake_leaf)
+		return 1;	/* the leaf exists but reports no cache */
+
+	switch (subleaf) {
+	case 0:		/* L1 data */
+		*eax = 1 | (1 << 5);
+		*ebx = (7U << 22) | 63;
+		*ecx = 63;
+		break;
+	case 1:		/* L1 instruction, to be skipped */
+		*eax = 2 | (1 << 5);
+		*ebx = (7U << 22) | 63;
+		*ecx = 1023;
+		break;
+	case 2:		/* L2 unified */
+		*eax = 3 | (2 << 5);
+		*ebx = (15U << 22) | 63;
+		*ecx = 1023;
+		break;
+	case 3:		/* L3 unified */
+		*eax = 3 | (3 << 5);
+		*ebx = (15U << 22) | 63;
+		*ecx = 8191;
+		break;
+	default:	/* type 0: no further caches */
+		break;
+	}
+	return 1;
+}
+
+static void test_cache_cpuid_fallback(void)
+{
+	long l1 = -1, l2 = -1, l3 = -1;
+	long s1 = -1, s2 = -1, s3 = -1;
+	const char *saved = jent_test_sysfs_root;
+
+	jent_ut_group("the cache CPUID fallback");
+
+	jent_test_cpuid = cpuid_fake;
+
+	/* Both leaves: Intel's 4, and AMD's 0x8000001D behind an empty 4. */
+	cpuid_fake_leaf = 4;
+	jent_get_cachesize_cpuid(&l1, &l2, &l3);
+	JENT_UT_EQ(l1, CPUID_L1, "leaf 4 gives the L1 data cache");
+	JENT_UT_EQ(l2, CPUID_L2, "leaf 4 gives the L2");
+	JENT_UT_EQ(l3, CPUID_L3, "leaf 4 gives the L3");
+
+	cpuid_fake_leaf = 0x8000001DU;
+	l1 = l2 = l3 = -1;
+	jent_get_cachesize_cpuid(&l1, &l2, &l3);
+	JENT_UT_EQ(l1, CPUID_L1, "leaf 0x8000001D gives the L1 data cache");
+	JENT_UT_EQ(l3, CPUID_L3, "leaf 0x8000001D gives the L3");
+
+	/*
+	 * Without sysfs, whatever sysconf reports stands - glibc does - and
+	 * only the levels it leaves at zero - all of them on musl - are
+	 * CPUID's.
+	 */
+	cpuid_fake_leaf = 4;
+	jent_get_cachesize_sysconf(&s1, &s2, &s3);
+	jent_test_sysfs_root = "/nonexistent/jent/sys/devices/system/cpu";
+	l1 = l2 = l3 = -1;
+	jent_get_cachesize_uncached(&l1, &l2, &l3);
+	jent_test_sysfs_root = saved;
+	JENT_UT_EQ(l1, s1 > 0 ? s1 : CPUID_L1,
+		   "without sysfs an L1 sysconf lacks comes from CPUID");
+	JENT_UT_EQ(l2, s2 > 0 ? s2 : CPUID_L2,
+		   "without sysfs an L2 sysconf lacks comes from CPUID");
+	JENT_UT_EQ(l3, s3 > 0 ? s3 : CPUID_L3,
+		   "without sysfs an L3 sysconf lacks comes from CPUID");
+
+	/*
+	 * A sysfs that states the L1 only: sysconf is not asked, the L1 is
+	 * kept, and the L2 and L3 are CPUID's.
+	 */
+	{
+		static char root[] = "/tmp/jent-sysfs-cpuid-XXXXXX";
+		char dir[160];
+
+		if (mkdtemp(root)) {
+			snprintf(dir, sizeof(dir), "%s/cpu0", root);
+			mkdir(dir, 0700);
+			snprintf(dir, sizeof(dir), "%s/cpu0/cache", root);
+			if (!mkdir(dir, 0700) &&
+			    !sysfs_index(dir, 0, "Data\n", "1\n", "16K\n")) {
+				jent_test_sysfs_root = root;
+				l1 = l2 = l3 = -1;
+				jent_get_cachesize_uncached(&l1, &l2, &l3);
+				jent_test_sysfs_root = saved;
+
+				JENT_UT_EQ(l1, 16384,
+					   "an L1 sysfs reports is kept over CPUID");
+				JENT_UT_EQ(l2, CPUID_L2,
+					   "the L2 it does not report comes from CPUID");
+				JENT_UT_EQ(l3, CPUID_L3,
+					   "the L3 it does not report comes from CPUID");
+			}
+			sysfs_rmtree(root);
+		}
+	}
+
+	/* No cache leaf at all leaves the unknown levels unknown. */
+	jent_test_cpuid = cpuid_none;
+	l1 = l2 = l3 = -1;
+	jent_get_cachesize_cpuid(&l1, &l2, &l3);
+	JENT_UT_TRUE(l1 == 0 && l2 == 0 && l3 == 0,
+		     "a CPU without the cache leaves reports nothing");
+
+	/* And the real instruction. */
+	jent_test_cpuid = NULL;
+	l1 = l2 = l3 = -1;
+	jent_get_cachesize_cpuid(&l1, &l2, &l3);
+	JENT_UT_TRUE(l1 >= 0 && l2 >= 0 && l3 >= 0,
+		     "the real CPUID answers with sizes, or none");
+	printf("  note: CPUID gives L1 %ld, L2 %ld, L3 %ld\n", l1, l2, l3);
+}
+#else
+static void test_cache_cpuid_fallback(void)
+{
+	JENT_UT_SKIP("the cache CPUID fallback",
+		     "not the Linux backend on x86");
+}
+#endif
+
+/*
+ * The core types of /proc/cpuinfo, the last resort on Arm. The file is fed in
+ * rather than read: a machine presents one core pairing, and one whose sysfs
+ * answers never reaches this at all.
+ */
+#if defined(JENT_ARCH_CACHE_LINUX) && defined(JENT_UT_CPUINFO)
+
+/*
+ * The largest caches the TRMs allow: a Cortex-A57 has a fixed 32 KB L1 data
+ * cache, a Cortex-A53 and A55 one of up to 64 KB, and the A57 and A53 up to
+ * 2 MB of L2 - the A55 only 256 KB, but a DSU with up to 4 MB of L3 behind
+ * it, where the other two have no L3. A Cortex-X925 sits in a DSU-120.
+ */
+#define A57_L1	32768
+#define A57_L2	2097152
+#define A53_L1	65536
+#define A53_L2	2097152
+#define A55_L1	65536
+#define A55_L2	262144
+#define A55_L3	4194304
+#define X925_L3	33554432
+
+/* Feeds @text line by line, as jent_get_cachesize_cpuinfo_file() does. */
+static void cpuinfo_lines(const char *text, long *l1, long *l2, long *l3)
+{
+	char line[256];
+	long implementer = -1;
+
+	*l1 = 0;
+	*l2 = 0;
+	*l3 = 0;
+	while (*text) {
+		size_t n = strcspn(text, "\n");
+
+		snprintf(line, sizeof(line), "%.*s", (int)n, text);
+		jent_cpuinfo_arm_line(line, &implementer, l1, l2, l3);
+		text += n;
+		if (*text)
+			text++;
+	}
+}
+
+/* A Nexus 5X (MSM8992): four Cortex-A53, two Cortex-A57. */
+static const char cpuinfo_msm8992[] =
+	"processor\t: 0\n"
+	"BogoMIPS\t: 38.40\n"
+	"Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid\n"
+	"CPU implementer\t: 0x41\n"
+	"CPU architecture: 8\n"
+	"CPU variant\t: 0x0\n"
+	"CPU part\t: 0xd03\n"
+	"CPU revision\t: 4\n"
+	"\n"
+	"processor\t: 4\n"
+	"BogoMIPS\t: 38.40\n"
+	"Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid\n"
+	"CPU implementer\t: 0x41\n"
+	"CPU architecture: 8\n"
+	"CPU variant\t: 0x1\n"
+	"CPU part\t: 0xd07\n"
+	"CPU revision\t: 3\n"
+	"\n"
+	"Hardware\t: Qualcomm Technologies, Inc MSM8992\n";
+
+static void test_cache_cpuinfo(void)
+{
+	static char path[] = "/tmp/jent-cpuinfo-XXXXXX";
+	long l1, l2, l3;
+	int fd;
+
+	jent_ut_group("the Arm core types of /proc/cpuinfo");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd07\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l1, A57_L1, "a Cortex-A57 has the L1 its TRM fixes");
+	JENT_UT_EQ(l2, A57_L2, "and the largest L2 it allows");
+	JENT_UT_EQ(l3, 0, "and no L3: its cluster cache is the L2");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd05\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l2, A55_L2, "a Cortex-A55 has the largest L2 its TRM allows");
+	JENT_UT_EQ(l3, A55_L3, "and the largest L3 its DSU does");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd85\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l3, X925_L3, "a Cortex-X925 the largest L3 of a DSU-120");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd4f\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l3, 0, "a Neoverse V2, connected directly, has no L3");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xd03\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l1, A53_L1, "a Cortex-A53 has the largest L1 its TRM allows");
+	JENT_UT_EQ(l2, A53_L2, "and the largest L2, which is optional");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xfff\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l1, 0, "a core type not listed has none");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t: 0xc0f\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l1, 32768, "an ARMv7 Cortex-A15 is listed as well");
+	JENT_UT_EQ(l2, 4194304, "with its largest L2");
+
+	cpuinfo_lines(cpuinfo_msm8992, &l1, &l2, &l3);
+	JENT_UT_EQ(l1, A53_L1, "the larger L1 of a big.LITTLE pair is taken");
+	JENT_UT_EQ(l2, A57_L2, "and the larger L2");
+
+	/* Per level: the L1 from one core type, the L2 from the other. */
+	cpuinfo_lines("processor\t: 0\nCPU implementer\t: 0x41\nCPU part\t: 0xd05\n"
+		      "processor\t: 4\nCPU implementer\t: 0x41\nCPU part\t: 0xd07\n",
+		      &l1, &l2, &l3);
+	JENT_UT_EQ(l1, A55_L1, "the largest L1 is kept across core types");
+	JENT_UT_EQ(l2, A57_L2, "and so is the largest L2");
+	JENT_UT_EQ(l3, A55_L3, "and the largest L3");
+
+	cpuinfo_lines("CPU implementer\t: 0x51\nCPU part\t: 0xd07\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l1, 0, "a part number counts only with its implementer");
+
+	cpuinfo_lines("CPU part\t: 0xd07\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l1, 0, "a part without an implementer counts for nothing");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nprocessor\t: 1\nCPU part\t: 0xd07\n",
+		      &l1, &l2, &l3);
+	JENT_UT_EQ(l1, 0, "an implementer does not carry over to the next CPU");
+
+	cpuinfo_lines("CPU implementer\t: arm\nCPU part\t: 0xd07\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l1, 0, "an implementer that does not parse counts for nothing");
+
+	cpuinfo_lines("CPU implementer\t: 0x41\nCPU part\t:\n", &l1, &l2, &l3);
+	JENT_UT_EQ(l1, 0, "and neither does a part that does not");
+
+	l1 = l2 = l3 = -1;
+	jent_get_cachesize_cpuinfo_file("/nonexistent/jent/proc/cpuinfo",
+					&l1, &l2, &l3);
+	JENT_UT_TRUE(l1 == 0 && l2 == 0 && l3 == 0,
+		     "an absent /proc/cpuinfo reports nothing");
+
+	jent_get_cachesize_cpuinfo(&l1, &l2, &l3);
+	printf("  note: /proc/cpuinfo gives L1 %ld, L2 %ld\n", l1, l2);
+
+	/*
+	 * The reader: a Features line longer than its line buffer, which must
+	 * be skipped whole rather than read in pieces, and a last line
+	 * without its newline.
+	 */
+	fd = mkstemp(path);
+	if (fd < 0) {
+		JENT_UT_SKIP("the /proc/cpuinfo reader", "no temporary file");
+		return;
+	}
+	{
+		static const char tail[] =
+			"processor\t: 0\n"
+			"Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp\n"
+			"CPU implementer\t: 0x41\n"
+			"CPU part\t: 0xd07";
+		ssize_t w = write(fd, tail, sizeof(tail) - 1);
+
+		close(fd);
+		if (w != (ssize_t)sizeof(tail) - 1) {
+			unlink(path);
+			JENT_UT_SKIP("the /proc/cpuinfo reader",
+				     "the temporary file is not writable");
+			return;
+		}
+	}
+
+	l1 = l2 = l3 = -1;
+	jent_get_cachesize_cpuinfo_file(path, &l1, &l2, &l3);
+	JENT_UT_EQ(l1, A57_L1, "the reader finds the core past a long line");
+	JENT_UT_EQ(l2, A57_L2, "with its L2");
+	JENT_UT_EQ(l3, 0, "and no L3");
+
+	/* The whole chain, with sysfs gone and the file in place. */
+	{
+		long s1, s2, s3;
+		const char *saved = jent_test_sysfs_root;
+
+		jent_get_cachesize_sysconf(&s1, &s2, &s3);
+		jent_test_sysfs_root = "/nonexistent/jent/sys/devices/system/cpu";
+		jent_test_cpuinfo = path;
+		jent_get_cachesize_uncached(&l1, &l2, &l3);
+		jent_test_sysfs_root = saved;
+		jent_test_cpuinfo = "/proc/cpuinfo";
+
+		if (s1 > 0)
+			JENT_UT_EQ(l1, s1, "an L1 from sysconf is not second-guessed");
+		else
+			JENT_UT_EQ(l1, A57_L1,
+				   "without sysfs and sysconf the core type answers");
+	}
+
+	/*
+	 * A sysfs that states the L1 only, as a device tree with d-cache-size
+	 * but no L2 node gives: the L1 is the measurement and stays, the L2
+	 * comes from the core type.
+	 */
+	{
+		static char root[] = "/tmp/jent-sysfs-l1-XXXXXX";
+		char dir[160];
+		const char *saved = jent_test_sysfs_root;
+
+		if (mkdtemp(root)) {
+			snprintf(dir, sizeof(dir), "%s/cpu0", root);
+			mkdir(dir, 0700);
+			snprintf(dir, sizeof(dir), "%s/cpu0/cache", root);
+			if (!mkdir(dir, 0700) &&
+			    !sysfs_index(dir, 0, "Data\n", "1\n", "16K\n")) {
+				jent_test_sysfs_root = root;
+				jent_test_cpuinfo = path;
+				l1 = l2 = l3 = -1;
+				jent_get_cachesize_uncached(&l1, &l2, &l3);
+				jent_test_sysfs_root = saved;
+				jent_test_cpuinfo = "/proc/cpuinfo";
+
+				JENT_UT_EQ(l1, 16384,
+					   "an L1 sysfs reports is kept over the table");
+				JENT_UT_EQ(l2, A57_L2,
+					   "the L2 it does not report comes from the table");
+			}
+			sysfs_rmtree(root);
+		}
+	}
+	unlink(path);
+}
+#else
+static void test_cache_cpuinfo(void)
+{
+	JENT_UT_SKIP("the Arm core types of /proc/cpuinfo",
+		     "not the Linux backend on Arm");
 }
 #endif
 
@@ -487,6 +1020,8 @@ int main(void)
 	test_cache_sysconf_fallback();
 	test_cache_parsers();
 	test_sysfs_cache_walk();
+	test_cache_cpuinfo();
+	test_cache_cpuid_fallback();
 
 	return jent_ut_report("unit-arch-cache");
 }
