@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Jitter RNG</string>
+    <string name="version">Jitter RNG %1$s</string>
+    <string name="tab_collector">Collector</string>
+    <string name="tab_output">Output</string>
+    <string name="show_status">Show status</string>
+    <string name="generate">32 bytes</string>
+    <string name="new_collector">New collector</string>
+    <string name="mode_default">Default</string>
+    <string name="mode_fips">FIPS</string>
+    <string name="mode_ntg1">NTG.1</string>
+    <string name="timer_thread">Timer thread</string>
+    <string name="osr">Initial oversampling rate: %1$d</string>
+    <string name="memory_size">Memory size: %1$s</string>
+    <string name="hash_loop">Hash loop count: %1$d</string>
+    <string name="timer_thread_note">Collectors allocated while this is on use the timer thread, the others the platform clock. NTG.1 forbids it.</string>
+</resources>
