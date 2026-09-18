@@ -38,16 +38,22 @@ The cutoffs:
     with x the root near 1 of 1 - x + q p^r x^(r+1).
 
   Repetition count test with memory
-    floor(n p + tau * sqrt(n p' (1 - p'))), capped at n and, for the
-    permanent cutoff, at n + 1. n = 321/3 * osr is the number of observations
-    a window makes, p = 2^(1 - margin/osr) is twice the 2^(-H) of the
-    heuristic entropy H = margin/osr, and p' = min(p, 1/2) holds the variance
-    at its maximum once p passes 1/2. tau is the 4 and 5 of the significance
-    levels pnorm(-4) and pnorm(-5) the source quotes.
+    floor(n p + tau * sqrt(n p' (1 - p'))), capped: at n for the two
+    intermittent cutoffs and at n + 1 for the two permanent ones. n = 321/3 *
+    osr is the number of observations a window makes, p = 2^(1 - margin/osr)
+    is twice the 2^(-H) of the heuristic entropy H = margin/osr, and
+    p' = min(p, 1/2) holds the variance at its maximum once p passes 1/2. tau
+    is the 4 and 5 of the significance levels pnorm(-4) and pnorm(-5) the
+    source quotes.
 
-    In the common case, margin 1, p >= 1 at every oversampling rate, so both
-    cutoffs are the cap - which is what "these values effectively disables the
-    health test" beside them means.
+    The caps are what the formula runs into wherever p >= 1 - at every
+    oversampling rate in the common case, margin 1, and from osr 8 on for
+    NTG.1 - because the mean alone then exceeds the n observations a window
+    makes. A permanent cutoff of n + 1 is one past anything a window can
+    count, so it fires only on a counter primed across a reallocation; an
+    intermittent cutoff of n is reached by a window whose every observation is
+    stuck. See rct_mem_table() for why the intermittent cap is n and not
+    n + 1.
 
 alpha is 2^-30 for the RCT and the APT and 2^-22 for the lag predictor, whose
 window is much larger; the permanent cutoffs use its square. The margin is the
@@ -74,8 +80,8 @@ APT_WINDOW_SIZE = 512
 LAG_WINDOW_SIZE = 1 << 17
 LAG_HISTORY_SIZE = 8
 
-# JENT_MAX_OSR, the highest oversampling rate the library accepts: every
-# table covers 1 up to it, which a build assertion in the source enforces.
+# JENT_MAX_OSR: every table has exactly one entry per rate from 1 up to it
+# (asserted in the source).
 MAX_OSR = 20
 
 # The 8-fold entropy margin of NTG.1 operation.
@@ -89,6 +95,12 @@ RCT_MEM_WINDOW = 321
 RCT_MEM_TAU = 3
 RCT_MEM_SIGMA = 4
 RCT_MEM_SIGMA_PERMANENT = 5
+
+# How far above the n observations of a window the formula may be capped.
+# See rct_mem_table(): the intermittent cutoffs are capped one lower than the
+# permanent ones, so that they stay reachable within their window.
+RCT_MEM_CAP_INTERMITTENT = 0
+RCT_MEM_CAP_PERMANENT = 1
 
 
 def upper_tail(m, n, p):
@@ -204,9 +216,26 @@ def rct_mem_table(margin, sigmas, cap_offset):
 
     The mean plus @sigmas standard deviations of the stuck count over the
     n = 321/tau * osr observations a window makes, rounded down and capped at
-    n (n + 1 for the permanent cutoff), which is where the test can no longer
-    fail. p is twice the 2^(-H) of the heuristic entropy H = margin/osr, and
-    the variance is held at its maximum once p passes 1/2.
+    n + @cap_offset.
+
+    The cap is not cosmetic: with p = 2^(1 - margin/osr) >= 1 the mean alone
+    is at or above n, so the formula asks for a cutoff no window can ever
+    count up to. Which cap is applied is a choice, and the two differ:
+
+      RCT_MEM_CAP_PERMANENT = 1 - n + 1, one past the largest count a window
+        can reach. A permanent failure then needs a counter that entered the
+        window above zero, which is what jent_rct_mem_duplicate() primes
+        after a reallocation, and no single window can raise one on its own.
+
+      RCT_MEM_CAP_INTERMITTENT = 0 - n, a window whose every observation is
+        stuck. This is one below what the formula says, deliberately: capping
+        at n + 1 like the permanent cutoff would leave the intermittent test
+        and the recovery loop behind it unable to fire at all within their
+        window. The cost is a bound that is slightly conservative wherever
+        the cap binds; the gain is that a dead noise source is still caught.
+
+    p is twice the 2^(-H) of the heuristic entropy H = margin/osr, and the
+    variance is held at its maximum once p passes 1/2.
     """
     table = []
 
@@ -259,13 +288,16 @@ TABLES = [
     ("jent_apt_cutoff_permanent_lookup_ntg1", "unsigned int",
      lambda: apt_table(NTG1_MARGIN, mpf(2) ** -60)),
     ("jent_rct_mem_cutoff_lookup", "unsigned short",
-     lambda: rct_mem_table(1, RCT_MEM_SIGMA, 0)),
+     lambda: rct_mem_table(1, RCT_MEM_SIGMA, RCT_MEM_CAP_INTERMITTENT)),
     ("jent_rct_mem_cutoff_permanent_lookup", "unsigned short",
-     lambda: rct_mem_table(1, RCT_MEM_SIGMA_PERMANENT, 1)),
+     lambda: rct_mem_table(1, RCT_MEM_SIGMA_PERMANENT,
+                           RCT_MEM_CAP_PERMANENT)),
     ("jent_rct_mem_cutoff_lookup_ntg1", "unsigned short",
-     lambda: rct_mem_table(NTG1_MARGIN, RCT_MEM_SIGMA, 0)),
+     lambda: rct_mem_table(NTG1_MARGIN, RCT_MEM_SIGMA,
+                           RCT_MEM_CAP_INTERMITTENT)),
     ("jent_rct_mem_cutoff_permanent_lookup_ntg1", "unsigned short",
-     lambda: rct_mem_table(NTG1_MARGIN, RCT_MEM_SIGMA_PERMANENT, 1)),
+     lambda: rct_mem_table(NTG1_MARGIN, RCT_MEM_SIGMA_PERMANENT,
+                           RCT_MEM_CAP_PERMANENT)),
 ]
 
 # The RCT has no table: src/jitterentropy-health.h states the cutoff as a
@@ -286,7 +318,7 @@ def format_table(name, ctype, values):
         row = ", ".join("%*d" % (width, v) for v in chunk)
         lines.append(("\t{ " if i == 0 else "\t  ") + row)
 
-    return ("static const %s %s[%d] =\n" % (ctype, name, len(values))
+    return ("static const %s %s[] =\n" % (ctype, name)
             + ",\n".join(lines) + " };")
 
 

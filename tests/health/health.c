@@ -64,26 +64,17 @@
  * recovery clears the counter and enters the loop instead of raising the
  * error - not what the noise source produces while it runs. A stub also keeps
  * the case deterministic.
+ *
+ * It clobbers the window counters as the real blocks do - jent_random_data_one()
+ * restarts the window at every block - so the test can see the recovery restore
+ * the outer window rather than resume against whatever the last block left.
  */
-void jent_random_data(struct rand_data *ec)
+void jent_random_data_recovery(struct rand_data *ec, unsigned int loops)
 {
-	(void)ec;
-}
+	(void)loops;
 
-/*
- * Window size of the RCT with memory, i.e. the number of time deltas the noise
- * source generates for one output block. Mirrors the calculation of
- * JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR in jent_random_data_one() which is
- * where ec->rct_mem_nosr is established at runtime.
- */
-static unsigned short jent_test_rct_mem_nosr(unsigned int osr)
-{
-	unsigned int nosr = (DATA_SIZE_BITS + ENTROPY_SAFETY_FACTOR) * osr;
-
-	/* Round up to the nearest multiple of three. */
-	nosr = ((nosr + 2) / 3) * 3;
-
-	return (unsigned short)nosr;
+	ec->rct_mem_ctr = ec->rct_mem_nosr;
+	ec->rct_mem_count = 0;
 }
 
 /*
@@ -235,6 +226,47 @@ static void jent_test_verify_clean(const char *name, struct rand_data *ec,
 		failures++;
 }
 
+/*
+ * The other half of an induced failure: one sample short of the cutoff the
+ * failure must not be raised yet.
+ *
+ * Without it every case here reads its expectation out of the implementation -
+ * cutoff = ec.<field>, then exactly that many samples - and a wrong cutoff
+ * table is fed to itself and agrees with itself. Feeding cutoff - 1 and cutoff
+ * pins the boundary instead, which catches an off-by-one and an inverted
+ * comparison at every oversampling rate. What it cannot catch is the absolute
+ * value of the table entry; tests/health/cutoffs.py recomputes that from the
+ * SP800-90B formulas, and the health-cutoff-tables case runs it.
+ *
+ * Unlike jent_test_verify_clean() this only asks about the one bit under test:
+ * one below a permanent cutoff the intermittent error of the same test is
+ * expected to stand.
+ */
+static void jent_test_verify_below(const char *name, struct rand_data *ec,
+				   unsigned int samples, unsigned int notexpect)
+{
+	unsigned int mask = jent_health_failure(ec);
+	const char *result = (mask & notexpect) ?
+		"FAILED (raised below the cutoff)" : "passed";
+
+	printf("  %-34s %6u samples -> ", name, samples);
+	jent_test_print_mask(mask);
+	printf(" : %s\n", result);
+
+	if (mask & notexpect)
+		failures++;
+}
+
+/* A case whose outcome is a state check rather than a reported error. */
+static void jent_test_check(const char *name, int ok, unsigned int samples)
+{
+	printf("  %-34s %6u samples -> %s\n", name, samples,
+	       ok ? "passed" : "FAILED");
+
+	if (!ok)
+		failures++;
+}
+
 static void jent_test_skip(const char *name, const char *reason)
 {
 	printf("  %-34s %6s    -> skipped: %s\n", name, "-", reason);
@@ -250,8 +282,14 @@ static void jent_test_init(struct rand_data *ec, unsigned int osr,
 	/* The health tests only report errors in FIPS mode. */
 	ec->is_fips_enabled = 1;
 
+	/*
+	 * jent_health_init() establishes the window of the RCT with memory,
+	 * so this collector is judged against the same window the noise source
+	 * would use. It used to be recomputed here from a copy of the formula,
+	 * because jent_health_init() left it at zero and the test then never
+	 * entered its window at all.
+	 */
 	jent_health_init(ec, inittype);
-	ec->rct_mem_nosr = jent_test_rct_mem_nosr(osr);
 }
 
 /*
@@ -267,15 +305,20 @@ static void jent_test_rct(unsigned int osr,
 
 	jent_test_init(&ec, osr, inittype);
 	cutoff = ec.rct_cutoff;
-	for (i = 0; i < cutoff; i++)
+	for (i = 0; i + 1 < cutoff; i++)
 		jent_rct_insert(&ec, 1);
+	jent_test_verify_clean("RCT below its cutoff", &ec, cutoff - 1);
+	jent_rct_insert(&ec, 1);
 	jent_test_verify("RCT intermittent", &ec, cutoff, JENT_RCT_FAILURE,
 			 testmask);
 
 	jent_test_init(&ec, osr, inittype);
 	cutoff = ec.rct_cutoff_permanent;
-	for (i = 0; i < cutoff; i++)
+	for (i = 0; i + 1 < cutoff; i++)
 		jent_rct_insert(&ec, 1);
+	jent_test_verify_below("RCT below its permanent cutoff", &ec, cutoff - 1,
+			       JENT_RCT_FAILURE_PERMANENT);
+	jent_rct_insert(&ec, 1);
 	jent_test_verify("RCT permanent", &ec, cutoff,
 			 JENT_RCT_FAILURE_PERMANENT, testmask);
 }
@@ -305,16 +348,21 @@ static void jent_test_apt(unsigned int osr,
 		jent_test_skip("APT intermittent",
 			       "cutoff coincides with the permanent cutoff");
 	} else {
-		for (i = 0; i < cutoff; i++)
+		for (i = 0; i + 1 < cutoff; i++)
 			jent_apt_insert(&ec, 0xc0ffee);
+		jent_test_verify_clean("APT below its cutoff", &ec, cutoff - 1);
+		jent_apt_insert(&ec, 0xc0ffee);
 		jent_test_verify("APT intermittent", &ec, cutoff,
 				 JENT_APT_FAILURE, testmask);
 	}
 
 	jent_test_init(&ec, osr, inittype);
 	cutoff = ec.apt_cutoff_permanent;
-	for (i = 0; i < cutoff; i++)
+	for (i = 0; i + 1 < cutoff; i++)
 		jent_apt_insert(&ec, 0xc0ffee);
+	jent_test_verify_below("APT below its permanent cutoff", &ec, cutoff - 1,
+			       JENT_APT_FAILURE_PERMANENT);
+	jent_apt_insert(&ec, 0xc0ffee);
 	jent_test_verify("APT permanent", &ec, cutoff,
 			 JENT_APT_FAILURE_PERMANENT, testmask);
 }
@@ -337,16 +385,21 @@ static void jent_test_lag(unsigned int osr,
 	cutoff = ec.lag_local_cutoff;
 	/* The first JENT_LAG_HISTORY_SIZE samples only prime the history. */
 	samples = JENT_LAG_HISTORY_SIZE + cutoff;
-	for (i = 0; i < samples; i++)
+	for (i = 0; i + 1 < samples; i++)
 		jent_lag_insert(&ec, 0xc0ffee);
+	jent_test_verify_clean("Lag local below its cutoff", &ec, samples - 1);
+	jent_lag_insert(&ec, 0xc0ffee);
 	jent_test_verify("Lag local intermittent", &ec, samples,
 			 JENT_LAG_FAILURE, testmask);
 
 	jent_test_init(&ec, osr, inittype);
 	cutoff = ec.lag_local_cutoff_permanent;
 	samples = JENT_LAG_HISTORY_SIZE + cutoff;
-	for (i = 0; i < samples; i++)
+	for (i = 0; i + 1 < samples; i++)
 		jent_lag_insert(&ec, 0xc0ffee);
+	jent_test_verify_below("Lag local below its permanent cutoff", &ec,
+			       samples - 1, JENT_LAG_FAILURE_PERMANENT);
+	jent_lag_insert(&ec, 0xc0ffee);
 	jent_test_verify("Lag local permanent", &ec, samples,
 			 JENT_LAG_FAILURE_PERMANENT, testmask);
 
@@ -360,19 +413,57 @@ static void jent_test_lag(unsigned int osr,
 	jent_test_init(&ec, osr, inittype);
 	for (i = 0; i < JENT_LAG_HISTORY_SIZE; i++)
 		jent_lag_insert(&ec, 0xc0ffee);
-	ec.lag_prediction_success_count = ec.lag_global_cutoff - 1;
+	ec.lag_prediction_success_count = ec.lag_global_cutoff - 2;
+	jent_lag_insert(&ec, 0xc0ffee);
+	jent_test_verify_clean("Lag global below its cutoff (primed)", &ec,
+			       JENT_LAG_HISTORY_SIZE + 1);
 	jent_lag_insert(&ec, 0xc0ffee);
 	jent_test_verify("Lag global intermittent (primed)", &ec,
-			 JENT_LAG_HISTORY_SIZE + 1, JENT_LAG_FAILURE, testmask);
+			 JENT_LAG_HISTORY_SIZE + 2, JENT_LAG_FAILURE, testmask);
 
 	jent_test_init(&ec, osr, inittype);
 	for (i = 0; i < JENT_LAG_HISTORY_SIZE; i++)
 		jent_lag_insert(&ec, 0xc0ffee);
-	ec.lag_prediction_success_count = ec.lag_global_cutoff_permanent - 1;
+	ec.lag_prediction_success_count = ec.lag_global_cutoff_permanent - 2;
+	jent_lag_insert(&ec, 0xc0ffee);
+	jent_test_verify_below("Lag global below its permanent (primed)", &ec,
+			       JENT_LAG_HISTORY_SIZE + 1,
+			       JENT_LAG_FAILURE_PERMANENT);
 	jent_lag_insert(&ec, 0xc0ffee);
 	jent_test_verify("Lag global permanent (primed)", &ec,
-			 JENT_LAG_HISTORY_SIZE + 1, JENT_LAG_FAILURE_PERMANENT,
+			 JENT_LAG_HISTORY_SIZE + 2, JENT_LAG_FAILURE_PERMANENT,
 			 testmask);
+
+	/*
+	 * The stuck test reads its 2nd and 3rd derivatives from the lag
+	 * history, so a new lag window must not start from a cleared one: a
+	 * constant delta straddling the window end has to stay stuck on both
+	 * sides. Varying deltas lead up to it, which only the first constant
+	 * one differs from.
+	 */
+	jent_test_init(&ec, osr, inittype);
+	{
+		uint64_t delta = 0x12345;
+		unsigned int stuck_all = 1;
+
+		samples = 0;
+		while (ec.lag_observations < JENT_LAG_WINDOW_SIZE - 4) {
+			delta = delta * 6364136223846793005ULL +
+				1442695040888963407ULL;
+			jent_stuck(&ec, (delta >> 16) | 1);
+			samples++;
+		}
+
+		jent_stuck(&ec, 0xc0ffee);
+		samples++;
+		for (i = 0; i < 8; i++, samples++) {
+			if (!jent_stuck(&ec, 0xc0ffee))
+				stuck_all = 0;
+		}
+
+		jent_test_check("Stuck across the lag window end",
+				stuck_all && ec.lag_observations < 8, samples);
+	}
 }
 #else /* JENT_HEALTH_LAG_PREDICTOR */
 static void jent_test_lag(unsigned int osr,
@@ -394,14 +485,17 @@ static void jent_test_rct_mem(unsigned int osr,
 			      enum jent_health_init_type inittype)
 {
 	struct rand_data ec;
-	unsigned int i, cutoff, samples;
+	unsigned int i, cutoff, samples, below;
 	const unsigned int testmask = JENT_RCT_MEM_FAILURE |
 				      JENT_RCT_MEM_FAILURE_PERMANENT;
 
 	jent_test_init(&ec, osr, inittype);
 	cutoff = ec.rct_mem_cutoff;
 	samples = jent_test_rct_mem_samples(cutoff);
+	below = jent_test_rct_mem_samples(cutoff ? cutoff - 1 : 0);
 	if (samples > ec.rct_mem_nosr) {
+		jent_test_skip("RCT-mem below its cutoff",
+			       "cutoff is not reachable within the window");
 		jent_test_skip("RCT-mem intermittent",
 			       "cutoff is not reachable within the window");
 	} else {
@@ -412,7 +506,10 @@ static void jent_test_rct_mem(unsigned int osr,
 		 * cannot be part of a deterministic induced failure.
 		 */
 		ec.in_recovery = 1;
-		for (i = 0; i < samples; i++)
+		for (i = 0; i < below; i++)
+			jent_rct_mem_insert(&ec, 1);
+		jent_test_verify_clean("RCT-mem below its cutoff", &ec, below);
+		for (; i < samples; i++)
 			jent_rct_mem_insert(&ec, 1);
 		jent_test_verify("RCT-mem intermittent", &ec, samples,
 				 JENT_RCT_MEM_FAILURE, testmask);
@@ -432,10 +529,24 @@ static void jent_test_rct_mem(unsigned int osr,
 	if (samples > ec.rct_mem_nosr) {
 		jent_test_skip("RCT-mem recovery loop",
 			       "cutoff is not reachable within the window");
+		/*
+		 * Counted on its own: it lives inside the branch below, and
+		 * in the common configuration the whole case is skipped at
+		 * every oversampling rate - which the tally has to show.
+		 */
+		jent_test_skip("RCT-mem window after recovery",
+			       "cutoff is not reachable within the window");
 	} else {
 		for (i = 0; i < samples; i++)
 			jent_rct_mem_insert(&ec, 1);
 		jent_test_verify_clean("RCT-mem recovery loop", &ec, samples);
+
+		/*
+		 * The recovery must restore the outer window, or the rest of
+		 * the block it recovers goes untested.
+		 */
+		jent_test_check("RCT-mem window after recovery",
+				ec.rct_mem_ctr == samples, samples);
 	}
 
 	/*
@@ -464,6 +575,7 @@ static void jent_test_rct_mem(unsigned int osr,
 	jent_test_init(&ec, osr, inittype);
 	cutoff = ec.rct_mem_cutoff_permanent;
 	samples = jent_test_rct_mem_samples(cutoff);
+	below = jent_test_rct_mem_samples(cutoff ? cutoff - 1 : 0);
 	if (samples > ec.rct_mem_nosr) {
 		/*
 		 * This is the expected outcome for the common (non-NTG.1)
@@ -471,11 +583,17 @@ static void jent_test_rct_mem(unsigned int osr,
 		 * permanent cutoff one count above the largest value the
 		 * window can produce.
 		 */
+		jent_test_skip("RCT-mem below its permanent cutoff",
+			       "cutoff is not reachable within the window");
 		jent_test_skip("RCT-mem permanent",
 			       "cutoff is not reachable within the window");
 	} else {
 		ec.in_recovery = 1;
-		for (i = 0; i < samples; i++)
+		for (i = 0; i < below; i++)
+			jent_rct_mem_insert(&ec, 1);
+		jent_test_verify_below("RCT-mem below its permanent cutoff", &ec,
+				       below, JENT_RCT_MEM_FAILURE_PERMANENT);
+		for (; i < samples; i++)
 			jent_rct_mem_insert(&ec, 1);
 		jent_test_verify("RCT-mem permanent", &ec, samples,
 				 JENT_RCT_MEM_FAILURE_PERMANENT, testmask);
@@ -483,48 +601,29 @@ static void jent_test_rct_mem(unsigned int osr,
 }
 
 /*
- * The cutoff tables are indexed by the oversampling rate and clamped to their
- * last entry above it. JENT_MAX_OSR currently equals the length of the longest
- * of them, so nothing the public API accepts reaches the clamp of every table
- * - it is what keeps a raised JENT_MAX_OSR, which is a compile-time tunable,
- * from indexing past the end. Reached here by initializing the health tests
- * directly at an oversampling rate above all of them.
+ * The cutoff tables cover exactly osr 1 to JENT_MAX_OSR, and an oversampling
+ * rate outside them must be refused rather than index past their ends.
  */
-static void jent_test_cutoff_clamping(enum jent_health_init_type inittype)
+static void jent_test_osr_bounds(enum jent_health_init_type inittype)
 {
-	struct rand_data ec, max_ec;
-	const unsigned int beyond = JENT_MAX_OSR + 5;
+	struct rand_data ec;
 
-	jent_test_init(&max_ec, JENT_MAX_OSR, inittype);
-	jent_test_init(&ec, beyond, inittype);
+	memset(&ec, 0, sizeof(ec));
+	ec.is_fips_enabled = 1;
+	ec.osr = JENT_MAX_OSR + 1;
+	jent_test_check("osr above JENT_MAX_OSR refused",
+			jent_health_init(&ec, inittype) != 0, 0);
 
-	printf("  %-34s %6u osr    -> ", "cutoff clamping", beyond);
-
-	if (ec.rct_mem_cutoff == max_ec.rct_mem_cutoff &&
-	    ec.apt_cutoff == max_ec.apt_cutoff &&
-#ifdef JENT_HEALTH_LAG_PREDICTOR
-	    ec.lag_local_cutoff == max_ec.lag_local_cutoff &&
-	    ec.lag_global_cutoff == max_ec.lag_global_cutoff &&
-	    ec.lag_local_cutoff_permanent == max_ec.lag_local_cutoff_permanent &&
-	    ec.lag_global_cutoff_permanent == max_ec.lag_global_cutoff_permanent &&
-#endif
-	    ec.rct_mem_cutoff_permanent == max_ec.rct_mem_cutoff_permanent &&
-	    ec.apt_cutoff_permanent == max_ec.apt_cutoff_permanent) {
-		printf("every table clamped : passed\n");
-	} else {
-		printf("a table was not clamped : FAILED\n");
-		failures++;
-	}
-
-	/*
-	 * The RCT is computed rather than looked up, so it scales instead of
-	 * clamping - stated here so that the difference is deliberate.
-	 */
-	if (ec.rct_cutoff <= max_ec.rct_cutoff) {
-		printf("  %-34s %6s    -> the computed RCT cutoff did not "
-		       "scale : FAILED\n", "RCT cutoff scaling", "-");
-		failures++;
-	}
+	/* An osr of 0 indexes no table entry and must be refused. */
+	memset(&ec, 0, sizeof(ec));
+	ec.is_fips_enabled = 1;
+	jent_test_check("osr 0 refused", jent_health_init(&ec, inittype) != 0,
+			0);
+	memset(&ec, 0, sizeof(ec));
+	ec.is_fips_enabled = 1;
+	ec.osr = JENT_MAX_OSR;
+	jent_test_check("JENT_MAX_OSR set up",
+			jent_health_init(&ec, inittype) == 0, 0);
 }
 
 static void jent_test_run(unsigned int osr,
@@ -554,18 +653,19 @@ static void jent_test_run(unsigned int osr,
 	jent_test_apt(osr, inittype);
 	jent_test_lag(osr, inittype);
 	jent_test_rct_mem(osr, inittype);
-	jent_test_cutoff_clamping(inittype);
+	jent_test_osr_bounds(inittype);
 	printf("\n");
 }
 
 /*
  * Replay a file of time stamps through the health tests.
  *
- * One decimal (or 0x-prefixed hexadecimal) value per line; blank lines and
- * lines beginning with # are skipped, so a recording can carry a header. This
- * is what judges a raw entropy recording with the very tests that will judge
- * the noise source at runtime - the same code, reaching the same verdict on
- * the same numbers.
+ * One decimal (or 0x-prefixed hexadecimal) value per line and nothing else on
+ * it; blank lines and lines beginning with # are skipped, so a recording can
+ * carry a header. This is what judges a raw entropy recording with the very
+ * tests that will judge the noise source at runtime - the same code, reaching
+ * the same verdict on the same numbers. Which is why nothing may be invented
+ * here: N stamps describe N - 1 deltas, and those are what is judged.
  *
  * Returns 0 when the file was read and no health test fired, 1 when one did,
  * and 2 when the file could not be read or did not parse.
@@ -577,7 +677,7 @@ static int jent_test_replay(const char *file, unsigned int osr,
 	FILE *f;
 	char line[128];
 	unsigned long lineno = 0;
-	unsigned long long stamps = 0, stuck = 0;
+	unsigned long long stamps = 0, measurements = 0, stuck = 0;
 	unsigned int mask;
 	int primed = 0;
 
@@ -595,43 +695,84 @@ static int jent_test_replay(const char *file, unsigned int osr,
 	fflush(stdout);
 
 	while (fgets(line, sizeof(line), f)) {
-		char *p = line, *endptr;
+		char *p = line, *start, *endptr;
 		uint64_t stamp;
 
 		lineno++;
+
+		/*
+		 * A line longer than the buffer would be split and its tail
+		 * parsed as a time stamp of its own.
+		 */
+		if (!strchr(line, '\n') && !feof(f)) {
+			fprintf(stderr, "%s:%lu: line too long\n", file,
+				lineno);
+			goto err;
+		}
 
 		while (*p == ' ' || *p == '\t')
 			p++;
 		if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0')
 			continue;
 
-		errno = 0;
-		if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
-			stamp = (uint64_t)strtoull(p + 2, &endptr, 16);
-		else
-			stamp = (uint64_t)strtoull(p, &endptr, 10);
+		/*
+		 * strtoull() takes a sign, and "-5" would arrive as a stamp
+		 * near the top of the range with errno clear.
+		 */
+		if (*p == '-' || *p == '+')
+			goto badstamp;
 
-		if (errno || endptr == p) {
-			fprintf(stderr, "%s:%lu: not a time stamp: %s", file,
-				lineno, line);
-			if (f != stdin)
-				fclose(f);
-			return 2;
-		}
+		errno = 0;
+		start = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) ? p + 2 : p;
+		stamp = (uint64_t)strtoull(start, &endptr,
+					   (start == p) ? 10 : 16);
 
 		/*
-		 * The first stamp only establishes what the second is a delta
-		 * against. Inserting it twice makes the reference and the
-		 * recording start together, so that the first measurement
-		 * judged is the first one the recording actually describes.
+		 * endptr is compared against where the conversion began, not
+		 * against the start of the line: for a hexadecimal stamp those
+		 * differ by the 0x, so "0xzz" converted nothing yet left
+		 * endptr != p. glibc leaves errno clear in that case, and the
+		 * line was replayed as a time stamp of 0.
+		 */
+		if (errno || endptr == start)
+			goto badstamp;
+
+		/*
+		 * And nothing but blanks may follow. The historical recording
+		 * format has a second column, which was silently dropped -
+		 * as was the tail of any line carrying a typo. See
+		 * tests/raw-entropy/extractlsb.c, which refuses the same.
+		 */
+		while (*endptr == ' ' || *endptr == '\t')
+			endptr++;
+		if (*endptr != '\0' && *endptr != '\n' && *endptr != '\r')
+			goto badstamp;
+
+		stamps++;
+
+		/*
+		 * The first stamp is the reference the second is a delta
+		 * against, and nothing more: it describes no measurement of
+		 * its own. It used to be inserted as a stamp, which made the
+		 * tool judge one measurement of the raw counter value against
+		 * a prev_time of zero and one stuck measurement behind it -
+		 * two judgements the recording does not contain, and the same
+		 * two whether the file held three lines or two thousand. N
+		 * lines now produce the N - 1 deltas they describe.
 		 */
 		if (!primed) {
-			jent_health_insert_timestamp(&ec, stamp);
+			ec.prev_time = stamp;
 			primed = 1;
+			continue;
 		}
 
 		stuck += jent_health_insert_timestamp(&ec, stamp);
-		stamps++;
+		measurements++;
+	}
+
+	if (ferror(f)) {
+		fprintf(stderr, "Read error on %s\n", file);
+		goto err;
 	}
 
 	if (f != stdin)
@@ -642,9 +783,17 @@ static int jent_test_replay(const char *file, unsigned int osr,
 		return 2;
 	}
 
+	if (!measurements) {
+		fprintf(stderr,
+			"%s holds one time stamp; two are needed for a delta\n",
+			file);
+		return 2;
+	}
+
 	mask = jent_health_failure(&ec);
 
-	printf("  %llu time stamps, %llu stuck measurement(s)\n", stamps, stuck);
+	printf("  %llu time stamps, %llu measurement(s), %llu stuck\n", stamps,
+	       measurements, stuck);
 	jent_test_print_failures(mask);
 
 	/*
@@ -656,12 +805,22 @@ static int jent_test_replay(const char *file, unsigned int osr,
 	printf("  note: no common timer divisor is applied to the deltas\n");
 
 	return mask ? 1 : 0;
+
+badstamp:
+	fprintf(stderr, "%s:%lu: not a time stamp: %s", file, lineno, line);
+	if (line[0] && line[strlen(line) - 1] != '\n')
+		fprintf(stderr, "\n");
+err:
+	if (f != stdin)
+		fclose(f);
+	return 2;
 }
 
 static void usage(const char *name)
 {
 	fprintf(stderr, "Usage: %s [osr]\n", name);
-	fprintf(stderr, "       %s --replay FILE [osr] [--ntg1]\n\n", name);
+	fprintf(stderr, "       %s --replay FILE [osr] [--ntg1]\n", name);
+	fprintf(stderr, "       %s --lag-predictor\n\n", name);
 	fprintf(stderr,
 		"Induced failure test of the Jitter RNG health tests. Feeds\n"
 		"known-bad samples into each health test and verifies that the\n"
@@ -672,7 +831,8 @@ static void usage(const char *name)
 		"Exits 0 when no health test fired and 1 when one did.\n\n"
 		"  osr\t\tOversampling rate to test, default %u\n"
 		"  --replay FILE\tReplay time stamps instead of inducing failures\n"
-		"  --ntg1\tUse the NTG.1 cutoffs for the replay\n",
+		"  --ntg1\tUse the NTG.1 cutoffs for the replay\n"
+		"  --lag-predictor\tExit 0 if the lag predictor is built in\n",
 		(unsigned int)JENT_MIN_OSR);
 }
 
@@ -698,6 +858,15 @@ int main(int argc, char *argv[])
 			}
 			replay = argv[i];
 			continue;
+		}
+
+		/* For the test drivers: the lag vectors need the lag test. */
+		if (!strcmp(argv[i], "--lag-predictor")) {
+#ifdef JENT_HEALTH_LAG_PREDICTOR
+			return 0;
+#else
+			return 1;
+#endif
 		}
 
 		if (!strcmp(argv[i], "--ntg1")) {
