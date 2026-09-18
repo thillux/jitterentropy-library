@@ -8,6 +8,14 @@
     let
       lib = nixpkgs.lib;
 
+      # From jitterentropy.h, so no version here can drift from the header's.
+      jentVersion =
+        let
+          header = builtins.readFile ./jitterentropy.h;
+          field = name: builtins.head (builtins.match
+            ".*#define ${name} ([0-9]+)\n.*" header);
+        in "${field "JENT_MAJVERSION"}.${field "JENT_MINVERSION"}.${field "JENT_PATCHLEVEL"}";
+
       # QEMU on the host architecture.
       systems = [ "x86_64-linux" "aarch64-linux" "i686-linux" ];
       forAllSystems = f: lib.genAttrs systems (system: f system);
@@ -16,7 +24,7 @@
       toolsFor = pkgs:
         pkgs.stdenv.mkDerivation {
           pname = "jitterentropy-tools";
-          version = "3.7.1";
+          version = jentVersion;
           src = self;
           nativeBuildInputs = [ pkgs.cmake ];
           enableParallelBuilding = true;
@@ -56,7 +64,7 @@
       crossFor = { cross, timer ? true, shared ? false }:
         cross.stdenv.mkDerivation {
           pname = "jitterentropy-cross";
-          version = "3.7.1";
+          version = jentVersion;
           src = self;
           nativeBuildInputs = [ nixpkgs.legacyPackages.x86_64-linux.cmake ];
           # BUILD_TESTING explicitly: the nixpkgs cmake hook passes it as OFF,
@@ -99,8 +107,17 @@
           cross-mingw32 = crossFor { cross = p.mingw32; };
         };
 
-      # ndk-build over arch/android/Android.mk against the real NDK toolchain,
-      # which is unfree - hence a dedicated nixpkgs instance for this output.
+      # The Android SDK and NDK are unfree - hence a dedicated nixpkgs instance
+      # for the two Android outputs.
+      pkgsAndroidFor = system: import nixpkgs {
+        inherit system;
+        config = {
+          allowUnfree = true;
+          android_sdk.accept_license = true;
+        };
+      };
+
+      # ndk-build over tests/android/Android.mk against the real NDK toolchain.
       #
       # APP_PLATFORM is the NDK's own floor, not this library's: r29 takes API
       # 21 upwards, and nothing the library calls is guarded above that except
@@ -109,19 +126,13 @@
       # branch compiled at all.
       androidFor = system:
         let
-          pkgsAndroid = import nixpkgs {
-            inherit system;
-            config = {
-              allowUnfree = true;
-              android_sdk.accept_license = true;
-            };
-          };
+          pkgsAndroid = pkgsAndroidFor system;
           ndk = (pkgsAndroid.androidenv.composeAndroidPackages {
             includeNDK = true;
           }).ndk-bundle;
         in pkgsAndroid.stdenv.mkDerivation {
           pname = "jitterentropy-android";
-          version = "3.7.1";
+          version = jentVersion;
           src = self;
           nativeBuildInputs = [ ndk ];
           dontConfigure = true;
@@ -130,7 +141,7 @@
             runHook preBuild
             ndk-build \
               NDK_PROJECT_PATH=null \
-              APP_BUILD_SCRIPT=$(pwd)/arch/android/Android.mk \
+              APP_BUILD_SCRIPT=$(pwd)/tests/android/Android.mk \
               APP_PLATFORM=android-21 \
               APP_ABI="arm64-v8a x86_64" \
               APP_OPTIM=release \
@@ -154,6 +165,95 @@
           };
         };
 
+      # The example app in tests/android, built by Gradle: the library through
+      # its CMakeLists.txt, linked into a JNI library.
+      #
+      # tests/android/deps.json lets mitmCache serve Gradle's Maven downloads
+      # offline. After changing anything Gradle downloads, regenerate it:
+      #
+      #   $(nix build --no-link --print-out-paths \
+      #       .#android-example.mitmCache.updateScript)
+      #
+      # The SDK must hold exactly what app/build.gradle.kts pins: AGP cannot
+      # install into the read-only store.
+      androidAppFor = system:
+        let
+          pkgsAndroid = pkgsAndroidFor system;
+          buildTools = "37.0.0";
+          sdk = (pkgsAndroid.androidenv.composeAndroidPackages {
+            platformVersions = [ "37.0" ];
+            buildToolsVersions = [ buildTools ];
+            cmakeVersions = [ "4.1.2" ];
+            includeNDK = true;
+            ndkVersions = [ "29.0.14206865" ];
+          }).androidsdk;
+          androidHome = "${sdk}/libexec/android-sdk";
+          gradle = pkgsAndroid.gradle_9;
+        in pkgsAndroid.stdenv.mkDerivation (finalAttrs: {
+          pname = "jitterentropy-android-example";
+          version = jentVersion;
+          src = self;
+
+          nativeBuildInputs = [ gradle ];
+
+          mitmCache = gradle.fetchDeps {
+            pkg = finalAttrs.finalPackage;
+            data = ./tests/android/deps.json;
+            # ninja needs /bin/sh, which the update script's sandbox lacks.
+            bwrapFlags = ''--ro-bind "$PWD" "$PWD" --ro-bind /bin /bin'';
+          };
+
+          env.ANDROID_HOME = androidHome;
+
+          # The aapt2 AGP fetches from Maven does not run on NixOS; the SDK's
+          # copy is patched.
+          gradleFlags = [
+            "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidHome}/build-tools/${buildTools}/aapt2"
+          ];
+          gradleBuildTask = "assembleDebug";
+          # The default, nixDownloadDeps, also resolves the androidTest
+          # classpaths, which an application module cannot resolve.
+          gradleUpdateTask = finalAttrs.gradleBuildTask;
+
+          # Also run by the update script. AGP writes its debug keystore below
+          # ANDROID_USER_HOME, which defaults to the unwritable $HOME.
+          postPatch = ''
+            cd tests/android
+            export ANDROID_USER_HOME=$(mktemp -d)
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            install -Dm644 app/build/outputs/apk/debug/app-debug.apk \
+              $out/jitterentropy-example.apk
+            runHook postInstall
+          '';
+
+          meta = {
+            description = "Jitter RNG example app for Android";
+            license = lib.licenses.bsd3;
+            sourceProvenance = with lib.sourceTypes; [
+              fromSource
+              binaryBytecode # the Gradle plugin from mitmCache
+            ];
+          };
+        });
+
+      # `nix run .#android-example-emulator` boots a fresh x86_64 emulator,
+      # installs the example app, starts it and leaves the emulator running.
+      # Needs /dev/kvm, and a display unless
+      # NIX_ANDROID_EMULATOR_FLAGS=-no-window.
+      androidEmulatorFor = system: app:
+        (pkgsAndroidFor system).androidenv.emulateApp {
+          name = "jitterentropy-android-example-emulator";
+          inherit app;
+          platformVersion = "36";
+          abiVersion = "x86_64";
+          systemImageType = "default";
+          package = "de.chronox.jitterentropy.example";
+          activity = ".MainActivity";
+        };
+
       # rng-tools and ESDM built against this tree. A build of this repository
       # alone cannot see what breaks a consumer: a header that stops declaring
       # something, a symbol that stops being exported, a link dependency missing
@@ -165,18 +265,29 @@
       # link only; behaviour is what the tool runs and the VM tests cover.
       consumersFor = pkgs:
         let
-          # INTERNAL_TIMER decides which symbols are exported, and rng-tools'
-          # configure probes for jent_notime_settick(): off, rngd_jitter.c
-          # compiles without the tick handling; on, it drives the timer thread.
-          # Two different compilations, hence both - off is what nixpkgs and so
-          # the distributions build, on is this repository's default.
+          # nixpkgs' derivation sets no BUILD_SHARED_LIBS, so what it installs
+          # is the static archive - which is why the CI job finds jent_*
+          # defined in rngd itself. The export set of a *shared* build is the
+          # same with the timer on or off (version.lds; the public notime
+          # functions have stubs without it), but the archive's symbols are
+          # not: jent_notime_settick() is internal, declared static inline in
+          # src/jitterentropy-timer.h when the timer is off, and an extern
+          # function in the archive when it is on. rng-tools' configure probes
+          # exactly that symbol with AC_CHECK_LIB, a link test, and defines
+          # HAVE_JITTER_NOTIME on success: off, rngd_jitter.c compiles without
+          # its notime thread; on, it registers one through
+          # jent_entropy_switch_notime_impl() and uses struct jent_notime_ctx
+          # from the public header. Two different compilations, hence both -
+          # off is what nixpkgs and so the distributions build, on is this
+          # repository's default.
           #
           # ESDM compiles the same either way but gates much of esdm_es_jent.c
           # on JENT_VERSION, which makes it the consumer pinning the widest
-          # part of the API.
+          # part of the API. With the timer the archive it links also needs
+          # the thread library, which the one without does not.
           libFor = timer:
             pkgs.jitterentropy.overrideAttrs (_: {
-              version = "3.7.1";
+              version = jentVersion;
               src = self;
               cmakeFlags =
                 [ "-DINTERNAL_TIMER=${if timer then "on" else "off"}" ];
@@ -203,17 +314,17 @@
       # instead of its own SHA-3 and secure memory, reaching the halves of the
       # memory and FIPS backends the default build never compiles: libgcrypt's
       # secmem pool, OpenSSL's secure heap, and AWS-LC's OPENSSL_malloc(), which
-      # is wiped but not locked and so reports itself as not secure.
+      # the library locks itself.
       #
-      # BUILD_SHARED_LIBS because CMakeLists.txt ties the two searches together:
-      # a static jitterentropy makes it look for a static libcrypto.a, which is
-      # not what these packages install.
+      # BUILD_SHARED_LIBS because the nix-crypto CI job reads the NEEDED entries
+      # of lib/libjitterentropy.so. The crypto library is found the same way for
+      # either linkage.
       cryptoFor = pkgs:
         let
           backendFor = { name, external, dep }:
             (toolsFor pkgs).overrideAttrs (old: {
               pname = "jitterentropy-tools-${name}";
-              buildInputs = (old.buildInputs or [ ]) ++ [ dep ];
+              buildInputs = (old.buildInputs or [ ]) ++ lib.toList dep;
               cmakeFlags = (old.cmakeFlags or [ ]) ++ [
                 "-DEXTERNAL_CRYPTO=${external}"
                 "-DBUILD_SHARED_LIBS=ON"
@@ -230,11 +341,11 @@
             external = "AWSLC";
             dep = pkgs.aws-lc;
           };
-          # <gpg-error.h> arrives through libgcrypt's propagated input.
+          # gcrypt.h includes <gpg-error.h>, which libgcrypt does not propagate.
           crypto-libgcrypt = backendFor {
             name = "libgcrypt";
             external = "LIBGCRYPT";
-            dep = pkgs.libgcrypt;
+            dep = [ pkgs.libgcrypt pkgs.libgpg-error ];
           };
         };
 
@@ -297,8 +408,12 @@
           ];
           boot.kernelModules = [ "jitter_rng" ];
           # Per-instance JSON status to the kernel log; test systems only.
+          #
+          # max_memsize pins the region so health-test recoveries cannot
+          # grow the hundreds of instances the tests open past the VM's
+          # memory (panic_on_oom is set).
           boot.extraModprobeConfig = ''
-            options jitter_rng verbose=1 ntg1=1 cache_all=1 selftest_interval=15
+            options jitter_rng verbose=1 ntg1=1 cache_all=1 selftest_interval=15 max_memsize=32768
           '';
           environment.systemPackages = [
             (toolsFor pkgs)
@@ -346,6 +461,167 @@
                   time.sleep(0.01)
               print("OK")
           '';
+          # max_instances: opens beyond it fail with ENFILE and take no slot
+          # or count, a close frees one, root is exempt.
+          environment.etc."jitterentropy-maxinstances-test.py".text = ''
+              import errno
+              import json
+              import os
+              import sys
+
+              # The module's max_instances; if 0, argv[2] is the open count.
+              limit = int(sys.argv[1])
+              opens = limit if limit else int(sys.argv[2])
+              privileged = os.geteuid() == 0
+
+
+              def chardev():
+                  """The counters, or None where the caller may not read them."""
+                  try:
+                      with open("/proc/jitterentropy/statistics") as f:
+                          return json.load(f)["charDevice"]
+                  except PermissionError:
+                      return None
+
+
+              # The statistics document is root only.
+              before = chardev()
+              assert (before is not None) == privileged, before
+
+              fds = [os.open("/dev/jitterentropy", os.O_RDONLY)
+                     for _ in range(opens)]
+
+              if before is not None:
+                  admitted = chardev()
+                  assert admitted["openInstances"] == \
+                      before["openInstances"] + opens, admitted
+                  assert admitted["cumulativeOpens"] == \
+                      before["cumulativeOpens"] + opens, admitted
+
+              if limit and privileged:
+                  # CAP_SYS_RESOURCE is exempt from the cap.
+                  fds += [os.open("/dev/jitterentropy", os.O_RDONLY)
+                          for _ in range(2)]
+              elif limit:
+                  try:
+                      os.close(os.open("/dev/jitterentropy", os.O_RDONLY))
+                  except OSError as e:
+                      assert e.errno == errno.ENFILE, f"errno {e.errno}"
+                  else:
+                      raise AssertionError("open beyond max_instances succeeded")
+
+                  # Closing one frees exactly one slot.
+                  os.close(fds.pop())
+                  fds.append(os.open("/dev/jitterentropy", os.O_RDONLY))
+
+              for fd in fds:
+                  os.close(fd)
+              if before is not None:
+                  assert chardev()["openInstances"] == \
+                      before["openInstances"], chardev()
+              print("OK")
+          '';
+          # max_kcapi_instances: AF_ALG binds beyond it fail with ENFILE and
+          # take no slot, a close frees one, root is exempt, and the count is
+          # apart from the character device's.
+          environment.etc."jitterentropy-maxkcapi-test.py".text = ''
+              import errno
+              import os
+              import socket
+              import sys
+
+              # The module's max_kcapi_instances; if 0, argv[2] is the bind
+              # count.
+              limit = int(sys.argv[1])
+              binds = limit if limit else int(sys.argv[2])
+              privileged = os.geteuid() == 0
+
+
+              def instantiate():
+                  """A socket bound to jitter_rng: the bind allocates the tfm."""
+                  s = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
+                  try:
+                      s.bind(("rng", "jitter_rng"))
+                  except BaseException:
+                      s.close()
+                      raise
+                  return s
+
+
+              def generate(s):
+                  op, _ = s.accept()
+                  with op:
+                      data = op.recv(32)
+                  assert len(data) == 32, f"read {len(data)} bytes"
+
+
+              def refused():
+                  try:
+                      instantiate().close()
+                  except OSError as e:
+                      assert e.errno == errno.ENFILE, f"errno {e.errno}"
+                  else:
+                      raise AssertionError(
+                          "bind beyond max_kcapi_instances succeeded")
+
+
+              tfms = [instantiate() for _ in range(binds)]
+              generate(tfms[0])
+              generate(tfms[-1])
+
+              if limit and privileged:
+                  # CAP_SYS_RESOURCE is exempt from the cap.
+                  tfms += [instantiate() for _ in range(2)]
+                  generate(tfms[-1])
+              elif limit:
+                  refused()
+
+                  # A refused bind took no slot; closing one frees exactly one.
+                  tfms.pop().close()
+                  tfms.append(instantiate())
+                  generate(tfms[-1])
+                  refused()
+
+                  # A full crypto API count leaves the character device open.
+                  fd = os.open("/dev/jitterentropy", os.O_RDONLY)
+                  assert len(os.read(fd, 32)) == 32
+                  os.close(fd)
+
+              for s in tfms:
+                  s.close()
+              print("OK")
+          '';
+
+          # The loop count bound JENT_IOCLOOPCNT enforces.
+          environment.etc."jitterentropy-loopcnt-test.py".text = ''
+              import errno
+              import fcntl
+              import os
+              import struct
+
+              # From jitterentropy_uapi.h: _IOW('J', 0x02, __u64).
+              JENT_IOCLOOPCNT = 0x40084A02
+              JENT_LOOPCNT_MAX = 1 << 18
+
+              fd = os.open("/sys/kernel/debug/jitter_rng/jent_raw_hires",
+                           os.O_RDONLY)
+
+              # 0 means the configured count.
+              for cnt in (0, 1, JENT_LOOPCNT_MAX):
+                  fcntl.ioctl(fd, JENT_IOCLOOPCNT, struct.pack("=Q", cnt))
+
+              for cnt in (JENT_LOOPCNT_MAX + 1, 1 << 20, (1 << 32) - 1,
+                          1 << 63):
+                  try:
+                      fcntl.ioctl(fd, JENT_IOCLOOPCNT, struct.pack("=Q", cnt))
+                  except OSError as e:
+                      assert e.errno == errno.EINVAL, f"{cnt}: errno {e.errno}"
+                  else:
+                      raise AssertionError(f"loop count {cnt} accepted")
+
+              os.close(fd)
+              print("OK")
+          '';
           # The ISO profile autologs in "nixos"; these are test images.
           services.getty.autologinUser = lib.mkForce "root";
           console.keyMap = "de";
@@ -386,6 +662,10 @@
             # procfs exports, including the per-instance status directory.
             print(machine.succeed("cat /proc/jitterentropy/statistics"))
             print(machine.succeed("cat /proc/jitterentropy/hwrng_status"))
+
+            # The size the machine configuration pins reached the module.
+            out = machine.succeed("cat /proc/jitterentropy/config/flags")
+            assert "max memory size: 32 MB" in " ".join(out.split()), out
 
             # Reading opens an instance; its UUID-named status file appears.
             machine.succeed(
@@ -487,6 +767,189 @@
                          "jitterentropy-chardev-status",
                          "jitterentropy-chardev-fields"):
                 machine.succeed(f"command -v {tool}")
+
+            print(machine.succeed(
+                "python3 /etc/jitterentropy-loopcnt-test.py"
+            ))
+            # The recording tool rejects the same values itself.
+            out = machine.fail("getrawentropy --samples 1 --loopcnt 262145 2>&1")
+            assert "out of range" in out, out
+
+            # The raw noise recording takes a signal per measurement, not
+            # per batch of 1000. Calibrate a loop count slow enough to tell
+            # the two apart.
+            def measurement_ms(loopcnt, samples=1):
+                return int(machine.succeed(
+                    "start=$(date +%s%N); "
+                    f"getrawentropy --samples {samples} --loopcnt {loopcnt}"
+                    " >/dev/null; "
+                    "echo $(( ($(date +%s%N) - start) / 1000000 ))"
+                ).strip())
+
+            loopcnt = 1 << 16
+            while measurement_ms(loopcnt) < 50 and loopcnt < (1 << 18):
+                loopcnt <<= 2
+            per_measurement = measurement_ms(loopcnt)
+            batch = per_measurement * 1000
+            print(f"loopcnt {loopcnt}: {per_measurement} ms per measurement, "
+                  f"{batch} ms per batch of 1000")
+            assert batch > 30000, f"batch of {batch} ms too short to tell"
+
+            answered = int(machine.succeed(
+                "start=$(date +%s%N); "
+                f"timeout -s INT 2 getrawentropy --samples 100000"
+                f" --loopcnt {loopcnt} >/dev/null || true; "
+                "echo $(( ($(date +%s%N) - start) / 1000000 ))"
+            ).strip())
+            print(f"SIGINT answered after {answered} ms")
+            assert answered < 2000 + 4 * per_measurement + 3000, \
+                f"SIGINT answered after {answered} ms, batch is {batch} ms"
+
+            # Documents reporting instance activity are root only; the
+            # configuration files stay world readable.
+            machine.succeed(
+                "test \"$(stat -c %a /proc/jitterentropy/hwrng_status)\" = 400"
+            )
+            machine.succeed(
+                "test \"$(stat -c %a /proc/jitterentropy/statistics)\" = 400"
+            )
+            machine.succeed(
+                "test \"$(stat -c %a /proc/jitterentropy/instances)\" = 500"
+            )
+            for world_readable in ("version",
+                                   "config/flags", "config/flags_raw",
+                                   "config/osr", "config/ntg1", "config/fips",
+                                   "interfaces/kcapi", "interfaces/hwrng",
+                                   "interfaces/chardev", "interfaces/testing"):
+                machine.succeed(
+                    "test \"$(stat -c %a"
+                    f" /proc/jitterentropy/{world_readable})\" = 444"
+                )
+
+            # An unprivileged caller is refused there but can still read the
+            # device. setpriv rather than runuser, which would reset PATH.
+            unpriv = "setpriv --reuid=65534 --regid=65534 --clear-groups"
+            for root_only in ("hwrng_status", "statistics"):
+                out = machine.fail(
+                    f"{unpriv} cat /proc/jitterentropy/{root_only} 2>&1"
+                )
+                assert "Permission denied" in out, out
+            out = machine.fail(f"{unpriv} ls /proc/jitterentropy/instances 2>&1")
+            assert "Permission denied" in out, out
+            machine.succeed(
+                f"test \"$({unpriv} sh -c"
+                " 'head -c 32 /dev/jitterentropy | wc -c')\" = 32"
+            )
+
+            # The per-instance status file likewise.
+            machine.succeed(
+                "exec 3</dev/jitterentropy; "
+                "test \"$(stat -c %a /proc/jitterentropy/instances/*)\" = 400; "
+                f"denied=$({unpriv} sh -c"
+                " 'cat /proc/jitterentropy/instances/*' 2>&1 || true); "
+                "case $denied in *'Permission denied'*) ;; "
+                "*) echo \"$denied\"; exit 1;; esac; "
+                "exec 3<&-"
+            )
+
+            # The concurrent-instance cap.
+            machine.succeed("rmmod jitter_rng")
+            machine.succeed("modprobe jitter_rng max_instances=4")
+            machine.wait_for_file("/dev/jitterentropy")
+            machine.succeed(
+                "test \"$(cat /sys/module/jitter_rng/parameters/max_instances)\""
+                " = 4"
+            )
+            print(machine.succeed(
+                "python3 /etc/jitterentropy-maxinstances-test.py 4"
+            ))
+
+            # An unprivileged caller is held to the cap. It cannot read the
+            # counters, so they are checked here: 4 + 1 admitted opens.
+            before = json.loads(
+                machine.succeed("cat /proc/jitterentropy/statistics")
+            )["charDevice"]
+            print(machine.succeed(
+                f"{unpriv}"
+                " python3 /etc/jitterentropy-maxinstances-test.py 4"
+            ))
+            after = json.loads(
+                machine.succeed("cat /proc/jitterentropy/statistics")
+            )["charDevice"]
+            assert after["openInstances"] == before["openInstances"], after
+            assert after["cumulativeOpens"] == \
+                before["cumulativeOpens"] + 5, after
+
+            # The kernel crypto API cap, reached through AF_ALG. The second
+            # unprivileged run finds every slot of the first released.
+            machine.succeed("test \"$(cat /proc/jitterentropy/interfaces/kcapi)\" = 1")
+            machine.succeed("rmmod jitter_rng")
+            machine.succeed("modprobe jitter_rng max_kcapi_instances=4")
+            machine.wait_for_file("/dev/jitterentropy")
+            machine.succeed(
+                "test \"$(cat"
+                " /sys/module/jitter_rng/parameters/max_kcapi_instances)\" = 4"
+            )
+            print(machine.succeed(
+                "python3 /etc/jitterentropy-maxkcapi-test.py 4"
+            ))
+            for _ in range(2):
+                print(machine.succeed(
+                    f"{unpriv} python3 /etc/jitterentropy-maxkcapi-test.py 4"
+                ))
+
+            # max_memsize pins the memory access region of every instance.
+            machine.succeed("rmmod jitter_rng")
+            machine.succeed("modprobe jitter_rng max_memsize=1024")
+            machine.wait_for_file("/dev/jitterentropy")
+            machine.succeed(
+                "test \"$(cat /sys/module/jitter_rng/parameters/max_memsize)\""
+                " = 1024"
+            )
+            out = machine.succeed("cat /proc/jitterentropy/config/flags")
+            assert "max memory size: 1 MB" in " ".join(out.split()), out
+            machine.succeed("test \"$(head -c 32 /dev/jitterentropy | wc -c)\" = 32")
+
+            # A size the field cannot hold refuses the load.
+            machine.succeed("rmmod jitter_rng")
+            machine.fail("modprobe jitter_rng max_memsize=3")
+            machine.fail("modprobe jitter_rng max_memsize=1048576")
+            # 0 overrides the machine's pinned size with the derivation.
+            machine.succeed("modprobe jitter_rng max_memsize=0")
+            machine.wait_for_file("/dev/jitterentropy")
+            out = machine.succeed("cat /proc/jitterentropy/config/flags")
+            assert "max memory size: auto" in " ".join(out.split()), out
+
+            # An oversampling rate above the maximum refuses the load; the
+            # NTG.1 ceiling itself loads and generates.
+            machine.succeed("rmmod jitter_rng")
+            machine.fail("modprobe jitter_rng osr=100")
+            machine.succeed("modprobe jitter_rng osr=20")
+            machine.wait_for_file("/dev/jitterentropy")
+            machine.succeed("test \"$(cat /proc/jitterentropy/config/osr)\" = 20")
+            machine.succeed("test \"$(head -c 32 /dev/jitterentropy | wc -c)\" = 32")
+
+            # max_instances=0 and max_kcapi_instances=0 are unbounded. 512 kB
+            # per instance, so that three hundred fit into the VM. The crypto
+            # API run is unprivileged, which the default cap would refuse.
+            machine.succeed("rmmod jitter_rng")
+            machine.succeed(
+                "modprobe jitter_rng max_instances=0 max_kcapi_instances=0"
+                " cache_all=0 max_memsize=512"
+            )
+            machine.wait_for_file("/dev/jitterentropy")
+            print(machine.succeed(
+                "python3 /etc/jitterentropy-maxinstances-test.py 0 300"
+            ))
+            print(machine.succeed(
+                f"{unpriv} python3 /etc/jitterentropy-maxkcapi-test.py 0 300"
+            ))
+
+            # Back to the configuration the machine is set up with.
+            machine.succeed("rmmod jitter_rng")
+            machine.succeed("modprobe jitter_rng")
+            machine.wait_for_file("/dev/jitterentropy")
+            machine.succeed("test \"$(head -c 32 /dev/jitterentropy | wc -c)\" = 32")
           '';
         };
 
@@ -705,7 +1168,7 @@
           target = spec.pkgsFor pkgs;
         in target.stdenv.mkDerivation {
           pname = "jitterentropy-efi-${efiArch}";
-          version = "3.7.1";
+          version = jentVersion;
           src = self;
           buildInputs = [ target.gnu-efi ];
           enableParallelBuilding = true;
@@ -863,11 +1326,10 @@
             fail "expected three status documents, one per configuration"
           grep -q '"internalTimer": false' console.txt ||
             fail "the internal timer is reported present in a build without one"
-          # There is no OS random pool to draw an identifier from, so the
-          # library says so rather than inventing one. This is the documented
-          # baremetal shortfall and it is asserted so that it stays documented.
-          grep -q '"uuid": "00000000-0000-0000-0000-000000000000"' console.txt ||
-            fail "expected the nil UUID where no CSPRNG exists"
+          # There is no OS random pool to draw an identifier from, so it is a
+          # version 8 UUID hashed from a counter and the time.
+          grep -Eq '"uuid": "[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",' console.txt ||
+            fail "expected a version 8 UUID where no CSPRNG exists"
           # Secure memory, and it is not a locked page: there is no swap
           # device here, no second process and no core dump, so the property
           # the flag is about holds by construction. A false would mean the
@@ -972,6 +1434,9 @@
             efi = efiFor pkgs "x86_64";
             efi-aarch64 = efiFor pkgs "aarch64";
             android = androidFor system;
+            android-example = androidAppFor system;
+            android-example-emulator =
+              androidEmulatorFor system (androidAppFor system);
             # The module for 32-bit x86, built natively through pkgsi686Linux.
             # Reaches the div64 helpers that stand in for the libgcc division
             # routines the kernel does not provide.
