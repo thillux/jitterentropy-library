@@ -383,10 +383,9 @@ static EFI_STATUS je_collector(const CHAR16 *name, unsigned int flags,
  * a collector whose clock is a counter nothing increments, which would then
  * spin forever on the first measurement rather than return an error.
  *
- * Run last, and that is not arbitrary. A startup that fails clears the
- * process-wide latch recording that the self tests have run, so the next
- * allocation repeats them; harmless, but it would happen underneath the three
- * configurations above and they are what this program is for.
+ * Run last, after the three configurations above that this program is for. A
+ * refused startup leaves the process-wide startup verdicts as they were - a
+ * failure never retracts one - so the order is not needed for correctness.
  */
 static EFI_STATUS je_no_internal_timer(void)
 {

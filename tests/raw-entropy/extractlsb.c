@@ -217,7 +217,8 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	fd = open(argv[2], O_CREAT|O_WRONLY|O_EXCL|O_BINARY, 0777);
+	/* The SP800-90B assessment input: not writable by others. */
+	fd = open(argv[2], O_CREAT|O_WRONLY|O_EXCL|O_BINARY, 0644);
 	if (fd < 0) {
 		fprintf(stderr, "File %s cannot be opened for write: %s\n",
 			argv[2], strerror(errno));

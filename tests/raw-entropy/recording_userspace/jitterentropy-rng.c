@@ -66,10 +66,26 @@ int main(int argc, char * argv[])
 
 	{
 		char *endp;
+		const char *p = argv[1];
 
-		/* Reject non-numeric input instead of treating it as 0. */
-		rounds = strtoull(argv[1], &endp, 10);
-		if (endp == argv[1] || *endp != '\0' || rounds >= ULLONG_MAX) {
+		while (*p == ' ' || *p == '\t')
+			p++;
+
+		/*
+		 * Reject non-numeric input instead of treating it as 0, and a
+		 * sign with it: strtoull() accepts "-5" and wraps it round to
+		 * ULLONG_MAX - 4 with errno clear, so "jitterentropy-rng -5"
+		 * ran for what amounts to forever.
+		 */
+		if (*p == '-' || *p == '+') {
+			fprintf(stderr, "Invalid rounds value %s\n", argv[1]);
+			return 1;
+		}
+
+		errno = 0;
+		rounds = strtoull(p, &endp, 10);
+		if (errno || endp == p || *endp != '\0' ||
+		    rounds >= ULLONG_MAX) {
 			fprintf(stderr, "Invalid rounds value %s\n", argv[1]);
 			return 1;
 		}

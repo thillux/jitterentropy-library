@@ -42,7 +42,6 @@ then
 	mkdir -p $DIR
 fi
 
-#testruns=$(ls $OUTFILE* | wc -l | cut -d" " -f1)
 testruns=$(cat $STATE)
 echo $((testruns+1)) > $STATE
 

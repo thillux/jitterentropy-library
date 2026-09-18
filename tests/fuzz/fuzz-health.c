@@ -104,9 +104,13 @@
  * deterministic, which a fuzzing target has to be or its crashes do not
  * reproduce.
  */
-void jent_random_data(struct rand_data *ec)
+void jent_random_data_recovery(struct rand_data *ec, unsigned int loops)
 {
-	(void)ec;
+	(void)loops;
+
+	/* As tests/health does: leave the window counters as a block would. */
+	ec->rct_mem_ctr = ec->rct_mem_nosr;
+	ec->rct_mem_count = 0;
 }
 
 /* Time stamps per input: enough to cross the APT window several times. */
@@ -169,24 +173,6 @@ static void fh_check_guards(const struct fh_collector *c)
 		assert(c->front[i] == FH_FILL);
 		assert(c->back[i] == FH_FILL);
 	}
-}
-
-/*
- * Window size of the RCT with memory: the number of time deltas the noise
- * source produces for one output block. Mirrors the calculation of
- * JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR in jent_random_data_one(), which is
- * where ec->rct_mem_nosr is established at runtime - as tests/health does,
- * for the same reason: without it the test never enters its window and the
- * fuzzer would never reach it.
- */
-static unsigned short fh_rct_mem_nosr(unsigned int osr)
-{
-	unsigned int nosr = (DATA_SIZE_BITS + ENTROPY_SAFETY_FACTOR) * osr;
-
-	/* Round up to the nearest multiple of three. */
-	nosr = ((nosr + 2) / 3) * 3;
-
-	return (unsigned short)nosr;
 }
 
 /*
@@ -271,8 +257,14 @@ static void fh_init(struct fh_collector *c, const struct fh_config *cfg)
 	if (cfg->fips)
 		c->ec.is_fips_enabled = 1;
 
+	/*
+	 * jent_health_init() establishes the window of the RCT with memory -
+	 * at this collector's own osr and FIPS setting, so the fuzzer drives
+	 * the window the runtime would use. It was recomputed here from a copy
+	 * of the formula while jent_health_init() left it at zero, which kept
+	 * the test out of its window entirely.
+	 */
 	jent_health_init(&c->ec, cfg->inittype);
-	c->ec.rct_mem_nosr = fh_rct_mem_nosr(cfg->osr);
 }
 
 /*
@@ -300,8 +292,11 @@ static uint64_t fh_next_stamp(struct fh_state *s, uint64_t prev, uint64_t *step)
 		return prev + *step;
 	case 3:
 		/* Small steps, where the deltas are drawn from a set small
-		 * enough for the lag predictor to learn. */
-		return prev + (pick % 4);
+		 * enough for the lag predictor to learn. A fresh draw: the
+		 * selector above is pick % 8, so pick % 4 is fixed at 3 in
+		 * this arm and the case was a constant step of 3 - case 1
+		 * over again, and this distribution was never generated. */
+		return prev + (fh_u8(s) % 4);
 	case 4:
 		/* Backwards, which no counter does and jent_delta() has to
 		 * answer for anyway. */

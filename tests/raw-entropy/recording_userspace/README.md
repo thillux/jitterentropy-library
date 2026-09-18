@@ -38,9 +38,7 @@ noise data to be analyzed with the tool set given in `validation-runtime`:
 * `invoke_testing_memloop.sh`: This test tool initializes the Jitter RNG with
   `JENT_NTG1` to obtain the BSI NTG.1 behavior. Its analysis tool is
   `validation-runtime/processdata_memloop.sh`. See [NTG.1 Raw Noise Sources] for
-  details. NOTE: This tool may need to be invoked with root permissions as it
-  attempts to allocate up to 512MB of mlock'ed memory (which typically exceeds
-  the ulimit for a normal user).
+  details.
   
 * `invoke_testing_hashloop.sh`: This test tool initializes the Jitter RNG with
   `JENT_NTG1` to obtain the BSI NTG.1 behavior. Its analysis tool is
@@ -54,21 +52,20 @@ noise data to be analyzed with the tool set given in `validation-runtime`:
   `validation-runtime/processdata_hashloop.sh` and
   `validation-runtime/processdata_memloop.sh`. The goal of the test is to
   analyze the common runtime behavior depending on the selected parameters for
-  the hashloop and memory size. NOTE: This tool may need to be invoked with root
-  permissions as it attempts to allocate up to 512MB of mlock'ed memory (which
-  typically exceeds the ulimit for a normal user).
+  the hashloop and memory size.
 
-The `JENT_NTG1` and `JENT_FORCE_FIPS` modes require the memory of the entropy
+The `JENT_NTG1` and `JENT_FORCE_FIPS` modes require the state of the entropy
 collector to be locked into RAM, i.e. the allocation fails when the operating
-system refuses the lock. How much memory may be locked is not set by the library
-but bounded per process by the operating system: `RLIMIT_MEMLOCK` on POSIX
-systems and the process working set quota on Windows. For these two modes the
-recording tools raise that limit as far as the process is allowed to - see
-`tests/jitterentropy-memlock.h`. Raising the `RLIMIT_MEMLOCK` *hard* limit requires
-privileges, so the large memory sizes (see the notes on root permissions above)
-still need the tool to be invoked as root, whereas the smaller ones now work as
-a normal user; where the limit is not sufficient, the tool reports that the
-Jitter RNG handle cannot be allocated.
+system refuses the lock. The memory access region is not part of that state and
+is never locked, so its size - up to 512MB in the memory size tests - does not
+count against the limit: a collector locks one page of state whatever its memory
+size, plus a page with the internal timer and two while its startup runs, and the
+tools run as a normal user. How much memory may be locked is bounded per
+process by the operating system - `RLIMIT_MEMLOCK` on POSIX systems and the
+process working set quota on Windows - and the recording tools raise it as far
+as the process is allowed to (see `tests/jitterentropy-memlock.h`); where it is
+still not sufficient, the tool reports that the Jitter RNG handle cannot be
+allocated.
 
 ## Core Selection on Hybrid CPUs
 

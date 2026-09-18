@@ -27,21 +27,6 @@
 
 #include "jitterentropy-gcd.h"
 
-// Currently not used
-// #define MAJVERSION 0   /* API / ABI incompatible changes,
-// 			* functional changes that require consumer
-// 			* to be updated (as long as this number is
-// 			* zero, the API is not considered stable
-// 			* and can change without a bump of the
-// 			* major version). */
-// #define MINVERSION 1   /* API compatible, ABI may change,
-// 			* functional enhancements only, consumer
-// 			* can be left unchanged if enhancements are
-// 			* not considered. */
-// #define PATCHLEVEL 0   /* API / ABI compatible, no functional
-// 			* changes, no enhancements, bug fixes
-// 			* only. */
-
 #define ELEM 1000
 #define EXP_GCD 50ULL
 int main(int argc, char *argv[])
