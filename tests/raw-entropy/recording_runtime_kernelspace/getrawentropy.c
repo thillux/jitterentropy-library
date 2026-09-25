@@ -18,11 +18,12 @@
  */
 
 /*
- * Compile for older kernels (< 6.13):
- * gcc -Wall -pedantic -Wextra -I../../.. -I../../../linux_kernel -o getrawentropy getrawentropy.c
- *
- * Compile for newer kernels (>= 6.13):
+ * Compile for the out-of-tree module of linux_kernel/ (the default
+ * --debugfs-file), and for the Jitter RNG of the vanilla kernel >= 6.13:
  * gcc -Wall -pedantic -Wextra -I../../.. -I../../../linux_kernel -DRAW_DATATYPE_U64 -o getrawentropy getrawentropy.c
+ *
+ * Compile for the Jitter RNG of the vanilla kernel < 6.13 only:
+ * gcc -Wall -pedantic -Wextra -I../../.. -I../../../linux_kernel -o getrawentropy getrawentropy.c
  */
 
 #include <sys/types.h>
@@ -50,9 +51,12 @@
 #define JENT_TEST_MEMACCLOOP (1<<16)
 
 /*
- * Starting with Linux kernel version 6.13, the data size changed from u32 to
- * u64 (see crypto/jitterentropy-testing.c:jent_testing_rb). Therefore, starting
- * from this kernel onwards, this tool MUST be compiled with -DRAW_DATATYPE_U64.
+ * The out-of-tree module (linux_kernel/jitterentropy_testing.c) delivers u64
+ * samples only and rejects reads of any other size with EINVAL, so this tool
+ * MUST be compiled with -DRAW_DATATYPE_U64 for it, whatever the kernel
+ * version. The vanilla kernel's interface changed its data size from u32 to
+ * u64 with Linux 6.13 (see crypto/jitterentropy-testing.c:jent_testing_rb):
+ * only for the vanilla kernel before 6.13 compile without it.
  */
 #ifdef RAW_DATATYPE_U64
 
@@ -337,6 +341,7 @@ out:
  * --loopcnt Apply the given loop count value for the operation (i.e. apply it
  *	     to the respecive used noise source(s)) - requires the
  *	     JENT_IOCLOOPCNT ioctl of the out-of-tree module's test interface
+ *	     and is bounded by JENT_LOOPCNT_MAX
  * --max-mem Set the memory size of the memory block used for the memory access
  *	     loop
  * --hashloop Perform the measurement of the hash loop only
@@ -454,13 +459,13 @@ int main(int argc, char * argv[])
 				return 1;
 			}
 
-			/*
-			 * Mirror the bound of the userspace recording tool
-			 * jitterentropy-hashtime (also enforced by the
-			 * JENT_IOCLOOPCNT ioctl).
-			 */
-			if (parse_ulong(argv[1], &val) || val >= UINT_MAX)
+			/* Checked here for a clearer error than EINVAL. */
+			if (parse_ulong(argv[1], &val) ||
+			    val > JENT_LOOPCNT_MAX) {
+				printf("Loop count out of range (maximum %u)\n",
+				       JENT_LOOPCNT_MAX);
 				return 1;
+			}
 			opts.loopcnt = val;
 		} else if (!strncmp(argv[1], "--max-mem", 9)) {
 			unsigned long val;

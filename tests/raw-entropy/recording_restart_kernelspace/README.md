@@ -9,14 +9,17 @@ some 1,000 times to collect these 1,001 event values.
 
 # Test procedure
 
-See boottime_test_record.sh.
+See boottime_test_record.sh. The test applies to the Jitter RNG of the vanilla
+kernel with `CONFIG_CRYPTO_JITTERENTROPY_TESTINTERFACE`, booted with
+`jitterentropy_testing.boot_raw_hires_test=1`.
 
-The result is a matrix where on each line the 1,001 successive time stamps
-of the interrupts for one boot operation are recorded.
+The result is one file per boot operation,
+`/root/results-measurements/jent-raw-noise-restart.<run>.data`, holding the
+1,001 successive time deltas recorded by the Jitter RNG, one per line.
 
-The number of lines equals to the number of reboots.
+The number of files equals the number of reboots.
 
 # Test analysis
 
-Copy the obtained output file into results and process the result by
-invoking validation-restart-*/processdata.sh.
+Copy the obtained files into `results-measurements` and process them by
+invoking `validation-restart/processdata.sh`.
