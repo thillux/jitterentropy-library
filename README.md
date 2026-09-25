@@ -29,11 +29,13 @@ header at configure time, so the two cannot drift apart unnoticed.
 
 # Build Instructions
 
-To generate the shared library `make` followed by `make install`.
+To generate the shared library `make` followed by `make install`, which
+installs the library, its header, the man page and the pkg-config file;
+`make install-static` adds the archive. The CMake package for
+`find_package(jitterentropy)` is installed by the CMake build only.
 
 Besides the Makefile based build system, CMake support is also provided.
-This may eases cross compiling or setting the relevant options for BSI's
-functionality class NTG.1, like:
+This may ease cross compiling or setting build options, like:
 
 ```sh
 cmake -S . -B build -DINTERNAL_TIMER=off -DEXTERNAL_CRYPTO=OPENSSL
@@ -41,9 +43,24 @@ cmake --build build
 ```
 CMake may also be used on platforms like Windows or MacOS to ease compilation.
 
-On Linux you may omit the `EXTERNAL_CRYPTO` setting, as the default
-memory handling implementation already implements secure erase and swap
-prevention.
+Neither option is needed for BSI's functionality class NTG.1 (see
+[AIS 20/31 NTG.1 Compliance](#ais-2031-ntg1-compliance)): the internal timer is
+refused at runtime for `JENT_NTG1` whatever the build, and the secure memory
+NTG.1 requires is provided by the built-in allocator on Linux, FreeBSD, NetBSD,
+OpenBSD, macOS and Windows, which locks the collector state and wipes it on
+release.
+`EXTERNAL_CRYPTO` is only needed for it where that allocator cannot lock
+memory.
+
+A build system of your own has to compile the library without optimization,
+as both provided ones do: `-O0` with GCC and Clang, where
+`src/jitterentropy-base.c` refuses anything else, and `/Od /Ob0` with MSVC,
+where nothing in the source can check it. `/Od` alone is not enough there - an
+explicit `/Ob1` or `/Ob2`, which the usual release configurations carry, still
+inlines into the timed loop - and `/GL` with `/LTCG` must not be used either,
+as it moves code generation into the linker. The CMake build rewrites `/O*`
+to `/Od` and `/Ob*` to `/Ob0` and refuses `/GL`, `/LTCG` and interprocedural
+optimization.
 
 ## Build Options
 
@@ -55,19 +72,22 @@ prevention.
 | `STACK_PROTECTOR` | `ON` | Compile with the stack protector enabled |
 | `AARCH64_NSTIME_REGISTER` | unset | Name of the register `jent_get_nstime()` should read on AArch64 |
 | `ENABLE_SANITIZERS` | `OFF` | Address and undefined behavior sanitizers (development only) |
+| `ENABLE_THREAD_SANITIZER` | `OFF` | Thread sanitizer, which `unit-concurrency` is written for (development only; see `tests/README.md`) |
 | `ENABLE_COVERAGE` | `OFF` | Instrument for code coverage and add the `coverage` target (development only) |
 | `ENABLE_FUZZING` | `OFF` | Instrument for libFuzzer and build the coverage-guided harness under `tests/fuzz` (Clang only, development) |
 | `MOCK_TIMER` | `OFF` | Let the caller replace the time source with a callback (testing only - such a build produces no entropy of its own) |
 | `ENABLE_TOOLS` | `ON` | Build and install the recording and validation tools, which live under `tests/` |
 | `BUILD_TESTING` | `ON` | Build the test programs and register the CTest suite |
+| `INSTALL_MAN` | `ON`, but `OFF` for Windows (MinGW included), Android, iOS/tvOS/watchOS/visionOS, bare metal (`Generic`) and Emscripten | Generate and install the man page and an alias page per function |
+| `JENT_REQUIRE_CUTOFF_CHECK` | `OFF` | Fail the configure instead of skipping `health-cutoff-tables` when python3 with mpmath is missing |
 
 The two are independent. `ENABLE_TOOLS` decides what is installed for a user
 to run - `jitterentropy-rng`, `jitterentropy-osr`, `jitterentropy-hashtime`,
-`getrawentropy`, `extractlsb`, `gcd`, `jitterentropy-health` and the
-`jitterentropy-chardev-*` tools - and `BUILD_TESTING`, the name CMake projects
-conventionally use, decides what CTest is given. Three of the tools are also
-what the suite drives, so they are built whenever either option is on and
-installed only for the first:
+`jitterentropy-cpuinfo`, `getrawentropy`, `extractlsb`, `gcd`,
+`jitterentropy-health` and the `jitterentropy-chardev-*` tools - and
+`BUILD_TESTING`, the name CMake projects conventionally use, decides what CTest
+is given. Three of the tools are also what the suite drives, so they are built
+whenever either option is on and installed only for the first:
 
 ```sh
 cmake -S . -B build -DENABLE_TOOLS=OFF    # the suite, nothing installed but the library
@@ -76,7 +96,8 @@ cmake -S . -B build -DENABLE_TOOLS=OFF -DBUILD_TESTING=OFF   # the library alone
 ```
 
 With both off the install tree is the library, its header, the pkg-config and
-CMake package files and the man page.
+CMake package files, and - where `INSTALL_MAN` is on - the man page with its
+aliases.
 
 Packaging commonly passes `-DBUILD_TESTING=OFF` on its own - the nixpkgs cmake
 hook does - and that is now exactly what it says: the tools keep being built
@@ -94,8 +115,10 @@ ctest --test-dir build --output-on-failure
 ```
 
 The suite has two halves. The deterministic tests - the GCD self test, the unit
-tests for `src/` and `arch/`, and the induced failure tests of the health tests
-- compute over fixed inputs and answer the same everywhere. The entropy
+tests for `src/` and `arch/`, the induced failure tests of the health tests,
+and `exported-symbols`, which reads the built shared library and asserts that
+it exports the functions of `version.lds` and nothing else - compute over
+fixed inputs and answer the same everywhere. The entropy
 generation tests exercise the real noise source and can fail for reasons that
 are properties of the machine rather than defects in the code: a memory lock
 limit lower than the collector needs, or a startup whose health tests do not
@@ -171,18 +194,70 @@ Please keep the following aspects regarding jitterentropy's usage in mind:
 * While jitterentropy is a rather fast noise source, don't expect multiple MB/s or GB/s. Use it as seed
   source for another deterministic RNG if such speeds are needed.
 
-# Android
+# Supported Platforms
 
-To compile the code on Android, use the following Makefile:
+The tiers say how much CI covers a platform and how quickly a breakage there
+is addressed.
 
-arch/android/Android.mk	-- NDK make file template that can be used to directly
-			   compile the CPU Jitter RNG code into Android binaries
+**Tier 1** - the platforms the library is developed against. The test suite
+runs on every push; on Android and iOS CI only builds the example app, so the
+suite is run by hand on a device there. A regression blocks a release.
+
+| Platform | Toolchain/Notes |
+| --- | --- |
+| Linux x86-64 | gcc, clang |
+| Windows x86-64 | MSVC, clang-cl |
+| macOS arm64 | clang |
+
+**Tier 2** - built and tested in CI, but not developed against day to day.
+Breakage is fixed, possibly not immediately.
+
+| Platform | Toolchain/Notes |
+| --- | --- |
+| macOS x86-64 | clang |
+| Linux arm64 | gcc, clang |
+| Linux x86-64 musl, 32 bit | |
+| Linux kernel module | out-of-tree, DKMS and in-tree, every non-EOL kernel.org release |
+| FreeBSD kernel module | built and loaded in a VM |
+| FreeBSD, OpenBSD, NetBSD, DragonFly BSD | in a VM |
+| Windows arm64 | MSVC |
+| Android arm64 | NDK |
+| iOS arm64 | Xcode |
+| Solaris | in a VM |
+| Cygwin, MinGW-w64 | |
+| Freestanding / EFI | x86-64 and aarch64, booted under OVMF |
+
+**Tier 3** - compiled and linked in CI, but not run there, or not covered at
+all. Best effort; a report should come with the compilation errors and/or test
+results from the machine.
+
+| Platform | Toolchain/Notes |
+| --- | --- |
+| Linux s390x, ppc64, riscv64, loongarch64, armv7, i686 | cross-build only |
+| watchOS, tvOS, visionOS | cross-build only |
+| Everything else | no CI |
+
+RISC-V machine mode (M-mode) is currently supported only in the Linux kernel.
+A freestanding build running in M-mode reads the `time` CSR with `rdtime`,
+which traps on cores that do not implement it in hardware, as no SBI below
+M-mode emulates it.
+
+# Android and iOS
+
+The library builds for both with its `CMakeLists.txt`, included into the app's
+own build. `tests/android` and `tests/ios` hold an example app for each that
+does exactly that, with the build commands in their READMEs.
+
+For ndk-build, `tests/android/Android.mk` compiles the library alone into
+Android binaries.
 
 ## Direct CPU instructions
 
 If the high-resolution timer needed by jent_get_nstime is not available
-on your target, add a new branch to arch/jitterentropy-arch-timer.h
-guarded by the appropriate architecture macros.
+on your target, add a new branch to arch/jitterentropy-arch-timer.c: a
+`JENT_ARCH_TIMER_*` selection in its platform detection, guarded by the
+appropriate architecture macros, and the matching branch in
+`jent_get_nstime()`.
 
 # Testing and Entropy Rate Validation
 
@@ -257,7 +332,16 @@ In order for the Jitter RNG to be NTG.1 compliant, the following usage constrain
 
 ### Compilation
 
-No special considerations.
+No special build options. `INTERNAL_TIMER=OFF` is not required: a collector
+allocated with `JENT_NTG1` never uses the internal timer, whether or not it is
+compiled in, and `JENT_NTG1` together with `JENT_FORCE_INTERNAL_TIMER` is
+refused (`jent_entropy_init_ex` returns `ENOTIME`,
+`jent_entropy_collector_alloc` NULL).
+
+`JENT_NTG1` implies `JENT_FORCE_SECURE_MEM`, so the platform has to be able to
+lock the collector state: the built-in allocator does on Linux, FreeBSD,
+NetBSD, OpenBSD, macOS and Windows. Elsewhere build with `EXTERNAL_CRYPTO=LIBGCRYPT` or `OPENSSL`
+and set up their secure memory arena; without either, the allocation fails.
 
 ### Initialization
 
@@ -299,7 +383,7 @@ The following test evidence must be provided to the German BSI for proving the c
 
 	* Common behavior (SP800-90B restart + runtime tests)
 
-- If the selected OSR after applying the methodology is larger than 20, the Jitter RNG cannot be used on the particular system.
+- If the selected OSR after applying the methodology is larger than `JENT_MAX_OSR` - 20 in a default build, the highest oversampling rate the Jitter RNG is allowed to run at - the Jitter RNG cannot be used on the particular system.
 
 # Version Numbers
 
