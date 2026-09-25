@@ -61,7 +61,7 @@ static inline uint64_t jent_rol64(uint64_t x, unsigned int n)
 
 /*********************************** Keccak ***********************************/
 /* state[x + y*5] */
-#define A(x, y) ((x) + 5 * (y))
+#define A(x, y) (x + 5 * y)
 
 static inline void jent_keccakp_theta(uint64_t s[25])
 {
@@ -118,7 +118,7 @@ static inline void jent_keccakp_rho(uint64_t s[25])
 	/* Step 1 */
 	/* s[A(0, 0)] = s[A(0, 0)]; */
 
-#define RHO_ROL(t)	((((t) + 1) * ((t) + 2) / 2) % 64)
+#define RHO_ROL(t)	(((t + 1) * (t + 2) / 2) % 64)
 	/* Step 3 */
 	s[A(1, 0)] = jent_rol64(s[A(1, 0)], RHO_ROL(0));
 	s[A(0, 2)] = jent_rol64(s[A(0, 2)], RHO_ROL(1));
@@ -370,37 +370,12 @@ void jent_sha3_final(struct jent_sha_ctx *ctx, uint8_t *digest)
 	 *   have a loop around the jent_keccakp_1600 / copy out loop below
 	 *
 	 * * the requested digest size must be multiples of uint64_t
-	 *
-	 * digestsize is a uint8_t, whose integral promotion makes the division
-	 * below a signed int; the cast keeps both sides of the comparison
-	 * unsigned (MSVC /W4 warns C4018 about the mismatch otherwise).
 	 */
 	for (i = 0; i < (unsigned int)ctx->digestsize / 8; i++, digest += 8)
 		le64_to_ptr(digest, ctx->state[i]);
 
 	memset(ctx->partial, 0, ctx->r);
 	jent_sha3_init(ctx);
-}
-
-int jent_sha3_alloc(void **hash_state, unsigned int flags)
-{
-	struct jent_sha_ctx *tmp;
-
-	tmp = jent_zalloc(JENT_SHA_MAX_CTX_SIZE, flags);
-	if (!tmp)
-		return 1;
-
-	*hash_state = tmp;
-
-	return 0;
-}
-
-void jent_sha3_dealloc(void *hash_state)
-{
-	struct jent_sha_ctx *ctx = (struct jent_sha_ctx *)hash_state;
-
-	if (ctx)
-		jent_zfree(ctx, JENT_SHA_MAX_CTX_SIZE);
 }
 
 /*********************************** XDRBG ************************************/
@@ -421,8 +396,7 @@ static void jent_xdrbg256_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
 	 * XDRBG:
 	 * 512 Bit for next state (internal memory) || 256 Bit output for user
 	 */
-	uint8_t jent_block_next_state[JENT_XDRBG_SIZE_STATE +
-				      JENT_SHA3_256_SIZE_DIGEST];
+	uint8_t *jent_block_next_state = ctx->xdrbg_block;
 	uint8_t encode;
 
 	/* Checking the output size */
@@ -432,13 +406,13 @@ static void jent_xdrbg256_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
 	 * rate-size block. See the comments in the squeeze operation for
 	 * details
 	 */
-	JENT_BUILD_BUG_ON(JENT_SHA3_256_SIZE_BLOCK < sizeof(jent_block_next_state));
+	JENT_BUILD_BUG_ON(JENT_SHA3_256_SIZE_BLOCK < sizeof(ctx->xdrbg_block));
 	/*
 	 * The squeeze operation is limited to return multiples of uint64_t -
 	 * verify all set_digestsize values.
 	 */
 	JENT_BUILD_BUG_ON(JENT_XDRBG_SIZE_STATE % sizeof(uint64_t));
-	JENT_BUILD_BUG_ON(sizeof(jent_block_next_state) % sizeof(uint64_t));
+	JENT_BUILD_BUG_ON(sizeof(ctx->xdrbg_block) % sizeof(uint64_t));
 
 	/* The final operation automatically re-initializes the ->hash_state */
 
@@ -477,7 +451,7 @@ static void jent_xdrbg256_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
 	 * Request a full block irrespective of the output size due to
 	 * Keccak squeeze implementation limitation.
 	 */
-	jent_shake256_set_digestsize(ctx, sizeof(jent_block_next_state));
+	jent_shake256_set_digestsize(ctx, sizeof(ctx->xdrbg_block));
 	jent_sha3_final(ctx, jent_block_next_state);
 
 	/* Return Σ to the caller truncated to the requested size */
@@ -496,7 +470,7 @@ static void jent_xdrbg256_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
 	 */
 	jent_sha3_update(ctx, jent_block_next_state, JENT_XDRBG_SIZE_STATE);
 	jent_memset_secure(jent_block_next_state,
-			   sizeof(jent_block_next_state));
+			   sizeof(ctx->xdrbg_block));
 }
 
 void jent_drbg_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
@@ -509,12 +483,10 @@ void jent_drbg_generate_block(struct jent_sha_ctx *ctx, uint8_t *dst,
 
 /*
  * The SHAKE-256 support is only needed to support the XDRBG. Therefore, it is
- * implicitly self-tested with the XDRBG-256 self test. Yet, this self-test
- * code for SHAKE-256 is left in here to allow implementors to activate it at
- * their discretion. Furthermore it provides an example how to invoke the
- * Keccak operation as a SHAKE-256 for testing and analysis.
+ * implicitly self-tested with the XDRBG-256 self test. Yet, it is tested on its
+ * own to report a fault in the XOF as such. Furthermore it provides an example
+ * how to invoke the Keccak operation as a SHAKE-256 for testing and analysis.
  */
-#if 0
 static int jent_shake256_tester(void)
 {
 	HASH_CTX_ON_STACK(ctx);
@@ -527,7 +499,7 @@ static int jent_shake256_tester(void)
 				       0x9d, 0x0e, 0xca, 0xf5, 0x38, 0x30, 0xa1,
 				       0x92, 0x87, 0xe0, 0xb3, 0x6e, 0xce, 0x48,
 				       0x82, 0xeb, 0x58, 0x0b, 0x78, 0x5c, 0x1d,
-				       0xef, 0x2d, 0xe5, 0xaa, 0x6c };
+				       0xef, 0x2d, 0xe5, 0xaa };
 	uint8_t act[sizeof(exp)] = { 0 };
 	unsigned int i;
 
@@ -543,7 +515,6 @@ static int jent_shake256_tester(void)
 
 	return 0;
 }
-#endif
 
 static int jent_xdrbg256_tester(void)
 {
@@ -606,9 +577,43 @@ static int jent_sha3_256_tester(void)
 	return 0;
 }
 
+/* SHA3-256 over more than one block, covering the block loop and carry. */
+static int jent_sha3_256_multiblock_tester(void)
+{
+	HASH_CTX_ON_STACK(ctx);
+	static const uint8_t exp[] = {
+		0x94, 0xD4, 0xB5, 0x9A, 0xE2, 0x33, 0xF9, 0x22, 0x30, 0x66,
+		0x1D, 0xD5, 0x57, 0x12, 0x2E, 0x6E, 0x3E, 0x33, 0xBD, 0x10,
+		0x28, 0xB4, 0x46, 0x34, 0x0E, 0xC0, 0x47, 0xC4, 0x67, 0x5C,
+		0x09, 0x56
+	};
+	uint8_t msg[JENT_SHA3_256_SIZE_BLOCK + 1];
+	uint8_t act[sizeof(exp)] = { 0 };
+	unsigned int i;
+
+	for (i = 0; i < sizeof(msg); i++)
+		msg[i] = (uint8_t)(i * 7 + 3);
+
+	jent_sha3_256_init(&ctx);
+	jent_sha3_update(&ctx, msg, sizeof(msg));
+	jent_sha3_update(&ctx, msg, JENT_SHA3_256_SIZE_BLOCK);
+	jent_sha3_final(&ctx, act);
+
+	for (i = 0; i < sizeof(exp); i++) {
+		if (exp[i] != act[i])
+			return 1;
+	}
+
+	return 0;
+}
+
 int jent_sha3_tester(void)
 {
 	if (jent_sha3_256_tester())
+		return 1;
+	if (jent_sha3_256_multiblock_tester())
+		return 1;
+	if (jent_shake256_tester())
 		return 1;
 	return jent_xdrbg256_tester();
 }

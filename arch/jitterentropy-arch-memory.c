@@ -47,27 +47,15 @@
  */
 
 /*
- * MAP_ANONYMOUS, MAP_ANON and madvise()/MADV_DONTDUMP are all __USE_MISC on
- * glibc, so a strict -std=c11 - which the Makefile uses - hides them. Current
- * glibc happens to define MAP_ANONYMOUS unconditionally, which is why this was
- * only noticed on glibc 2.17 (RHEL 7), where neither spelling exists and the
- * MAP_ANON fallback below expands to an undeclared identifier.
- *
- * _DEFAULT_SOURCE is the modern spelling and _BSD_SOURCE the one glibc before
- * 2.19 understands; both are defined because 2.17 ignores the former and
- * everything from 2.20 on warns about the latter unless the former is present
- * too. Defined here rather than in the public jitterentropy.h so the header
- * imposes no feature-test macro on consumers; they must precede every system
- * header. Same reasoning as arch/jitterentropy-arch-timer.c.
+ * The feature-test macros that make glibc declare MAP_ANONYMOUS, MAP_ANON and
+ * madvise()/MADV_DONTDUMP - all __USE_MISC, and so hidden by the strict
+ * -std=c11 the Makefile uses. Current glibc happens to define MAP_ANONYMOUS
+ * unconditionally, which is why this was only noticed on glibc 2.17 (RHEL 7),
+ * where neither spelling exists and the MAP_ANON fallback below expands to an
+ * undeclared identifier. Must be the first line: they have to precede every
+ * system header.
  */
-#if defined(__linux__)
-# ifndef _DEFAULT_SOURCE
-#  define _DEFAULT_SOURCE
-# endif
-# ifndef _BSD_SOURCE
-#  define _BSD_SOURCE
-# endif
-#endif
+#include "jitterentropy-arch-compat.h"
 
 #include "jitterentropy.h"
 #include "jitterentropy-internal.h"
@@ -95,6 +83,8 @@
  */
 #ifdef LINUX_KERNEL
 # define JENT_ARCH_MEM_LINUX_KERNEL
+#elif defined(_KERNEL) && defined(__FreeBSD__)
+# define JENT_ARCH_MEM_FREEBSD_KERNEL
 #elif defined(JENT_BAREMETAL)
 /*
  * Neither backend: there is no kernel here to ask for a locked page, and no
@@ -121,7 +111,17 @@
 #include <linux/slab.h>		/* GFP_KERNEL */
 #include <linux/string.h>	/* memset() */
 
-#else /* JENT_ARCH_MEM_LINUX_KERNEL */
+#elif defined(JENT_ARCH_MEM_FREEBSD_KERNEL)
+
+#include <sys/param.h>
+#include <sys/systm.h>		/* explicit_bzero() */
+#include <sys/kernel.h>		/* MALLOC_DEFINE() */
+#include <sys/malloc.h>		/* malloc(9), zfree(9) */
+
+static MALLOC_DEFINE(M_JITTERENTROPY, "jitterentropy",
+		     "Jitter RNG entropy collector state");
+
+#else /* JENT_ARCH_MEM_LINUX_KERNEL / JENT_ARCH_MEM_FREEBSD_KERNEL */
 
 #include <stdlib.h>
 #include <string.h>
@@ -144,7 +144,7 @@
 # include <unistd.h>	/* sysconf() */
 #endif
 
-#endif /* JENT_ARCH_MEM_LINUX_KERNEL */
+#endif /* JENT_ARCH_MEM_LINUX_KERNEL / JENT_ARCH_MEM_FREEBSD_KERNEL */
 
 /*
  * Whether the active backend provides secure (locked / wiped) memory. This
@@ -157,6 +157,12 @@
    * core dumps and is wiped on free via kvfree_sensitive().
    */
 # define JENT_MEM_SECURE
+#elif defined(JENT_ARCH_MEM_FREEBSD_KERNEL)
+  /*
+   * The same holds for malloc(9) memory, which is wired, and zfree(9) wipes
+   * it on release.
+   */
+# define JENT_MEM_SECURE
 #elif defined(LIBGCRYPT) || defined(OPENSSL)
 # define JENT_MEM_SECURE
   /*
@@ -165,6 +171,11 @@
    * it can run out. Either way the allocation comes back from the regular
    * heap, which is the one thing that is not secure memory.
    */
+# define JENT_MEM_SECURE_ON_REQUEST
+#elif defined(AWSLC) &&						      \
+      (defined(JENT_ARCH_MEM_WINDOWS) || defined(JENT_ARCH_MEM_POSIX_MLOCK))
+  /* AWS-LC allocates and wipes, the operating system lock is added here. */
+# define JENT_MEM_SECURE
 # define JENT_MEM_SECURE_ON_REQUEST
 #elif defined(AWSLC)
   /* AWS-LC memory is wiped but not locked; not advertised as secure. */
@@ -197,10 +208,9 @@
  * JENT_MEM_SECURE_ON_REQUEST marks the backends whose secure memory can be
  * denied at runtime: the memory lock the environment refuses, and the arena
  * the application did not provide. Only there does JENT_FORCE_SECURE_MEM
- * have a meaning - it turns that denial from a silent fallback to
- * unprotected memory into a failed allocation. The Linux kernel and the
- * baremetal backends cannot be denied and AWS-LC never claimed to be secure,
- * so none of them consults the flag.
+ * turn that denial from a silent fallback to unprotected memory into a failed
+ * allocation. The kernel and the baremetal backends cannot be denied, so
+ * none consults the flag - they satisfy it by construction.
  */
 
 int jent_secure_memory_supported(void)
@@ -236,16 +246,31 @@ void jent_memset_secure(void *s, size_t n)
 {
 #if defined(JENT_ARCH_MEM_LINUX_KERNEL)
 	memzero_explicit(s, n);
+#elif defined(JENT_ARCH_MEM_FREEBSD_KERNEL)
+	explicit_bzero(s, n);
 #elif defined(AWSLC) || defined(OPENSSL)
 	OPENSSL_cleanse(s, n);
 #elif defined(JENT_ARCH_MEM_WINDOWS)
 	SecureZeroMemory(s, n);
+#elif defined(_MSC_VER) && !defined(__clang__)
+	/*
+	 * MSVC without <windows.h> - a JENT_BAREMETAL build, firmware among
+	 * them - and so without SecureZeroMemory(). Neither has it the inline
+	 * assembly barrier below, so the stores are made volatile instead,
+	 * which is what SecureZeroMemory() itself does.
+	 */
+	volatile unsigned char *p = (volatile unsigned char *)s;
+
+	while (n--)
+		*p++ = 0;
 #else
 	memset(s, 0, n);
 	__asm__ __volatile__("" : : "r" (s) : "memory");
 #endif
 }
 
+/* libgcrypt and OpenSSL place secure memory themselves. */
+#if !defined(LIBGCRYPT) && !defined(OPENSSL)
 #ifdef JENT_ARCH_MEM_WINDOWS
 static size_t jent_pagesize(void)
 {
@@ -269,6 +294,7 @@ static size_t jent_pagesize(void)
 	return (page_size <= 0) ? 4096 : (size_t)page_size;
 }
 #endif /* JENT_ARCH_MEM_POSIX_MLOCK */
+#endif /* !LIBGCRYPT && !OPENSSL */
 
 #ifdef JENT_ARCH_MEM_LINUX_KERNEL
 
@@ -276,7 +302,18 @@ void *jent_zalloc(size_t len, unsigned int flags)
 {
 	/* Kernel memory is not paged out, so there is nothing to relax. */
 	(void)flags;
-	return kvzalloc(len, GFP_KERNEL);
+
+	/*
+	 * Charged to the caller's memory cgroup: every open of the character
+	 * device allocates a collector of up to 512 MB.
+	 */
+	return kvzalloc(len, GFP_KERNEL_ACCOUNT);
+}
+
+/* Kernel memory is not locked: the same allocation as above. */
+void *jent_zalloc_unlocked(size_t len)
+{
+	return jent_zalloc(len, 0);
 }
 
 void jent_zfree(void *ptr, size_t len)
@@ -288,15 +325,55 @@ void jent_zfree(void *ptr, size_t len)
 	kvfree_sensitive(ptr, len);
 }
 
-#else /* !JENT_ARCH_MEM_LINUX_KERNEL */
+#elif defined(JENT_ARCH_MEM_FREEBSD_KERNEL)
 
 void *jent_zalloc(size_t len, unsigned int flags)
 {
+	/* Kernel memory is not paged out, so there is nothing to relax. */
+	(void)flags;
+
+	/*
+	 * M_NOWAIT fails rather than sleep: a collector takes up to 512 MB
+	 * and the health test recovery doubles it from within a read, which
+	 * M_WAITOK would stall indefinitely under memory pressure and confine
+	 * to a sleepable context. The callers handle the NULL as ENOMEM, as
+	 * with kvzalloc() on Linux.
+	 */
+	return malloc(len, M_JITTERENTROPY, M_NOWAIT | M_ZERO);
+}
+
+/* Kernel memory is not locked: the same allocation as above. */
+void *jent_zalloc_unlocked(size_t len)
+{
+	return jent_zalloc(len, 0);
+}
+
+void jent_zfree(void *ptr, size_t len)
+{
+	/* See the NULL guard of the userspace variant below. */
+	if (!ptr)
+		return;
+
+	/* zfree(9) wipes the whole allocation, which covers @len. */
+	(void)len;
+	zfree(ptr, M_JITTERENTROPY);
+}
+
+#else /* !JENT_ARCH_MEM_LINUX_KERNEL && !JENT_ARCH_MEM_FREEBSD_KERNEL */
+
+/*
+ * @secure asks for the lock or the secure arena, and only then is @flags
+ * consulted. Zeroing, guard pages and dump exclusion are the same either way,
+ * so jent_zfree() releases both kinds.
+ */
+static void *jent_zalloc_common(size_t len, unsigned int flags, int secure)
+{
 	void *tmp = NULL;
 
-#ifndef JENT_MEM_SECURE_ON_REQUEST
-	/* Only a backend that can be denied secure memory reads the flag. */
+#if !defined(JENT_MEM_SECURE_ON_REQUEST) && !defined(AWSLC)
+	/* Only a backend that can be denied secure memory reads these. */
 	(void)flags;
+	(void)secure;
 #endif
 
 #ifdef LIBGCRYPT
@@ -314,8 +391,14 @@ void *jent_zalloc(size_t len, unsigned int flags)
 	 * invokes libgcrypt's fatal out-of-core handler when the secmem pool
 	 * is exhausted, terminating the host process from inside the library.
 	 * The NULL return is handled by all callers.
+	 *
+	 * gcry_malloc_secure() wraps a length near SIZE_MAX around into a
+	 * small block, so such a length is refused here.
 	 */
-	tmp = gcry_malloc_secure(len);
+	if (len > SIZE_MAX / 2)
+		return NULL;
+	if (secure)
+		tmp = gcry_malloc_secure(len);
 
 	/*
 	 * Check that the memory really came out of the pool. libgcrypt returns
@@ -336,7 +419,91 @@ void *jent_zalloc(size_t len, unsigned int flags)
 	if (!tmp && !(flags & JENT_FORCE_SECURE_MEM))
 		tmp = gcry_malloc(len);
 
+#elif defined(AWSLC) &&						      \
+      (defined(JENT_ARCH_MEM_WINDOWS) || defined(JENT_ARCH_MEM_POSIX_MLOCK))
+
+	{
+		/*
+		 * AWS-LC has no secure allocator, so the lock is added around
+		 * OPENSSL_malloc(). The payload starts on a page boundary
+		 * inside the allocation and ends before it does, so the pages
+		 * locked and excluded from core dumps are shared with no other
+		 * heap allocation, and jent_zfree() can unlock them without
+		 * unlocking a neighbor. The allocation's own pointer is kept
+		 * in the slot right before the payload.
+		 */
+		size_t page_size = jent_pagesize();
+		size_t payload, total;
+		void *base;
+
+		if (len > SIZE_MAX - 2 * page_size - sizeof(void *))
+			return NULL;
+		payload = (len + page_size - 1) & ~(page_size - 1);
+		total = payload + page_size + sizeof(void *);
+
+		base = OPENSSL_malloc(total);
+		if (!base)
+			return NULL;
+
+		tmp = (void *)(((uintptr_t)base + sizeof(void *) +
+				page_size - 1) & ~(uintptr_t)(page_size - 1));
+		memcpy((uint8_t *)tmp - sizeof(void *), &base, sizeof(base));
+
+# ifdef JENT_ARCH_MEM_POSIX_MLOCK
+#  if defined(MADV_DONTDUMP)
+		madvise(tmp, payload, MADV_DONTDUMP);
+#  elif defined(MADV_NOCORE)
+		madvise(tmp, payload, MADV_NOCORE);
+#  endif
+
+		/* Tolerated errors: those of the mmap() backend below. */
+		if (secure && payload && mlock(tmp, payload) &&
+		    ((flags & JENT_FORCE_SECURE_MEM) ||
+		     (errno != EPERM && errno != ENOMEM && errno != EAGAIN))) {
+			/*
+			 * The heap keeps these pages: unlocked (a failed
+			 * mlock() may have locked part of them) and dumpable
+			 * again, as jent_zfree() leaves them.
+			 */
+			munlock(tmp, payload);
+#  if defined(MADV_DODUMP)
+			madvise(tmp, payload, MADV_DODUMP);
+#  elif defined(MADV_CORE)
+			madvise(tmp, payload, MADV_CORE);
+#  endif
+			OPENSSL_free(base);
+			return NULL;
+		}
+# else
+		if (secure && payload && !VirtualLock(tmp, payload) &&
+		    (flags & JENT_FORCE_SECURE_MEM)) {
+			OPENSSL_free(base);
+			return NULL;
+		}
+# endif
+	}
+
 #elif defined(AWSLC)
+
+	/*
+	 * AWS-LC has no secure allocator: OPENSSL_malloc() is ordinary heap
+	 * that AWS-LC wipes on release. It is not locked, not guard-paged and
+	 * not excluded from a core dump, and jent_secure_memory_supported()
+	 * says so.
+	 *
+	 * So a caller that made secure memory a condition of the allocation is
+	 * told no. It used to be handed this memory instead, which is the one
+	 * outcome JENT_FORCE_SECURE_MEM exists to rule out - and silently, on a
+	 * flag the compliance modes set for the caller (see
+	 * jent_update_secure_mem()), so a JENT_FORCE_FIPS or JENT_NTG1 collector
+	 * on an AWS-LC build kept its entropy pool, SHA-3 state and health test
+	 * state in swappable memory while the header promised the allocation
+	 * would fail rather than let that happen.
+	 *
+	 * Only reached where the platform has no memory lock to add.
+	 */
+	if (secure && (flags & JENT_FORCE_SECURE_MEM))
+		return NULL;
 
 	tmp = OPENSSL_malloc(len);
 
@@ -349,7 +516,7 @@ void *jent_zalloc(size_t len, unsigned int flags)
 	 * knows what else in the process allocates from it - see
 	 * arch/jitterentropy-arch-memory.h. Only its presence is checked.
 	 */
-	if (CRYPTO_secure_malloc_initialized())
+	if (secure && CRYPTO_secure_malloc_initialized())
 		tmp = OPENSSL_secure_malloc(len);
 	/*
 	 * If secure memory was not available, OpenSSL falls back to "normal"
@@ -409,11 +576,10 @@ void *jent_zalloc(size_t len, unsigned int flags)
 		 *
 		 * VirtualLock() charges its pages against the process
 		 * *minimum* working set and fails with ERROR_WORKING_SET_QUOTA
-		 * once that budget is exhausted. The default minimum is
-		 * smaller than the memory block of a collector asking for a
-		 * large size (a JENT_CACHE_ALL one most visibly), so with
-		 * JENT_FORCE_SECURE_MEM such an allocation fails unless the
-		 * quota was raised beforehand.
+		 * once that budget is exhausted. A collector locks one page of
+		 * state (its memory access region is not locked), one more
+		 * with the internal timer and two more while its startup runs,
+		 * so the 200 kB default holds some 44 collectors.
 		 *
 		 * Raising it here is deliberately not done: the working set
 		 * limits are process-wide state, extending them evicts what
@@ -422,7 +588,7 @@ void *jent_zalloc(size_t len, unsigned int flags)
 		 * RLIMIT_MEMLOCK is on the POSIX path below; the test programs
 		 * raise both in tests/jitterentropy-memlock.h.
 		 */
-		if (!VirtualLock(tmp, payload) &&
+		if (secure && !VirtualLock(tmp, payload) &&
 		    (flags & JENT_FORCE_SECURE_MEM)) {
 			VirtualFree(base, 0, MEM_RELEASE);
 			return NULL;
@@ -538,7 +704,7 @@ void *jent_zalloc(size_t len, unsigned int flags)
 		 * The mapping itself is unaffected by the flag, so
 		 * jent_zfree() needs no knowledge of it.
 		 */
-		if (mlock(tmp, len) &&
+		if (secure && mlock(tmp, len) &&
 		    ((flags & JENT_FORCE_SECURE_MEM) ||
 		     (errno != EPERM && errno != ENOMEM && errno != EAGAIN))) {
 			munmap(base, total);
@@ -555,6 +721,16 @@ void *jent_zalloc(size_t len, unsigned int flags)
 	if (tmp != NULL)
 		jent_memset_secure(tmp, len);
 	return tmp;
+}
+
+void *jent_zalloc(size_t len, unsigned int flags)
+{
+	return jent_zalloc_common(len, flags, 1);
+}
+
+void *jent_zalloc_unlocked(size_t len)
+{
+	return jent_zalloc_common(len, 0, 0);
 }
 
 void jent_zfree(void *ptr, size_t len)
@@ -580,6 +756,45 @@ void jent_zfree(void *ptr, size_t len)
 	if (!gcry_is_secure(ptr))
 		jent_memset_secure(ptr, len);
 	gcry_free(ptr);
+
+#elif defined(AWSLC) &&						      \
+      (defined(JENT_ARCH_MEM_WINDOWS) || defined(JENT_ARCH_MEM_POSIX_MLOCK))
+
+	{
+		/* Mirror the layout of jent_zalloc(). */
+		size_t page_size = jent_pagesize();
+		size_t payload = (len + page_size - 1) & ~(page_size - 1);
+		void *base;
+
+		memcpy(&base, (uint8_t *)ptr - sizeof(void *), sizeof(base));
+
+		/*
+		 * Wiped while still locked. Unlocking pages the allocation did
+		 * not lock does nothing, so the free path needs no flag.
+		 */
+		jent_memset_secure(ptr, len);
+# ifdef JENT_ARCH_MEM_POSIX_MLOCK
+		/*
+		 * Locks do not nest: under an application's mlockall() this
+		 * unlocks heap pages the application meant to stay locked.
+		 * Not unlocking would leak the lock quota on every free, and
+		 * which lock a page holds cannot be told apart here.
+		 */
+		if (payload)
+			munlock(ptr, payload);
+		/* The heap hands these pages out again. */
+#  if defined(MADV_DODUMP)
+		madvise(ptr, payload, MADV_DODUMP);
+#  elif defined(MADV_CORE)
+		madvise(ptr, payload, MADV_CORE);
+#  endif
+# else
+		if (payload)
+			VirtualUnlock(ptr, payload);
+# endif
+		/* OPENSSL_free() wipes the whole allocation. */
+		OPENSSL_free(base);
+	}
 
 #elif defined(AWSLC)
 
@@ -654,4 +869,4 @@ void jent_zfree(void *ptr, size_t len)
 #endif
 }
 
-#endif /* JENT_ARCH_MEM_LINUX_KERNEL */
+#endif /* JENT_ARCH_MEM_LINUX_KERNEL / JENT_ARCH_MEM_FREEBSD_KERNEL */

@@ -22,15 +22,11 @@
 #include "jitterentropy-internal.h"
 
 #ifdef LINUX_KERNEL
-/*
- * Do not rely on transitive includes for the string helpers: snprintf() and
- * strlen()/memcpy() live in <linux/kernel.h> (which pulls in the sprintf
- * declarations across the supported kernel range) and <linux/string.h>. This
- * file is not part of the -O0 entropy core, so the heavier headers are safe
- * here.
- */
 #include <linux/kernel.h>
 #include <linux/string.h>
+#elif defined(_KERNEL) && defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/systm.h>
 #else
 #include <stdio.h>
 #endif
@@ -44,25 +40,22 @@
 int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 {
 	size_t used;
+	int written, truncated = 0;
 
 	if (!buf || buflen == 0)
 		return -1;
 
-	/*
-	 * Append to what is already in @buf, stopping once it is full.
-	 *
-	 * The guard is "used + 1 < buflen", not "used < buflen": snprintf()
-	 * always terminates within the size it is given, so strlen(buf) never
-	 * reaches buflen and the latter would be true at every call site
-	 * below, walking the rest of the document one useless snprintf() at a
-	 * time. The output is the same either way - an snprintf() with a size
-	 * of one writes only the NUL that is already there.
-	 */
+	/* Truncation is taken from snprintf(), the length cannot tell it. */
 	#define jent_add_to_status(...)					\
 	{								\
 		used = strlen(buf);					\
-		if (used + 1 < buflen)					\
-			snprintf(buf + used, buflen - used, __VA_ARGS__);\
+		if (used < buflen) {					\
+			written = snprintf(buf + used, buflen - used,	\
+					   __VA_ARGS__);		\
+			if (written < 0 ||				\
+			    (size_t)written >= buflen - used)		\
+				truncated = 1;				\
+		}							\
 	}
 
 	/* needed as plain snprintf to make jent_add_to_status len calculation usable */
@@ -72,23 +65,15 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 			   JENT_MAJVERSION, JENT_MINVERSION, JENT_PATCHLEVEL)
 
 	if (!ec) {
-		/*
-		 * Terminate the version line without the field separator: a
-		 * trailing comma before the closing brace is invalid JSON.
-		 */
+		/* No trailing comma before the closing brace. */
 		jent_add_to_status("\n")
 		goto out;
 	}
 
-	/* stable per-instance identifier */
 	jent_add_to_status(",\n\t\"uuid\": \"%s\",\n", ec->uuid);
 
-	/* number of reinitializations (reallocations on health-test recovery) */
 	jent_add_to_status("\t\"reinitializations\": %u,\n", ec->reinit_count);
 
-	/*
-	 * output accounting over the instance's lifetime
-	 */
 	jent_add_to_status("\t\"output\": {\n");
 	jent_add_to_status("\t\t\"invocations\": %llu,\n",
 			   (unsigned long long)ec->read_invocations);
@@ -139,6 +124,10 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 
 	jent_add_to_status("\t},\n");
 
+	jent_add_to_status("\t\"selftestFailed\": %s,\n",
+			   jent_atomic_load_int(&ec->selftest_failed) ?
+			   "true" : "false");
+
 	/*
 	 * runtime environment
 	 */
@@ -147,8 +136,10 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 	jent_add_to_status("\t\t\"cpuCores\": %ld,\n", jent_ncpu());
 
 	jent_add_to_status("\t\t\"cpuCache\": {\n");
-	jent_add_to_status("\t\t\t\"l1Bytes\": %u,\n", jent_cache_size_roundup(0));
-	jent_add_to_status("\t\t\t\"allBytes\": %u\n", jent_cache_size_roundup(1));
+	jent_add_to_status("\t\t\t\"l1Bytes\": %llu,\n",
+			   (unsigned long long)jent_cache_size_roundup(0));
+	jent_add_to_status("\t\t\t\"allBytes\": %llu\n",
+			   (unsigned long long)jent_cache_size_roundup(1));
 	jent_add_to_status("\t\t}\n");
 	jent_add_to_status("\t},\n");
 
@@ -158,11 +149,16 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 	jent_add_to_status( "\t\"configuration\": {\n");
 
 	jent_add_to_status( "\t\t\"osr\": %u,\n", ec->osr);
-	jent_add_to_status( "\t\t\"memoryBlockSizeBytes\": %u,\n", jent_memsize(ec->flags));
+	jent_add_to_status( "\t\t\"osrMin\": %u,\n",
+			   (unsigned int)JENT_MIN_OSR);
+	jent_add_to_status( "\t\t\"osrMax\": %u,\n",
+			   (unsigned int)JENT_MAX_OSR);
+	jent_add_to_status( "\t\t\"memoryBlockSizeBytes\": %u,\n",
+			   ec->memmask ? (unsigned int)(ec->memmask + 1) : 0);
 
 	jent_add_to_status("\t\t\"hashLoopCount\": {\n");
-	jent_add_to_status("\t\t\t\"runtime\": %u,\n", jent_hashloop_cnt(ec->flags));
-	jent_add_to_status("\t\t\t\"initialization\": %u\n", jent_hashloop_cnt(ec->flags) * JENT_HASH_LOOP_INIT);
+	jent_add_to_status("\t\t\t\"runtime\": %u,\n", ec->hashloopcnt);
+	jent_add_to_status("\t\t\t\"initialization\": %u\n", ec->hashloopcnt * JENT_HASH_LOOP_INIT);
 	jent_add_to_status("\t\t},\n");
 
 	jent_add_to_status("\t\t\"memoryLoopCount\": {\n");
@@ -172,12 +168,6 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 
 	jent_add_to_status("\t\t\"secureMemory\": %s,\n", jent_memory_is_secure(ec->flags) ? "true" : "false");
 	jent_add_to_status("\t\t\"internalTimer\": %s,\n", ec->enable_notime ? "true" : "false");
-	/*
-	 * Whether this build can have its time source replaced by the caller -
-	 * a property of the build, not of whether a callback is registered
-	 * right now, as a status taken between two replays would otherwise
-	 * claim nothing was ever mocked.
-	 */
 #ifdef JENT_CONF_ENABLE_MOCK_TIMER
 	jent_add_to_status("\t\t\"mockedTimerBuild\": true,\n");
 	jent_add_to_status("\t\t\"mockedTimerActive\": %s,\n",
@@ -209,8 +199,7 @@ int jent_status(const struct rand_data *ec, char *buf, size_t buflen)
 out:
 	jent_add_to_status("}\n");
 
-	used = strlen(buf);
-	return (used >= buflen - 1) ? -1 : 0;
+	return truncated ? -1 : 0;
 #undef jent_add_to_status
 }
 

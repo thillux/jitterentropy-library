@@ -47,19 +47,24 @@
  * OS-level scheduler yield. The two phases are dispatched independently.
  *
  * CPU pause hint:
- *   - x86 / x86_64           -> _mm_pause() intrinsic
+ *   - x86 / x86_64           -> _mm_pause() intrinsic ('pause' inline asm
+ *                               in the FreeBSD kernel)
+ *   - Windows on ARM / ARM64 -> __yield() intrinsic
  *   - aarch64                -> 'yield' instruction
  *   - arm (ARMv7+)           -> 'yield' instruction
  *   - powerpc                -> 'or 27,27,27' (low-priority hint)
- *   - Linux kernel           -> schedule()
- *   - other (s390x, riscv,   -> no hint
- *     unknown)
+ *   - riscv                  -> Zihintpause 'pause', emitted as its raw
+ *                               encoding (a no-op on older cores)
+ *   - Linux kernel           -> no hint (schedule() below is the yield)
+ *   - other (s390x, unknown) -> no hint
  *
  * OS yield:
  *   - Windows (MSVC / MinGW)             -> SwitchToThread()
  *   - hosted Unix-like (Linux, BSDs,     -> sched_yield()
  *     Apple, AIX, Solaris/illumos,
  *     Haiku, Cygwin)
+ *   - Linux kernel                       -> schedule()
+ *   - FreeBSD kernel                     -> kern_yield(PRI_USER)
  *   - other (e.g. baremetal)             -> no-op
  *
  * The CPU hint mirrors what YieldProcessor() does on Windows (which

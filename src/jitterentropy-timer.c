@@ -29,13 +29,12 @@
  * Thread handler
  ***************************************************************************/
 
-/*
- * CPU the counting thread pins itself to. When the caller has not set one
- * via jent_notime_set_cpu(), jent_notime_init() defaults to the
- * highest-numbered CPU the caller may run on.
- */
+/* CPU the counting thread pins itself to, see jent_notime_set_cpu(). */
 static int jent_notime_cpu_configured = 0;
 static unsigned long jent_notime_cpu = 0;
+
+/* No CPU configured: the counting thread picks the highest it may run on. */
+#define JENT_NOTIME_CPU_DEFAULT	(~0UL)
 
 static int jent_notime_init_flags(void **ctx, unsigned int flags)
 {
@@ -53,46 +52,15 @@ static int jent_notime_init_flags(void **ctx, unsigned int flags)
 	if (!thread_ctx)
 		return -ENOMEM;
 
-	/*
-	 * Pin the counting thread to a dedicated CPU - the caller-configured
-	 * one, or the highest-numbered CPU this thread may run on. The
-	 * consumer is left unpinned, so on the >= 2 CPUs required above the
-	 * scheduler keeps the two apart and the counter keeps ticking while
-	 * the consumer busy-waits.
-	 *
-	 * Advisory only: jent_thread_pin_to_cpu() reports -ENOTSUP where there
-	 * is no affinity API (OpenBSD, macOS on Apple Silicon), and both
-	 * threads are then left to the scheduler.
-	 */
-	if (jent_notime_cpu_configured) {
-		thread_ctx->notime_cpu = jent_notime_cpu;
-	} else {
-		/*
-		 * The highest CPU the thread may run on, not the count minus
-		 * one: those CPUs are a set and need not start at zero, so
-		 * under a cpuset the count names a CPU pinning is refused for.
-		 * See jent_cpu_highest().
-		 */
-		long highest = jent_cpu_highest();
-
-		thread_ctx->notime_cpu = (highest >= 0) ?
-					 (unsigned long)highest :
-					 (unsigned long)(ncpu - 1);
-	}
+	thread_ctx->notime_cpu = jent_notime_cpu_configured ?
+				 jent_notime_cpu : JENT_NOTIME_CPU_DEFAULT;
 
 	*ctx = thread_ctx;
 
 	return 0;
 }
 
-/*
- * The registered-handler interface (struct jent_notime_thread) passes nothing
- * but the context pointer, so this entry point - the one an external handler
- * replaces - cannot know the collector flags and allocates its context with
- * the default ones. The builtin handler is not called through it but through
- * jent_notime_init_flags() above, which does see them (see
- * jent_notime_enable_thread()).
- */
+/* The handler interface has no flags: an external handler gets the defaults. */
 JENT_PRIVATE_STATIC
 int jent_notime_init(void **ctx)
 {
@@ -155,15 +123,6 @@ static struct jent_notime_thread jent_notime_thread_builtin = {
  * that no suitable time source is available.
  ***************************************************************************/
 
-/*
- * Both are process-wide and one-way: the first is set by a startup that had to
- * fall back to the counting thread, the second by any startup at all, and every
- * later caller reads them from whichever thread it runs on. Atomic for the
- * reason given in arch/jitterentropy-arch-atomic.h - the store releases the
- * decision and the load acquires it, so a thread told that the internal timer
- * is forced also sees the state the forcing thread built.
- */
-static int jent_force_internal_timer = 0;
 static int jent_notime_switch_blocked = 0;
 
 void jent_notime_block_switch(void)
@@ -201,12 +160,24 @@ static int jent_notime_sample_timer(void *arg)
 	struct jent_notime_ctx *thread_ctx =
 		(struct jent_notime_ctx *)ec->notime_thread_ctx;
 
-	/*
-	 * Best-effort pin to a dedicated CPU; a failure here is ignored as
-	 * the counter still ticks on whatever CPU the scheduler picks.
-	 */
-	if (thread_ctx)
-		(void)jent_thread_pin_to_cpu(thread_ctx->notime_cpu);
+	/* Best-effort pin; only the builtin handler's ctx has this layout. */
+	if (thread_ctx && notime_thread == &jent_notime_thread_builtin) {
+		unsigned long cpu = thread_ctx->notime_cpu;
+
+		/*
+		 * Asked here, of the affinity inherited from the reader that
+		 * started this thread, not of the allocating thread's.
+		 */
+		if (cpu == JENT_NOTIME_CPU_DEFAULT) {
+			long highest = jent_cpu_highest();
+
+			if (highest >= 0)
+				(void)jent_thread_pin_to_cpu(
+					(unsigned long)highest);
+		} else {
+			(void)jent_thread_pin_to_cpu(cpu);
+		}
+	}
 
 	ec->notime_timer = 0;
 
@@ -234,6 +205,8 @@ out:
  */
 int jent_notime_settick(struct rand_data *ec)
 {
+	int ret;
+
 	if (!ec->enable_notime || !notime_thread)
 		return 0;
 
@@ -241,36 +214,72 @@ int jent_notime_settick(struct rand_data *ec)
 	ec->notime_prev_timer = 0;
 	ec->notime_timer = 0;
 
-	return notime_thread->jent_notime_start(ec->notime_thread_ctx,
-					       jent_notime_sample_timer, ec);
+	ret = notime_thread->jent_notime_start(ec->notime_thread_ctx,
+					      jent_notime_sample_timer, ec);
+	if (!ret)
+		ec->notime_running = 1;
+
+	return ret;
 }
 
+/* Stops only a thread a start created, and only once. */
 void jent_notime_unsettick(struct rand_data *ec)
 {
-	if (!ec->enable_notime || !notime_thread)
+	if (!ec->enable_notime || !notime_thread || !ec->notime_running)
 		return;
 
 	ec->notime_interrupt = 1;
 	notime_thread->jent_notime_stop(ec->notime_thread_ctx);
+	ec->notime_running = 0;
+}
+
+/*
+ * One read of the counter. Where a uint64_t takes two loads, a read may be
+ * torn by a carry into the upper word: a reader's tear shows as two reads
+ * disagreeing, a writer preempted between its stores (high word first) shows
+ * a low word of all ones. Both are read again.
+ */
+static uint64_t jent_notime_read(struct rand_data *ec)
+{
+#if defined(UINTPTR_MAX) && defined(UINT64_MAX) && UINTPTR_MAX >= UINT64_MAX
+	return ec->notime_timer;
+#else
+	uint64_t a, b;
+
+	for (;;) {
+		a = ec->notime_timer;
+		b = ec->notime_timer;
+
+		/* The reader's own tear. */
+		if (b < a || b - a > 0x80000000U)
+			continue;
+
+		/* Possibly the writer's, torn high: let it complete. */
+		if ((b & UINT64_C(0xffffffff)) == UINT64_C(0xffffffff)) {
+			jent_yield();
+			continue;
+		}
+
+		return b;
+	}
+#endif
 }
 
 void jent_get_nstime_internal(struct rand_data *ec, uint64_t *out)
 {
 	if (ec->enable_notime) {
+		uint64_t now;
+
 		/*
 		 * Allow the counting thread to be initialized and guarantee
-		 * that it ticked since last time we looked.
-		 *
-		 * Note, we do not use an atomic operation here for reading
-		 * jent_notime_timer since if this integer is garbled, it even
-		 * adds to entropy. But on most architectures, read/write
-		 * of an uint64_t should be atomic anyway.
+		 * that it ticked since last time we looked. The value compared
+		 * is the value returned, so a torn read cannot slip through.
 		 */
-		while (ec->notime_timer == ec->notime_prev_timer)
+		while ((now = jent_notime_read(ec)) <= ec->notime_prev_timer)
 			jent_yield();
 
-		ec->notime_prev_timer = ec->notime_timer;
-		*out = ec->notime_prev_timer;
+		ec->notime_prev_timer = now;
+		*out = now;
 	} else {
 		jent_get_nstime(out);
 	}
@@ -279,48 +288,44 @@ void jent_get_nstime_internal(struct rand_data *ec, uint64_t *out)
 static inline int jent_notime_enable_thread(struct rand_data *ec,
 					    unsigned int flags)
 {
+	int ret;
+
 	if (!notime_thread)
 		return 0;
 
-	/*
-	 * Reach the builtin handler through the variant that takes the flags:
-	 * it allocates its context with jent_zalloc() and therefore has to
-	 * honor JENT_FORCE_SECURE_MEM like every other allocation of this
-	 * collector. An externally registered handler is reached through the
-	 * documented interface, which has no room for them.
-	 */
+	/* The builtin handler honors the collector flags for its context. */
 	if (notime_thread == &jent_notime_thread_builtin)
-		return jent_notime_init_flags(&ec->notime_thread_ctx, flags);
+		ret = jent_notime_init_flags(&ec->notime_thread_ctx, flags);
+	else
+		ret = notime_thread->jent_notime_init(&ec->notime_thread_ctx);
 
-	return notime_thread->jent_notime_init(&ec->notime_thread_ctx);
+	/* A failed init's context is never handed to fini. */
+	if (ret)
+		ec->notime_thread_ctx = NULL;
+
+	return ret;
 }
 
 void jent_notime_disable(struct rand_data *ec)
 {
-	if (notime_thread)
+	/* Only a context an init handed back is torn down. */
+	if (notime_thread && ec->notime_thread_ctx) {
 		notime_thread->jent_notime_fini(ec->notime_thread_ctx);
+		ec->notime_thread_ctx = NULL;
+	}
 }
 
 int jent_notime_enable(struct rand_data *ec, unsigned int flags)
 {
-	/*
-	 * Read once and used twice: the two tests below are the same question
-	 * - has a startup already established the internal timer - and a
-	 * second load could answer them differently if another thread forces
-	 * it in between, which would run the startup a second time.
-	 */
-	int forced = jent_atomic_load_int(&jent_force_internal_timer);
+	int ret;
 
 	/* Use internal timer */
-	if (forced || (flags & JENT_FORCE_INTERNAL_TIMER)) {
-		/* Self test not run yet */
-		if (!forced &&
-		    jent_time_entropy_init(ec->osr,
-					   flags | JENT_FORCE_INTERNAL_TIMER))
-			return EHEALTH;
-
+	if (flags & JENT_FORCE_INTERNAL_TIMER) {
+		/* Marked only once the handler holds a context. */
+		ret = jent_notime_enable_thread(ec, flags);
+		if (ret)
+			return ret;
 		ec->enable_notime = 1;
-		return jent_notime_enable_thread(ec, flags);
 	}
 
 	return 0;
@@ -331,13 +336,7 @@ int jent_notime_switch(struct jent_notime_thread *new_thread)
 	if (jent_atomic_load_int(&jent_notime_switch_blocked))
 		return -EAGAIN;
 
-	/*
-	 * Reject incomplete handlers: a NULL thread would let
-	 * jent_notime_settick() succeed without ever starting a counting
-	 * thread, and the first timer read would then spin forever waiting
-	 * for a counter that nobody increments; a NULL callback would crash
-	 * on first use.
-	 */
+	/* Reject incomplete handlers, which would hang or crash on first use. */
 	if (!new_thread || !new_thread->jent_notime_init ||
 	    !new_thread->jent_notime_fini || !new_thread->jent_notime_start ||
 	    !new_thread->jent_notime_stop)
@@ -345,16 +344,6 @@ int jent_notime_switch(struct jent_notime_thread *new_thread)
 
 	notime_thread = new_thread;
 	return 0;
-}
-
-void jent_notime_force(void)
-{
-	jent_atomic_store_int(&jent_force_internal_timer, 1);
-}
-
-int jent_notime_forced(void)
-{
-	return jent_atomic_load_int(&jent_force_internal_timer);
 }
 
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */

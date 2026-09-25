@@ -94,13 +94,57 @@ unsigned int jent_version(void)
  ***************************************************************************/
 
 /* Calculate log2 of given value assuming that the value is a power of 2 */
-static inline unsigned int jent_log2_simple(unsigned int val)
+static inline unsigned int jent_log2_simple(uint64_t val)
 {
 	unsigned int idx = 0;
 
 	while (val >>= 1)
 		idx++;
 	return idx;
+}
+
+/*
+ * The memory size field derived from a cache of @cache_size bytes (0: none
+ * known), @inc reallocation steps up.
+ */
+static inline unsigned int jent_derive_memsize(uint64_t cache_size,
+					       int cache_all, unsigned int inc)
+{
+	/*
+	 * The safe starting value is the cache size increased by the
+	 * multiplicator.
+	 */
+	unsigned int max = jent_log2_simple(cache_size);
+
+	if (max) {
+		max += JENT_CACHE_SHIFT_BITS;
+
+		if (!cache_all) {
+			/*
+			 * We increase the memory size 4-fold. This is
+			 * due to ensure that the memory access
+			 * operation mostly is caused by L1 misses and
+			 * L2 hits.
+			 */
+			max += 2;
+		}
+	}
+
+	/* No usable cache size: start from the default, so @inc steps up. */
+	if (max <= JENT_MAX_MEMSIZE_OFFSET)
+		max = JENT_DEFAULT_MEMORY_BITS;
+
+	/* Adjust offset */
+	max = (max > JENT_MAX_MEMSIZE_OFFSET) ?
+		max - JENT_MAX_MEMSIZE_OFFSET : 0;
+
+	max += inc;
+
+	/* Bound the derived size, see JENT_MAX_AUTO_MEMSIZE. */
+	if (max > JENT_MAX_AUTO_MEMSIZE)
+		max = JENT_MAX_AUTO_MEMSIZE;
+
+	return max;
 }
 
 /*
@@ -122,6 +166,7 @@ static inline unsigned int jent_log2_simple(unsigned int val)
  *   to determine the memory size, or
  * * 1 << JENT_DEFAULT_MEMORY_BITS
  *
+ * A derived size grows by @inc steps, a size the caller provided does not.
  * All is capped by JENT_MAX_MEMSIZE_MAX
  */
 static inline unsigned int jent_update_memsize(unsigned int flags,
@@ -134,42 +179,10 @@ static inline unsigned int jent_update_memsize(unsigned int flags,
 	max = JENT_FLAGS_TO_MAX_MEMSIZE(flags);
 
 	if (!max) {
-		/*
-		 * The safe starting value is the cache size increased by the
-		 * multiplicator.
-		 */
-		max = jent_log2_simple(jent_cache_size_roundup(
-						!!(flags & JENT_CACHE_ALL)));
-		if (!max) {
-			max = JENT_DEFAULT_MEMORY_BITS;
-		} else {
-			max += JENT_CACHE_SHIFT_BITS;
+		int cache_all = !!(flags & JENT_CACHE_ALL);
 
-			if (!(flags & JENT_CACHE_ALL)) {
-				/*
-				 * We increase the memory size 4-fold. This is
-				 * due to ensure that the memory access
-				 * operation mostly is caused by L1 misses and
-				 * L2 hits.
-				 */
-				max += 2;
-			}
-		}
-
-		/* Adjust offset */
-		max = (max > JENT_MAX_MEMSIZE_OFFSET) ?
-			max - JENT_MAX_MEMSIZE_OFFSET : 0;
-
-		/*
-		 * Bound the automatically derived size. This is a no-op on
-		 * 64-bit targets; on 32-bit ones it keeps a large host cache
-		 * from deriving a working set that cannot be mapped and locked.
-		 * See JENT_MAX_AUTO_MEMSIZE.
-		 */
-		if (max > JENT_MAX_AUTO_MEMSIZE)
-			max = JENT_MAX_AUTO_MEMSIZE;
-	} else {
-		max += inc;
+		max = jent_derive_memsize(jent_cache_size_roundup(cache_all),
+					  cache_all, inc);
 	}
 
 	max = (max > global_max) ? global_max : max;
@@ -189,6 +202,19 @@ static inline unsigned int jent_update_hashloop(unsigned int flags,
 	unsigned int max;
 
 	max = JENT_FLAGS_TO_HASHLOOP(flags);
+
+	/*
+	 * Field n is 2^(n - 1) loops, field 0 JENT_HASH_LOOP_DEFAULT: step up
+	 * from the field covering the default, never below it.
+	 */
+	if (!max && inc) {
+		if (JENT_HASH_LOOP_DEFAULT > (UINT32_C(1) << (global_max - 1)))
+			return flags;
+		max = 1;
+		while ((UINT32_C(1) << (max - 1)) < JENT_HASH_LOOP_DEFAULT)
+			max++;
+	}
+
 	max += inc;
 	max = (max > global_max) ? global_max : max;
 
@@ -201,18 +227,8 @@ static inline unsigned int jent_update_hashloop(unsigned int flags,
 }
 
 /*
- * The compliance modes claim a protected entropy collector state, so they turn
- * secure memory from a best effort into a requirement: with them the
- * allocation fails rather than leaving the state in memory that may be swapped
- * out. Every other caller keeps the default, where memory the platform does
- * not protect is tolerated.
- *
- * This normalization belongs to the caller-provided flags and therefore not
- * into jent_entropy_collector_alloc_internal(): jent_time_entropy_init() ORs
- * JENT_FORCE_FIPS into its test instance to get the health tests run, which is
- * not a compliance statement, and deriving the requirement there would make
- * every default allocation demand secure memory. Same reasoning as the
- * JENT_DISABLE_MEMORY_ACCESS check in _jent_entropy_collector_alloc().
+ * The compliance modes require secure memory. Caller flags only: the startup
+ * test instance sets JENT_FORCE_FIPS for the health tests alone.
  */
 static inline unsigned int jent_update_secure_mem(unsigned int flags)
 {
@@ -222,18 +238,130 @@ static inline unsigned int jent_update_secure_mem(unsigned int flags)
 	return flags;
 }
 
+/* The FIPS / NTG.1 startup needs the memory access noise source. */
+static inline int jent_memaccess_contradicts(unsigned int flags)
+{
+	return (flags & JENT_DISABLE_MEMORY_ACCESS) &&
+	       ((flags & (JENT_NTG1 | JENT_FORCE_FIPS)) || jent_fips_enabled());
+}
+
+/* Every bit of the flags word jitterentropy.h gives a meaning. */
+#define JENT_FLAGS_DEFINED						       \
+	(JENT_DISABLE_STIR | JENT_DISABLE_UNBIAS |			       \
+	 JENT_DISABLE_MEMORY_ACCESS | JENT_FORCE_INTERNAL_TIMER |	       \
+	 JENT_DISABLE_INTERNAL_TIMER | JENT_FORCE_FIPS | JENT_NTG1 |	       \
+	 JENT_CACHE_ALL | JENT_FORCE_SECURE_MEM |			       \
+	 JENT_MAX_HASHLOOP_MASK | JENT_MAX_MEMSIZE_MASK)
+
+/*
+ * An undefined bit, or a memory size / hash loop field above its maximum.
+ * Caller flags only: the kernel test interface uses the unused bits.
+ */
+static inline int jent_flags_invalid(unsigned int flags)
+{
+	return (flags & ~(unsigned int)JENT_FLAGS_DEFINED) ||
+	       JENT_FLAGS_TO_MAX_MEMSIZE(flags) >
+			JENT_FLAGS_TO_MAX_MEMSIZE(JENT_MAX_MEMSIZE_MAX) ||
+	       JENT_FLAGS_TO_HASHLOOP(flags) >
+			JENT_FLAGS_TO_HASHLOOP(JENT_MAX_HASHLOOP);
+}
+
 /***************************************************************************
  * Random Number Generation
  ***************************************************************************/
+
+/*
+ * Clear the stack the noise source left behind, at the end of every entry
+ * point that runs it. 4 kB covers the deepest path. Hosted only.
+ */
+#define JENT_STACK_SCRUB_LEN	4096
+
+#if !defined(LINUX_KERNEL) && !defined(__KERNEL__) && !defined(JENT_BAREMETAL) && \
+    !(defined(_KERNEL) && defined(__FreeBSD__))
+
+/* Not instrumented: ASan would move the array away from the stack below. */
+static JENT_NO_SANITIZE_ADDRESS void jent_stack_scrub_array(void)
+{
+	unsigned char scrub[JENT_STACK_SCRUB_LEN];
+
+	jent_memset_secure(scrub, sizeof(scrub));
+}
+
+/* The padding between that array and the stack canary. */
+static void jent_stack_scrub_frame(void)
+{
+	volatile unsigned long z0 = 0, z1 = 0, z2 = 0, z3 = 0;
+	volatile unsigned long z4 = 0, z5 = 0, z6 = 0, z7 = 0;
+
+	(void)z0; (void)z1; (void)z2; (void)z3;
+	(void)z4; (void)z5; (void)z6; (void)z7;
+}
+
+#define jent_stack_scrub()						       \
+	do {								       \
+		jent_stack_scrub_array();				       \
+		jent_stack_scrub_frame();				       \
+	} while (0)
+
+#else /* freestanding */
+
+#define jent_stack_scrub()	do { } while (0)
+
+#endif
+
+/* The health failure bits of the two kinds. */
+#define JENT_INTERMITTENT_FAILURES					       \
+	(JENT_RCT_FAILURE | JENT_APT_FAILURE | JENT_LAG_FAILURE |	       \
+	 JENT_RCT_MEM_FAILURE)
+#define JENT_PERMANENT_FAILURES						       \
+	JENT_PERMANENT_FAILURE(JENT_INTERMITTENT_FAILURES)
+
+/* The JENT_ERR_* code of a non-zero set of health failure bits. */
+static int jent_health_err(unsigned int health_test_result)
+{
+	if (health_test_result & JENT_RCT_FAILURE_PERMANENT)
+		return JENT_ERR_RCT_PERMANENT;
+	if (health_test_result & JENT_APT_FAILURE_PERMANENT)
+		return JENT_ERR_APT_PERMANENT;
+	if (health_test_result & JENT_LAG_FAILURE_PERMANENT)
+		return JENT_ERR_LAG_PERMANENT;
+	if (health_test_result & JENT_RCT_MEM_FAILURE_PERMANENT)
+		return JENT_ERR_RCT_MEM_PERMANENT;
+	if (health_test_result & JENT_RCT_FAILURE)
+		return JENT_ERR_RCT;
+	if (health_test_result & JENT_APT_FAILURE)
+		return JENT_ERR_APT;
+	if (health_test_result & JENT_RCT_MEM_FAILURE)
+		return JENT_ERR_RCT_MEM;
+
+	return JENT_ERR_LAG;
+}
+
+/* The permanent failure bit reported as @err, or 0. */
+static unsigned int jent_health_err_permanent(int err)
+{
+	switch (err) {
+	case JENT_ERR_RCT_PERMANENT:
+		return JENT_RCT_FAILURE_PERMANENT;
+	case JENT_ERR_APT_PERMANENT:
+		return JENT_APT_FAILURE_PERMANENT;
+	case JENT_ERR_LAG_PERMANENT:
+		return JENT_LAG_FAILURE_PERMANENT;
+	case JENT_ERR_RCT_MEM_PERMANENT:
+		return JENT_RCT_MEM_FAILURE_PERMANENT;
+	default:
+		return 0;
+	}
+}
 
 /**
  * Entry function: Obtain entropy for the caller.
  *
  * This function invokes the entropy gathering logic as often to generate
  * as many bytes as requested by the caller. The entropy gathering logic
- * creates 64 bit per invocation.
+ * creates 256 bit per invocation.
  *
- * This function truncates the last 64 bit entropy value output to the exact
+ * This function truncates the last 256 bit entropy value output to the exact
  * size specified by the caller.
  *
  * @param[in] ec Reference to entropy collector
@@ -262,14 +390,9 @@ JENT_PRIVATE_STATIC
 ssize_t jent_read_entropy(struct rand_data *ec, char *data, size_t len)
 {
 	/*
-	 * Maximum value representable by ssize_t. Use a portable definition
-	 * in case SSIZE_MAX is not available under strict C standard modes.
-	 * It is nevertheless available on POSIX systems.
-	 *
-	 * Clearing the sign bit of SIZE_MAX relies on ssize_t being the
-	 * signed counterpart of size_t, which the build assertion below
-	 * enforces. Deriving the shift count from sizeof(ssize_t) instead
-	 * would be undefined behavior as soon as ssize_t is the wider type.
+	 * Maximum value representable by ssize_t. Use a portable
+	 * definition in case SSIZE_MAX is not available under strict
+	 * C standard modes. It is nevertheless available on POSIX systems.
 	 */
 	static const size_t ssize_max = (size_t)-1 >> 1;
 	char *p = data;
@@ -282,6 +405,9 @@ ssize_t jent_read_entropy(struct rand_data *ec, char *data, size_t len)
 	if (!ec || (data == NULL && len > 0))
 		return JENT_ERR_EINVAL;
 
+	if (!len)
+		return 0;
+
 	/*
 	 * (hypothetical) edge case: clamp to ssize_t range to prevent
 	 * negative return on cast
@@ -290,56 +416,31 @@ ssize_t jent_read_entropy(struct rand_data *ec, char *data, size_t len)
 		len = ssize_max;
 	orig_len = len;
 
-	if (jent_notime_settick(ec))
+	if (jent_notime_settick(ec)) {
+		jent_stack_scrub();
 		return JENT_ERR_NOTIME;
+	}
 
 	while (len > 0) {
 		size_t tocopy;
 		unsigned int health_test_result;
 
-		/*
-		 * A conditioning self test bound to this instance failed. The
-		 * check does not go through jent_health_failure(): that path
-		 * only reports under FIPS, while the KAT verdict is about the
-		 * conditioning implementation, not the noise source, and must
-		 * stop the output in every mode. Checked per block so that a
-		 * self test failing on another thread stops a request already
-		 * in flight.
-		 */
-		if (ec->selftest_failed) {
+		/* A self test bound to this instance failed. */
+		if (jent_atomic_load_int(&ec->selftest_failed)) {
 			ret = JENT_ERR_SELFTEST;
 			goto err;
 		}
 
 		jent_random_data(ec);
 
-		if ((health_test_result = jent_health_failure(ec))) {
-			if (health_test_result & JENT_RCT_FAILURE_PERMANENT)
-				ret = JENT_ERR_RCT_PERMANENT;
-			else if (health_test_result &
-				 JENT_APT_FAILURE_PERMANENT)
-				ret = JENT_ERR_APT_PERMANENT;
-			else if (health_test_result &
-				 JENT_LAG_FAILURE_PERMANENT)
-				ret = JENT_ERR_LAG_PERMANENT;
-			else if (health_test_result &
-				 JENT_RCT_MEM_FAILURE_PERMANENT)
-				ret = JENT_ERR_RCT_MEM_PERMANENT;
-			else if (health_test_result & JENT_RCT_FAILURE)
-				ret = JENT_ERR_RCT;
-			else if (health_test_result & JENT_APT_FAILURE)
-				ret = JENT_ERR_APT;
-			else if (health_test_result & JENT_RCT_MEM_FAILURE)
-				ret = JENT_ERR_RCT_MEM;
-			else
-				/*
-				 * The only remaining defined bit is
-				 * JENT_LAG_FAILURE. A hypothetical unknown bit
-				 * lands here as well: a health test failure
-				 * must never result in a success return.
-				 */
-				ret = JENT_ERR_LAG;
+		/* The noise source stopped delivering. */
+		if (ec->noise_stopped) {
+			ret = JENT_ERR_RCT_PERMANENT;
+			goto err;
+		}
 
+		if ((health_test_result = jent_health_failure(ec))) {
+			ret = jent_health_err(health_test_result);
 			goto err;
 		}
 
@@ -355,37 +456,57 @@ ssize_t jent_read_entropy(struct rand_data *ec, char *data, size_t len)
 	}
 
 	/*
-	 * Enhanced backtracking resistance needs nothing done here: it is a
-	 * property of the XDRBG-256 generate operation itself. Every
-	 * jent_read_random_block() call above consumed the state V' into one
-	 * XOF invocation whose output is the successor state V followed by
-	 * the returned bits, and only V is retained - the sponge is reset and
-	 * the temporary buffer is zeroized. Recovering returned data from V
-	 * would require inverting the XOF or knowing the consumed V', so an
-	 * attacker who obtains the memory after this point cannot deduce
-	 * output the instance produced before it. The explicit ratchet the
-	 * pre-XDRBG design performed here is gone with the design: only its
-	 * retained pool state allowed the last output to be recomputed.
+	 * Enhanced backtracking resistance is provided by the XDRBG-256
+	 * generate operation, which retains only the successor state.
 	 */
 
 err:
 	jent_notime_unsettick(ec);
 
-	/* Count only the bytes actually delivered to the caller. */
+	/* A failure outputs nothing: wipe what earlier blocks copied. */
+	if (ret && p != data)
+		jent_memset_secure(data, (size_t)(p - data));
+
 	if (!ret) {
 		ec->read_invocations++;
 		ec->bytes_output += orig_len;
 	}
 
+	jent_stack_scrub();
+
 	return ret ? ret : (ssize_t)orig_len;
 }
 
-static int jent_health_failure_reset(
-	struct rand_data **ec, struct rand_data *(*alloc)(unsigned int osr,
-							  unsigned int flags))
+/*
+ * JENT_ALLOC_MEASURE_CLOCK: an instance measuring the clock (startup, raw
+ * recording).
+ */
+#define JENT_ALLOC_MEASURE_CLOCK	1
+
+/*
+ * Failures of a reset short of a permanent health failure: the noise source
+ * failed up to JENT_MAX_OSR, or the platform lacked memory / a thread.
+ */
+#define JENT_RESET_FAILED	1
+#define JENT_RESET_NORESOURCE	2
+
+static int jent_entropy_init_internal(unsigned int osr, unsigned int flags,
+				      unsigned int reinits);
+static struct rand_data
+*jent_entropy_collector_alloc_internal(unsigned int osr, unsigned int flags,
+				       unsigned int reinits, int mode);
+static int jent_entropy_collector_startup(struct rand_data **ec);
+
+/*
+ * Replace @ec with a collector at the next oversampling rate, running its
+ * startup if @startup. Returns 0, JENT_RESET_* or the JENT_ERR_* code of a
+ * permanent failure of that startup; on failure @ec is left untouched.
+ */
+static int jent_health_failure_reset(struct rand_data **ec, int startup)
 {
 	struct rand_data *new_ec;
-	unsigned int osr, flags;
+	unsigned int osr, flags, reinits;
+	int ret;
 
 	/* Increment OSR */
 	osr = (*ec)->osr + 1;
@@ -393,14 +514,7 @@ static int jent_health_failure_reset(
 	/* Remember flags value */
 	flags = (*ec)->flags;
 
-	/*
-	 * A compliance mode does not change its noise source underneath the
-	 * caller: pin the clock this instance was validated on, so the startup
-	 * re-run below cannot fall back to the other one - and cannot force
-	 * the internal timer for the whole process while doing so. If the
-	 * pinned clock no longer passes, the reset fails and the caller is
-	 * told. Everywhere else the fallback is unchanged.
-	 */
+	/* A compliance mode stays on the clock it was validated on. */
 	if ((*ec)->is_fips_enabled) {
 		if ((*ec)->enable_notime)
 			flags |= JENT_FORCE_INTERNAL_TIMER;
@@ -410,64 +524,58 @@ static int jent_health_failure_reset(
 
 	/* generic arbitrary cutoff to prevent running "forever" */
 	if (osr > JENT_MAX_OSR)
-		return -1;
+		return JENT_RESET_FAILED;
 
-	/*
-	 * If the caller did not set any specific maximum value let the Jitter
-	 * RNG increase the maximum memory by one step.
-	 */
-	if (!(*ec)->max_mem_set)
-		flags = jent_update_memsize(flags, 1);
-
-	/* Increment hash loop count by one */
-	flags = jent_update_hashloop(flags, 1);
+	reinits = (*ec)->reinit_count + 1;
 
 	/* Perform new health test with updated OSR */
-	while (jent_entropy_init_ex(osr, flags)) {
+	while ((ret = jent_entropy_init_internal(osr, flags, reinits))) {
+		if (ret == EMEM)
+			return JENT_RESET_NORESOURCE;
 		osr++;
 		if (osr > JENT_MAX_OSR)
-			return -1;
+			return JENT_RESET_FAILED;
 	}
 
-	new_ec = alloc(osr, flags);
+	new_ec = jent_entropy_collector_alloc_internal(osr, flags, reinits, 0);
 
 	/*
 	 * In case of an error, leave the existing ec state untouched as a
 	 * safety measure. But it is in error state and is of not much use.
 	 */
 	if (!new_ec)
-		return -1;
-
-	/* Remember whether caller configured memory size */
-	new_ec->max_mem_set = !!(*ec)->max_mem_set;
+		return JENT_RESET_NORESOURCE;
 
 	/*
-	 * Duplicate the state of the health tests to ensure the newly allocated
-	 * state will continue from the current health state - as far as it
-	 * applies to the clock the replacement ended up on.
+	 * Duplicate the state of the health tests, the identity and the
+	 * caller's flags before the startup, to ensure the newly allocated
+	 * state will continue from the current health state.
 	 */
 	jent_health_duplicate(new_ec, *ec);
-
-	/*
-	 * Carry the instance identifier over so the reallocated collector keeps
-	 * the same UUID (empty during the startup-time reset, when it has not
-	 * been assigned yet), and count this reinitialization.
-	 */
 	memcpy(new_ec->uuid, (*ec)->uuid, sizeof(new_ec->uuid));
-	new_ec->reinit_count = (*ec)->reinit_count + 1;
-
-	/* Preserve the lifetime output accounting across the reallocation. */
+	new_ec->flags = (*ec)->flags;
 	new_ec->read_invocations = (*ec)->read_invocations;
 	new_ec->bytes_output = (*ec)->bytes_output;
+
+	/*
+	 * Seed the replacement unless the caller is itself a startup loop,
+	 * which continues on the new collector instead of nesting a second one.
+	 */
+	if (startup) {
+		ret = jent_entropy_collector_startup(&new_ec);
+		if (ret)
+			return ret;
+	}
+
+	/* A failed self test carries over. */
+	if (jent_atomic_load_int(&(*ec)->selftest_failed))
+		jent_atomic_store_int(&new_ec->selftest_failed, 1);
 
 	jent_entropy_collector_free(*ec);
 	*ec = new_ec;
 
 	return 0;
 }
-
-static struct rand_data *_jent_entropy_collector_alloc(unsigned int osr,
-						       unsigned int flags);
 
 /**
  * Entry function: Obtain entropy for the caller.
@@ -479,7 +587,7 @@ static struct rand_data *_jent_entropy_collector_alloc(unsigned int osr,
  * increases the OSR by one. This is done based on the idea that a health
  * test failure indicates that the assumed entropy rate is too high.
  *
- * Note the function returns with an health test error if the OSR is
+ * Note the function returns with a permanent health test error if the OSR is
  * getting too large. If an error is returned by this function, the Jitter RNG
  * is not safe to be used on the current system.
  *
@@ -496,24 +604,20 @@ JENT_PRIVATE_STATIC
 ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 {
 	/*
-	 * Maximum value representable by ssize_t. Use a portable definition
-	 * in case SSIZE_MAX is not available under strict C standard modes.
-	 * It is nevertheless available on POSIX systems.
-	 *
-	 * Clearing the sign bit of SIZE_MAX relies on ssize_t being the
-	 * signed counterpart of size_t, which the build assertion below
-	 * enforces. Deriving the shift count from sizeof(ssize_t) instead
-	 * would be undefined behavior as soon as ssize_t is the wider type.
+	 * Maximum value representable by ssize_t. Use a portable
+	 * definition in case SSIZE_MAX is not available under strict
+	 * C standard modes. It is nevertheless available on POSIX systems.
 	 */
 	static const size_t ssize_max = (size_t)-1 >> 1;
 	char *p = data;
 	size_t orig_len;
 	ssize_t ret = 0;
+	int reset;
 
 	JENT_BUILD_BUG_ON(sizeof(ssize_t) != sizeof(size_t));
 
 	/* check obvious misuse of API */
-	if (!ec || (data == NULL && len > 0))
+	if (!ec || !*ec || (data == NULL && len > 0))
 		return JENT_ERR_EINVAL;
 
 	/*
@@ -537,12 +641,6 @@ ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 		case JENT_ERR_APT_PERMANENT:
 		case JENT_ERR_LAG_PERMANENT:
 		case JENT_ERR_RCT_MEM_PERMANENT:
-
-			/*
-			 * A failed conditioning self test as well: it judges
-			 * the implementation, which a reallocation at a higher
-			 * oversampling rate cannot mend.
-			 */
 		case JENT_ERR_SELFTEST:
 			return ret;
 
@@ -558,9 +656,35 @@ ssize_t jent_read_entropy_safe(struct rand_data **ec, char *data, size_t len)
 			 *
 			 * If we fail here, the Jitter RNG returns the error.
 			 */
-			if (jent_health_failure_reset(
-				ec, _jent_entropy_collector_alloc))
+			reset = jent_health_failure_reset(ec, 1);
+
+			/* Out of resources: retry on the next call. */
+			if (reset == JENT_RESET_NORESOURCE) {
+				jent_stack_scrub();
 				return ret;
+			}
+
+			if (reset) {
+				unsigned int permanent =
+					jent_health_err_permanent(reset);
+
+				/*
+				 * No usable replacement: escalate to a
+				 * permanent failure on the collector, reported
+				 * to the FIPS callback once.
+				 */
+				if (!permanent)
+					permanent = JENT_PERMANENT_FAILURE(
+						(*ec)->health_failure &
+						JENT_INTERMITTENT_FAILURES);
+				else
+					(*ec)->health_failure_reported |=
+						permanent;
+				(*ec)->health_failure |= permanent;
+				jent_health_failure(*ec);
+				jent_stack_scrub();
+				return jent_health_err((*ec)->health_failure);
+			}
 
 			/*
 			 * We are not returning the intermittent errors here.
@@ -594,13 +718,7 @@ uint32_t jent_memsize(unsigned int flags)
 	static const uint32_t max_field =
 		JENT_FLAGS_TO_MAX_MEMSIZE(JENT_MAX_MEMSIZE_MAX);
 
-	/*
-	 * Flags of collectors instantiated with JENT_DISABLE_MEMORY_ACCESS are
-	 * never normalized by jent_update_memsize(), so an out-of-range
-	 * caller-provided size field can reach this point (e.g. via
-	 * jent_status()). Clamp it: the shift below would otherwise exceed the
-	 * uint32_t width, which is undefined behavior.
-	 */
+	/* Clamp an unnormalized field: the shift below would overflow. */
 	if (memsize > max_field)
 		memsize = max_field;
 
@@ -619,43 +737,65 @@ unsigned int jent_hashloop_cnt(unsigned int flags)
 {
 	unsigned int cnt = JENT_FLAGS_TO_HASHLOOP(flags);
 
+	/* Clamp an unchecked field to the maximum. */
+	if (cnt > JENT_FLAGS_TO_HASHLOOP(JENT_MAX_HASHLOOP))
+		cnt = JENT_FLAGS_TO_HASHLOOP(JENT_MAX_HASHLOOP);
+
 	if (cnt == 0)
 		cnt = JENT_HASH_LOOP_DEFAULT;
 	else
-		cnt = UINT32_C(1) << cnt;
+		cnt = UINT32_C(1) << (cnt - 1);
 
 	return cnt;
 }
 
 /*
- * Whether the startup self tests have run in this process. Written by whichever
- * thread gets there first and read by every allocation afterwards, so it is
- * reached through the atomic helpers: the store releases the state the tests
- * established - the timer's common GCD, the configuration switch blocks - and
- * the load acquires it, so a thread that skips the tests because this is set
- * also sees what they left behind.
+ * Whether the startup self tests have passed, per clock. Atomic: the store
+ * releases the state the tests established, the load acquires it.
  */
-static int jent_selftest_run = 0;
+#define JENT_CLOCK_PLATFORM	0	/* jent_get_nstime() */
+#define JENT_CLOCK_NOTIME	1	/* the counting thread */
+static int jent_selftest_run[2] = { 0, 0 };
 
-static struct rand_data
-*jent_entropy_collector_alloc_internal(unsigned int osr, unsigned int flags)
+static inline int jent_startup_passed(unsigned int clock)
 {
+	return jent_atomic_load_int(&jent_selftest_run[clock]);
+}
+
+/* Whether a startup has passed on the clock @ec reads, run here if none has. */
+static int jent_clock_usable(struct rand_data *ec, unsigned int osr,
+			     unsigned int flags, unsigned int reinits)
+{
+	unsigned int clock = ec->enable_notime ? JENT_CLOCK_NOTIME :
+						 JENT_CLOCK_PLATFORM;
+
+	flags &= ~(unsigned int)(JENT_FORCE_INTERNAL_TIMER |
+				 JENT_DISABLE_INTERNAL_TIMER);
+	flags |= ec->enable_notime ? JENT_FORCE_INTERNAL_TIMER :
+				     JENT_DISABLE_INTERNAL_TIMER;
+
+	return jent_startup_passed(clock) ||
+	       !jent_entropy_init_internal(osr, flags, reinits);
+}
+
+/* @mode: JENT_ALLOC_* */
+static struct rand_data
+*jent_entropy_collector_alloc_internal(unsigned int osr, unsigned int flags,
+				       unsigned int reinits, int mode)
+{
+	int measure_clock = mode & JENT_ALLOC_MEASURE_CLOCK;
 	struct rand_data *entropy_collector;
 	uint32_t memsize = 0;
 
-	/*
-	 * Enforce the invariants of the compile-time tunable OSR bounds: the
-	 * health-test lookup tables are indexed with osr - 1, and an empty
-	 * [JENT_MIN_OSR, JENT_MAX_OSR] range would make every allocation fail.
-	 */
+	/* The health test tables are indexed with osr - 1. */
 	JENT_BUILD_BUG_ON(JENT_MIN_OSR < 1);
 	JENT_BUILD_BUG_ON(JENT_MIN_OSR > JENT_MAX_OSR);
 
 	/*
 	 * Requesting disabling and forcing of internal timer
-	 * makes no sense.
+	 * makes no sense. NTG.1 disables it below.
 	 */
-	if ((flags & JENT_DISABLE_INTERNAL_TIMER) &&
+	if ((flags & (JENT_DISABLE_INTERNAL_TIMER | JENT_NTG1)) &&
 	    (flags & JENT_FORCE_INTERNAL_TIMER))
 		return NULL;
 
@@ -671,8 +811,10 @@ static struct rand_data
 		return NULL;
 
 	/* Force the self test to be run */
-	if (!jent_atomic_load_int(&jent_selftest_run) &&
-	    jent_entropy_init_ex(osr, flags))
+	if (!measure_clock &&
+	    !jent_startup_passed(JENT_CLOCK_PLATFORM) &&
+	    !jent_startup_passed(JENT_CLOCK_NOTIME) &&
+	    jent_entropy_init_internal(osr, flags, reinits))
 		return NULL;
 
 	/*
@@ -681,33 +823,18 @@ static struct rand_data
 	if (flags & JENT_NTG1)
 		flags |= JENT_DISABLE_INTERNAL_TIMER;
 
-	/*
-	 * If the initial test code concludes to force the internal timer
-	 * and the user requests it not to be used, do not allocate
-	 * the Jitter RNG instance.
-	 */
-	if (jent_notime_forced() && (flags & JENT_DISABLE_INTERNAL_TIMER))
-		return NULL;
-
 	entropy_collector = jent_zalloc(sizeof(struct rand_data), flags);
 	if (NULL == entropy_collector)
 		return NULL;
 
-	/*
-	 * Record whether the caller capped the memory size before
-	 * jent_update_memsize() normalizes the flags. This must happen here
-	 * and not in the outer jent_entropy_collector_alloc(): health-test
-	 * resets during the startup loop consult max_mem_set, and were it
-	 * still unset they would grow the memory region beyond the cap the
-	 * caller requested.
-	 */
-	entropy_collector->max_mem_set = !!JENT_FLAGS_TO_MAX_MEMSIZE(flags);
+	entropy_collector->reinit_count = reinits;
 
 	if (!(flags & JENT_DISABLE_MEMORY_ACCESS)) {
-		flags = jent_update_memsize(flags, 0);
-		memsize = jent_memsize(flags);
+		memsize = jent_memsize(jent_update_memsize(flags, reinits));
+
+		/* Not secure memory: the region is only timed, never output. */
 		entropy_collector->mem =
-			(unsigned char *)jent_zalloc(memsize, flags);
+			(unsigned char *)jent_zalloc_unlocked(memsize);
 
 		if (entropy_collector->mem == NULL)
 			goto err;
@@ -721,16 +848,13 @@ static struct rand_data
 	}
 
 	/* Set the hash loop count */
-	flags = jent_update_hashloop(flags, 0);
-	entropy_collector->hashloopcnt = jent_hashloop_cnt(flags);
-
-	if (jent_sha3_alloc(&entropy_collector->hash_state, flags))
-		goto err;
+	entropy_collector->hashloopcnt =
+		jent_hashloop_cnt(jent_update_hashloop(flags, reinits));
 
 	/*
 	 * Initialize the hash state for the XDRBG
 	 */
-	jent_shake256_init(entropy_collector->hash_state);
+	jent_shake256_init(&entropy_collector->hash_state);
 
 	if ((flags & JENT_FORCE_FIPS) || jent_fips_enabled()) {
 		/*
@@ -745,6 +869,7 @@ static struct rand_data
 	/* Set the oversampling rate */
 	entropy_collector->osr = osr;
 	entropy_collector->flags = flags;
+	entropy_collector->measure_clock = !!measure_clock;
 
 	/*
 	 * BSI AIS 20/31 NTG.1 requires that during startup 2 noise sources
@@ -762,9 +887,10 @@ static struct rand_data
 	}
 
 	/* Initialize the health tests */
-	jent_health_init(entropy_collector, flags & JENT_NTG1 ?
-					    jent_health_init_type_ntg1 :
-					    jent_health_init_type_common);
+	if (jent_health_init(entropy_collector, flags & JENT_NTG1 ?
+					        jent_health_init_type_ntg1 :
+					        jent_health_init_type_common))
+		goto err;
 
 	/*
 	 * Use timer-less noise source - note, OSR must be set in
@@ -775,22 +901,20 @@ static struct rand_data
 			goto err;
 	}
 
-	/*
-	 * The common divisor of the clock this collector reads. Asked after
-	 * the clock is chosen, as the divisor belongs to the clock - and
-	 * jent_notime_enable() above is where the counting thread's own
-	 * startup establishes it.
-	 *
-	 * None established means no startup has ever measured this clock,
-	 * which for an instance that is to generate entropy from it is an
-	 * error: it would be normalizing by a divisor nothing measured, on a
-	 * noise source nothing validated. Only the instances that do the
-	 * measuring run without one - they are what establishes it - and they
-	 * take the deltas as the clock produces them.
-	 */
+	/* Fall back to the internal timer unless the caller pinned the clock. */
+	if (!measure_clock &&
+	    !jent_clock_usable(entropy_collector, osr, flags, reinits) &&
+	    (entropy_collector->enable_notime ||
+	     (flags & JENT_DISABLE_INTERNAL_TIMER) ||
+	     jent_notime_enable(entropy_collector,
+				flags | JENT_FORCE_INTERNAL_TIMER) ||
+	     !jent_clock_usable(entropy_collector, osr, flags, reinits)))
+		goto err;
+
+	/* Was jent_entropy_init run on this clock (establishing the GCD)? */
 	if (jent_gcd_get(&entropy_collector->jent_common_timer_gcd,
 			 entropy_collector->enable_notime)) {
-		if (!(flags & JENT_INT_MEASURE_CLOCK))
+		if (!measure_clock)
 			goto err;
 
 		entropy_collector->jent_common_timer_gcd = 1;
@@ -803,41 +927,20 @@ err:
 	return NULL;
 }
 
-static struct rand_data *_jent_entropy_collector_alloc(unsigned int osr,
-						       unsigned int flags)
+/*
+ * Run the startup entropy collection on *@ec. Returns 0, JENT_RESET_* or the
+ * JENT_ERR_* code of a permanent failure, in which case *@ec is freed.
+ */
+static int jent_entropy_collector_startup(struct rand_data **ec_p)
 {
-	struct rand_data *ec;
-
-	/*
-	 * The FIPS / NTG.1 startup samples the memory-access noise source as
-	 * an independent stage (startup_state jent_startup_memory). Without
-	 * the memory region every startup sample is stuck, so the allocation
-	 * could only fail after burning through the entire health-test reset
-	 * ladder below. Reject the contradictory combination immediately.
-	 *
-	 * This check must not live in jent_entropy_collector_alloc_internal():
-	 * the test-only collectors (jent_time_entropy_init(), the kernel raw
-	 * test interface, the raw-entropy recording tools) are allocated there
-	 * directly and never run the startup ladder, and jent_time_entropy_init()
-	 * always ORs in JENT_FORCE_FIPS for its test instance - rejecting the
-	 * combination there would make jent_entropy_init_ex() fail for every
-	 * caller using JENT_DISABLE_MEMORY_ACCESS.
-	 */
-	if ((flags & JENT_DISABLE_MEMORY_ACCESS) &&
-	    ((flags & (JENT_NTG1 | JENT_FORCE_FIPS)) || jent_fips_enabled()))
-		return NULL;
-
-	flags = jent_update_secure_mem(flags);
-
-	ec = jent_entropy_collector_alloc_internal(osr, flags);
-
-	if (!ec)
-		return ec;
+	struct rand_data *ec = *ec_p;
+	unsigned int health_test_result;
+	int ret;
 
 	/* fill the data pad with non-zero values */
 	if (jent_notime_settick(ec)) {
-		jent_entropy_collector_free(ec);
-		return NULL;
+		ret = JENT_RESET_NORESOURCE;
+		goto err;
 	}
 
 	/*
@@ -855,51 +958,78 @@ static struct rand_data *_jent_entropy_collector_alloc(unsigned int osr,
 	do {
 		jent_random_data(ec);
 
-		/*
-		 * Check for any kind of health error at this point including
-		 * intermittent or permanent errors. If we observed one,
-		 * re-initialize the entropy collector.
-		 */
-		if (jent_health_failure(ec)) {
+		/* The noise source stopped delivering: no reset mends that. */
+		if (ec->noise_stopped) {
+			jent_health_failure(ec);
+			ret = JENT_ERR_RCT_PERMANENT;
+			goto err;
+		}
 
-			/*
-			 * Re-allocate the entropy collector with updated
-			 * OSR, hash loop count and memory size.
-			 */
-			if (jent_health_failure_reset(
-				&ec, jent_entropy_collector_alloc_internal)) {
-				jent_entropy_collector_free(ec);
-				return NULL;
-			}
-
-			/*
-			 * The reset replaced ec with a freshly allocated
-			 * collector. That new collector has enable_notime
-			 * set but no running timer thread (the old thread
-			 * was stopped when the old collector was freed).
-			 * Restart the timer thread before re-entering the
-			 * loop, otherwise jent_get_nstime_internal will
-			 * spin forever waiting for a counter that nobody
-			 * increments.
-			 */
-			if (jent_notime_settick(ec)) {
-				jent_entropy_collector_free(ec);
-				return NULL;
-			}
-
-			/* Rerun startup sequence */
+		health_test_result = jent_health_failure(ec);
+		if (!health_test_result)
 			continue;
+
+		/* A permanent failure ends the startup as it ends generation. */
+		if (health_test_result & JENT_PERMANENT_FAILURES) {
+			ret = jent_health_err(health_test_result);
+			goto err;
+		}
+
+		/* The reset runs a startup with a counting thread of its own. */
+		jent_notime_unsettick(ec);
+
+		/*
+		 * Re-allocate the entropy collector with updated
+		 * OSR, hash loop count and memory size.
+		 */
+		ret = jent_health_failure_reset(&ec, 0);
+		if (ret)
+			goto err;
+
+		/*
+		 * The reset replaced ec with a freshly allocated
+		 * collector without a running timer thread. Restart it.
+		 */
+		if (jent_notime_settick(ec)) {
+			ret = JENT_RESET_NORESOURCE;
+			goto err;
 		}
 	} while (ec->startup_state != jent_startup_completed);
 
 	jent_notime_unsettick(ec);
+	*ec_p = ec;
 
-	/*
-	 * Assign the stable per-instance identifier. This is done once, after a
-	 * successful startup; jent_health_failure_reset() carries it over to the
-	 * replacement collector so the identity survives a reallocation.
-	 */
+	return 0;
+
+err:
+	jent_entropy_collector_free(ec);
+	*ec_p = NULL;
+
+	return ret;
+}
+
+static struct rand_data *_jent_entropy_collector_alloc(unsigned int osr,
+						       unsigned int flags)
+{
+	struct rand_data *ec;
+
+	if (jent_flags_invalid(flags))
+		return NULL;
+
+	if (jent_memaccess_contradicts(flags))
+		return NULL;
+
+	flags = jent_update_secure_mem(flags);
+
+	ec = jent_entropy_collector_alloc_internal(osr, flags, 0, 0);
+	if (!ec)
+		return NULL;
+
+	/* The per-instance identifier, carried over to every replacement. */
 	jent_uuid_generate(ec->uuid);
+
+	if (jent_entropy_collector_startup(&ec))
+		return NULL;
 
 	return ec;
 }
@@ -908,37 +1038,23 @@ JENT_PRIVATE_STATIC
 struct rand_data *jent_entropy_collector_alloc(unsigned int osr,
 					       unsigned int flags)
 {
-	/*
-	 * max_mem_set is recorded in jent_entropy_collector_alloc_internal()
-	 * so that it is already valid during the startup health-test resets.
-	 *
-	 * The internal flags are the library's to set, whatever the caller
-	 * passed: this one would let an instance generate from a clock no
-	 * startup measured.
-	 */
-	return _jent_entropy_collector_alloc(osr,
-					     flags & ~JENT_INT_MEASURE_CLOCK);
+	struct rand_data *ec = _jent_entropy_collector_alloc(osr, flags);
+
+	jent_stack_scrub();
+
+	return ec;
 }
 
 #ifdef LINUX_KERNEL
 /*
- * Test interface support: allocate an entropy collector without running the
- * startup entropy collection and its health-test reset ladder, so the
- * requested OSR/flags (and thus memory size and hash loop count) remain
- * exactly what the raw noise recording measures. This mirrors the userspace
- * recording tools (tests/raw-entropy/recording_userspace), which call
- * jent_entropy_collector_alloc_internal() directly by including this file.
- *
- * Only intended for the kernel test interface
- * (linux_kernel/jitterentropy_testing.c); regular consumers must use
- * jent_entropy_collector_alloc().
+ * Kernel test interface only: allocate a collector without the startup, so the
+ * raw noise recording measures exactly the requested OSR and flags.
  */
 struct rand_data *jent_entropy_collector_alloc_raw(unsigned int osr,
 						   unsigned int flags)
 {
-	return jent_entropy_collector_alloc_internal(osr,
-						     flags |
-						     JENT_INT_MEASURE_CLOCK);
+	return jent_entropy_collector_alloc_internal(osr, flags, 0,
+						     JENT_ALLOC_MEASURE_CLOCK);
 }
 #endif /* LINUX_KERNEL */
 
@@ -951,20 +1067,8 @@ void jent_entropy_collector_free(struct rand_data *entropy_collector)
 
 		jent_notime_disable(entropy_collector);
 
-		if (entropy_collector->hash_state != NULL) {
-			jent_sha3_dealloc(entropy_collector->hash_state);
-			entropy_collector->hash_state = NULL;
-		}
-
 		if (entropy_collector->mem != NULL) {
-			/*
-			 * Use memmask (== memsize - 1, set whenever mem was
-			 * allocated) rather than recomputing the size from
-			 * ->flags. On the allocation-failure cleanup path ->flags
-			 * may not have been assigned yet, in which case
-			 * jent_memsize(->flags) would return the default size and
-			 * mis-size the free (heap overflow or partial zeroization).
-			 */
+			/* ->flags may not be set yet on the error path. */
 			jent_zfree(entropy_collector->mem,
 				   (size_t)entropy_collector->memmask + 1);
 			entropy_collector->mem = NULL;
@@ -973,34 +1077,22 @@ void jent_entropy_collector_free(struct rand_data *entropy_collector)
 	}
 }
 
-int jent_time_entropy_init(unsigned int osr, unsigned int flags)
+static int jent_time_entropy_init_internal(unsigned int osr,
+					   unsigned int flags,
+					   unsigned int reinits)
 {
 	struct rand_data *ec = NULL;
-	uint64_t *delta_history;
-	int i, time_backwards = 0, count_stuck = 0, ret = 0;
+	uint64_t *delta_history, gcd;
+	int i, time_backwards = 0, count_stuck = 0, ret = 0, ticking = 0;
+	size_t nelem = 0;
 	unsigned int health_test_result;
 
 	delta_history = jent_gcd_init(JENT_POWERUP_TESTLOOPCOUNT, flags);
 	if (!delta_history)
 		return EMEM;
 
-	if (flags & JENT_FORCE_INTERNAL_TIMER)
-		jent_notime_force();
-	else
+	if (!(flags & JENT_FORCE_INTERNAL_TIMER))
 		flags |= JENT_DISABLE_INTERNAL_TIMER;
-
-	/*
-	 * Once the internal timer has been forced anywhere in the process -
-	 * that flag is one-way - jent_entropy_collector_alloc_internal()
-	 * refuses a collector that disables it, so this attempt cannot be made
-	 * at all. Say so, rather than letting the refused allocation below be
-	 * reported as EMEM: the caller ladders on to the internal timer either
-	 * way, but the log no longer blames memory for it.
-	 */
-	if (jent_notime_forced() && (flags & JENT_DISABLE_INTERNAL_TIMER)) {
-		ret = ENOTIME;
-		goto out;
-	}
 
 	/*
 	 * If the start-up health tests (including the APT and RCT) are not
@@ -1012,21 +1104,24 @@ int jent_time_entropy_init(unsigned int osr, unsigned int flags)
 	 * are really bad.
 	 */
 	flags |= JENT_FORCE_FIPS;
-	ec = jent_entropy_collector_alloc_internal(osr,
-						  flags |
-						  JENT_INT_MEASURE_CLOCK);
+	ec = jent_entropy_collector_alloc_internal(osr, flags, reinits,
+						   JENT_ALLOC_MEASURE_CLOCK);
 	if (!ec) {
 		ret = EMEM;
 		goto out;
 	}
 
+	/* The RCT-with-memory recovery must sample the source under test. */
+	ec->startup_state = jent_startup_completed;
+
 	if (jent_notime_settick(ec)) {
 		ret = EMEM;
 		goto out;
 	}
+	ticking = 1;
 
 	/* To initialize the prior time. */
-	jent_measure_jitter(ec, 0, NULL);
+	jent_measure_jitter_prime(ec);
 
 	/* We could perform statistical tests here, but the problem is
 	 * that we only have a few loop counts to do testing. These
@@ -1044,17 +1139,7 @@ int jent_time_entropy_init(unsigned int osr, unsigned int flags)
 		uint64_t start_time = 0, end_time = 0, delta = 0;
 		unsigned int stuck;
 
-		/*
-		 * The reading the previous measurement ended on, taken before
-		 * this one overwrites it, so the monotonicity check below
-		 * compares two readings the timer actually produced.
-		 *
-		 * Reconstructing it as prev_time - delta could not: delta is
-		 * unsigned and jent_measure_jitter() has already divided it by
-		 * the common timer divisor, so the check reduced to delta > 0
-		 * - which the coarseness check above had established anyway,
-		 * letting a timer running backwards pass.
-		 */
+		/* prev_time - delta cannot detect a timer running backwards */
 		start_time = ec->prev_time;
 
 		/* Invoke core entropy collection logic */
@@ -1091,20 +1176,22 @@ int jent_time_entropy_init(unsigned int osr, unsigned int flags)
 			count_stuck++;
 
 		/* test whether we have an increasing timer */
-		if (!(end_time > start_time))
+		if (!(end_time > start_time)) {
 			time_backwards++;
+			/* A wrapped delta would collapse the GCD analysis. */
+			continue;
+		}
 
 		/* Watch for common adjacent GCD values */
-		jent_gcd_add_value(delta_history, delta, i);
+		jent_gcd_add_value(delta_history, delta, nelem++);
 	}
 
 	/*
 	 * we allow up to three times the time running backwards.
-	 * All timer backends are monotonic by construction, but a counter read
-	 * can still appear to go backwards once in a while, e.g. when the
-	 * thread migrates between CPUs whose counters are not perfectly in
-	 * sync. Such an event must not fail the test outright; the value of 3
-	 * covers the occasional occurrence during our test run.
+	 * CLOCK_REALTIME is affected by adjtime and NTP operations. Thus,
+	 * if such an operation just happens to interfere with our test, it
+	 * should not fail. The value of 3 should cover the NTP case being
+	 * performed during our test run.
 	 */
 	if (time_backwards > 3) {
 		ret = ENOMONOTONIC;
@@ -1113,20 +1200,13 @@ int jent_time_entropy_init(unsigned int osr, unsigned int flags)
 
 	/* First, did we encounter a health test failure? */
 	if ((health_test_result = jent_health_failure(ec))) {
-		/*
-		 * A permanent RCT failure only sets
-		 * JENT_RCT_FAILURE_PERMANENT, not the intermittent bit, so both
-		 * must be tested to report ERCT instead of the generic EHEALTH.
-		 */
 		ret = (health_test_result &
 		       (JENT_RCT_FAILURE | JENT_RCT_FAILURE_PERMANENT)) ?
 		      ERCT : EHEALTH;
 		goto out;
 	}
 
-	/* ec->enable_notime rather than the flags: it did the measuring. */
-	ret = jent_gcd_analyze(delta_history, JENT_POWERUP_TESTLOOPCOUNT,
-			       ec->osr, ec->enable_notime);
+	ret = jent_gcd_verdict(delta_history, nelem, ec->osr, &gcd);
 	if (ret)
 		goto out;
 
@@ -1134,14 +1214,19 @@ int jent_time_entropy_init(unsigned int osr, unsigned int flags)
 	 * If we have more than 90% stuck results, then this Jitter RNG is
 	 * likely to not work well.
 	 */
-	if (JENT_STUCK_INIT_THRES(JENT_POWERUP_TESTLOOPCOUNT) < count_stuck)
+	if (JENT_STUCK_INIT_THRES(JENT_POWERUP_TESTLOOPCOUNT) < count_stuck) {
 		ret = ESTUCK;
+		goto out;
+	}
+
+	/* Only a passed startup establishes the divisor of its clock. */
+	jent_gcd_store(gcd, ec->enable_notime);
 
 out:
 	jent_gcd_fini(delta_history, JENT_POWERUP_TESTLOOPCOUNT);
 
 	/* NOOP if notime disabled. Can be done unconditionally */
-	if (ec)
+	if (ticking)
 		jent_notime_unsettick(ec);
 
 	jent_entropy_collector_free(ec);
@@ -1149,23 +1234,36 @@ out:
 	return ret;
 }
 
+int jent_time_entropy_init(unsigned int osr, unsigned int flags)
+{
+	return jent_time_entropy_init_internal(osr, flags, 0);
+}
+
+#ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
+/*
+ * The startup on the internal timer after the platform timer failed with
+ * @platform_ret, which is returned if the internal timer cannot be set up.
+ */
+static int jent_entropy_init_notime(unsigned int osr, unsigned int flags,
+				    unsigned int reinits, int platform_ret,
+				    unsigned int *clock)
+{
+	int ret = jent_time_entropy_init_internal(osr,
+					flags | JENT_FORCE_INTERNAL_TIMER,
+					reinits);
+
+	if (ret == EMEM)
+		return platform_ret;
+
+	*clock = JENT_CLOCK_NOTIME;
+	return ret;
+}
+#endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
+
 /**
  * jent_selftest() - Run the known answer tests of the conditioning component
  *
- * The SHA3-256 and XDRBG-256 tests that jent_entropy_init*() runs before
- * anything else, exposed separately for callers that have to repeat them over
- * the lifetime of a long-running process (the ESDM does so).
- *
- * They run on stack-local state alone, touching nothing of the library, of a
- * collector or of the operating system, and are therefore reentrant: callable
- * at any time, from any thread, in parallel with entropy collection,
- * allocating nothing and never blocking. Only a failure writes to the bound
- * collector, and nothing but this function ever sets that word.
- *
- * @param[in] ec Entropy collector the verdict is bound to: a failure puts the
- *		 instance permanently out of service, jent_read_entropy*()
- *		 returning JENT_ERR_SELFTEST instead of output from then on.
- *		 May be NULL to obtain the verdict without binding it.
+ * @param[in] ec Entropy collector a failure permanently disables, or NULL.
  *
  * @return 0 on success, EHASH if a known answer test failed.
  */
@@ -1174,18 +1272,13 @@ int jent_selftest(struct rand_data *ec)
 {
 	if (jent_sha3_tester()) {
 		if (ec)
-			ec->selftest_failed = 1;
+			jent_atomic_store_int(&ec->selftest_failed, 1);
 		return EHASH;
 	}
 
 	return 0;
 }
 
-/*
- * The flags are only needed for the memory the GCD self test allocates:
- * JENT_FORCE_SECURE_MEM must reach it as well, or the initialization would
- * report success on memory the collector allocation is then going to reject.
- */
 static inline int jent_entropy_init_common_pre(unsigned int flags)
 {
 	int ret;
@@ -1193,46 +1286,33 @@ static inline int jent_entropy_init_common_pre(unsigned int flags)
 	jent_notime_block_switch();
 	jent_health_cb_block_switch();
 
-	ret = jent_selftest(NULL);
-	if (ret)
-		return ret;
+	if (jent_sha3_tester())
+		return EHASH;
 
 	ret = jent_gcd_selftest(flags);
-
-	jent_atomic_store_int(&jent_selftest_run, 1);
 
 	return ret;
 }
 
-static inline int jent_entropy_init_common_post(int ret)
+static inline int jent_entropy_init_common_post(int ret, unsigned int clock)
 {
-	/* Unmark the execution of the self tests if they failed. */
-	if (ret)
-		jent_atomic_store_int(&jent_selftest_run, 0);
+	/* Never unmark: a failure must not retract another thread's verdict. */
+	if (!ret)
+		jent_atomic_store_int(&jent_selftest_run[clock], 1);
 
 	return ret;
 }
 
 /*
- * Note: the process-wide state this function and jent_entropy_init_ex()
- * establish - the self test verdict, the common timer GCD, whether the
- * internal timer had to be forced - is written and read through
- * arch/jitterentropy-arch-atomic.h, so several threads may run them at once:
- * each establishes the same state, and a thread that is told the state is
- * established also sees what was established. Running them once before any
- * concurrent use, e.g. via pthread_once(), remains the cheaper way to get
- * there, as every call measures the timer afresh.
- *
- * What must still happen before any concurrent use is configuration.
- * jent_entropy_set_notime_cpu(), jent_entropy_switch_notime_impl() and
- * jent_set_fips_failure_callback() write state that the calls above and the
- * generation only read; the -EAGAIN they return once an initialization has run
- * reports that the window has closed, it does not synchronize with a thread
- * that is already in it.
+ * Note: This function and jent_entropy_init_ex() may run concurrently; the
+ * global state they establish is accessed atomically. Configuration
+ * (jent_entropy_set_notime_cpu(), jent_entropy_switch_notime_impl(),
+ * jent_set_fips_failure_callback()) must precede any concurrent use.
  */
 JENT_PRIVATE_STATIC
 int jent_entropy_init(void)
 {
+	unsigned int clock = JENT_CLOCK_PLATFORM;
 	int ret = jent_entropy_init_common_pre(0);
 
 	if (ret)
@@ -1242,68 +1322,69 @@ int jent_entropy_init(void)
 
 #ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
 	if (ret)
-		ret = jent_time_entropy_init(0, JENT_FORCE_INTERNAL_TIMER);
+		ret = jent_entropy_init_notime(0, 0, 0, ret, &clock);
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 
-	return jent_entropy_init_common_post(ret);
+	ret = jent_entropy_init_common_post(ret, clock);
+
+	jent_stack_scrub();
+
+	return ret;
 }
 
-JENT_PRIVATE_STATIC
-int jent_entropy_init_ex(unsigned int osr, unsigned int flags)
+static int jent_entropy_init_internal(unsigned int osr, unsigned int flags,
+				    unsigned int reinits)
 {
+	unsigned int clock = JENT_CLOCK_PLATFORM;
 	int ret;
 
-	/*
-	 * Apply the same requirement the collector allocation will apply, so
-	 * that a caller asking for a compliance mode is not told the
-	 * initialization succeeded on memory that the later allocation then
-	 * refuses to work with.
-	 */
+	/* The same requirement the collector allocation applies. */
 	flags = jent_update_secure_mem(flags);
+
+	/* The configuration window closes on the first attempt. */
+	jent_notime_block_switch();
+	jent_health_cb_block_switch();
+
+	/* Arguments every allocation refuses. */
+	if (osr > JENT_MAX_OSR || jent_flags_invalid(flags) ||
+	    jent_memaccess_contradicts(flags))
+		return EPROGERR;
+
+	/* NTG.1 forbids the internal timer. */
+	if ((flags & JENT_NTG1) && (flags & JENT_FORCE_INTERNAL_TIMER))
+		return ENOTIME;
 
 	ret = jent_entropy_init_common_pre(flags);
 
 	if (ret)
 		return ret;
 
-	/*
-	 * NTG.1 forbids the internal timer, and the collector allocation
-	 * enforces that by adding JENT_DISABLE_INTERNAL_TIMER for it. Asking
-	 * for both is therefore a contradiction, and one that used to be
-	 * answered with EMEM after the allocation had already refused it.
-	 */
-	if ((flags & JENT_NTG1) && (flags & JENT_FORCE_INTERNAL_TIMER))
-		return jent_entropy_init_common_post(ENOTIME);
-
 	ret = ENOTIME;
 
 	/* Test without internal timer unless caller does not want it */
 	if (!(flags & JENT_FORCE_INTERNAL_TIMER))
-		ret = jent_time_entropy_init(osr,
-					flags | JENT_DISABLE_INTERNAL_TIMER);
+		ret = jent_time_entropy_init_internal(osr,
+					flags | JENT_DISABLE_INTERNAL_TIMER,
+					reinits);
 
 #ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
-	/*
-	 * Test with internal timer unless the caller does not want it - and
-	 * not for NTG.1, where the collector allocation disables the internal
-	 * timer anyway and then refuses the combination.
-	 *
-	 * Trying it regardless is not merely a wasted attempt: reaching
-	 * jent_time_entropy_init() with JENT_FORCE_INTERNAL_TIMER calls the
-	 * one-way jent_notime_force(), after which no collector in this
-	 * process can be allocated with the internal timer disabled. Every
-	 * later NTG.1 initialization then fails with the allocation's EMEM
-	 * rather than with a verdict on the platform clock - so one
-	 * intermittent health test failure, a normal event with the tighter
-	 * NTG.1 cutoffs, would put NTG.1 out of action for the life of the
-	 * process.
-	 */
+	/* Test with internal timer unless caller does not want it */
 	if (ret && !(flags & (JENT_DISABLE_INTERNAL_TIMER | JENT_NTG1)))
-		ret = jent_time_entropy_init(osr,
-					     flags | JENT_FORCE_INTERNAL_TIMER);
+		ret = jent_entropy_init_notime(osr, flags, reinits, ret,
+					       &clock);
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 
-	return jent_entropy_init_common_post(ret);
+	ret = jent_entropy_init_common_post(ret, clock);
+
+	jent_stack_scrub();
+
+	return ret;
+}
+
+JENT_PRIVATE_STATIC
+int jent_entropy_init_ex(unsigned int osr, unsigned int flags)
+{
+	return jent_entropy_init_internal(osr, flags, 0);
 }
 
 JENT_PRIVATE_STATIC
