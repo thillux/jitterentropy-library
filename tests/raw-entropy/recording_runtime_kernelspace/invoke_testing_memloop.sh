@@ -4,8 +4,13 @@
 # the memory access with all supported memory sizes and measures its execution
 # time.
 #
-# The testing disables the maximum memory check to allow analyzing all
-# memory sizes.
+# Each size is passed to the kernel as the JENT_MAX_MEMSIZE_* field of
+# testing_flags, which the collector takes as given - there is no check to
+# bypass, only the library's 512 MB maximum. The kernel must still be able to
+# allocate the region, though: a size it cannot (such as one above about 64 MB
+# on a 32-bit kernel, whose vmalloc area is small) fails the open of the test
+# interface with ENOMEM, and record() then aborts the script. The sizes
+# recorded before remain; the larger ones are not recorded.
 #
 # Specifically with the deterministic memory access pattern, the measurement
 # is intended to show the access variations of the "just" the cache that
@@ -34,17 +39,17 @@
 
 raw_entropy_ntg1_memloop()
 {
-	local memsize=$1
+	memsize=$1
 	shift
-	local testtype=$1
+	testtype=$1
 	shift
 
 	echo "---"
 	echo "Obtaining $NUM_EVENTS raw entropy measurement from Jitter RNG"
 
-	local cmdopts="--max-mem ${memsize} --memaccess -f $DEBUGFS_DIR --param-dir $PARAM_DIR $@"
+	cmdopts="--max-mem ${memsize} --memaccess -f $DEBUGFS_DIR --param-dir $PARAM_DIR $*"
 
-	$JENT_GETRAWENTROPY -s $NUM_EVENTS $cmdopts > $OUTDIR/${NONIID_MEMLOOP_DATA}_${testtype}${memsize}-0001.data
+	record $OUTDIR/${NONIID_MEMLOOP_DATA}_${testtype}${memsize}-0001.data -s $NUM_EVENTS $cmdopts
 
 	echo "---"
 }

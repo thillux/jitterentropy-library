@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 #
 # Process the entropy data
 
@@ -9,10 +9,22 @@
 # point to the directory that contains the results from the entropy collection
 ENTROPYDATA_DIR=${ENTROPYDATA_DIR:-"../results-measurements"}
 
-# this is where the resulting data and the entropy analysis will be stored
-RESULTS_DIR="../results-analysis-restart"
+# this is where the resulting data and the entropy analysis will be stored,
+# the hash loop and memory access sets go to directories beside it
+if [ -n "$RESULTS_DIR" ]
+then
+	HASHLOOP_RESULTS_DIR="$RESULTS_DIR-hashloop"
+	MEMACCLOOP_RESULTS_DIR="$RESULTS_DIR-memaccloop"
+else
+	RESULTS_DIR="../results-analysis-restart"
+	HASHLOOP_RESULTS_DIR="../results-analysis-hashloop-restart"
+	MEMACCLOOP_RESULTS_DIR="../results-analysis-memaccloop-restart"
+fi
 
 NONIID_DATA="$ENTROPYDATA_DIR/jent-raw-noise-restart*.data"
+
+# set by processdata_helper.sh when an analysis fails
+EA_FAILED=0
 
 ############################################################
 # Code only after this line -- do not change               #
@@ -24,8 +36,7 @@ NONIID_DATA="$ENTROPYDATA_DIR/jent-raw-noise-restart*.data"
 # Configuration values hash loop                           #
 ############################################################
 
-# this is where the resulting data and the entropy analysis will be stored
-RESULTS_DIR="../results-analysis-hashloop-restart"
+RESULTS_DIR="$HASHLOOP_RESULTS_DIR"
 
 BUILD_EXTRACT="no"
 
@@ -41,8 +52,7 @@ NONIID_DATA="$ENTROPYDATA_DIR/jent-raw-noise-hashloop-restart*.data"
 # Configuration values memory access loop                  #
 ############################################################
 
-# this is where the resulting data and the entropy analysis will be stored
-RESULTS_DIR="../results-analysis-memaccloop-restart"
+RESULTS_DIR="$MEMACCLOOP_RESULTS_DIR"
 
 BUILD_EXTRACT="no"
 

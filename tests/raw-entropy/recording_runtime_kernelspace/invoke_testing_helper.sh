@@ -25,14 +25,38 @@ JENT_GETRAWENTROPY=${JENT_GETRAWENTROPY:-"./getrawentropy"}
 # 1 -> JENT_MAX_MEMSIZE_1kB
 # ...
 # 20 -> JENT_MAX_MEMSIZE_512MB
-MAX_MEMORY_SIZE=0
+MAX_MEMORY_SIZE=${MAX_MEMORY_SIZE:-0}
 
 PARAM_DIR="/sys/module/jitter_rng/parameters"
 DEBUGFS_DIR="/sys/kernel/debug/jitter_rng/jent_raw_hires"
 
+# POSIX sh, as the device that records may have no bash, and ksh93 has no
+# local: function variables are global, hence names no caller uses.
+
+# A failed build or recording would leave a short or missing data set behind.
+fail()
+{
+	echo "ERROR: $*" >&2
+	exit 1
+}
+
 build()
 {
-	gcc -Wall -pedantic -Wextra -I../../../ -I../../../linux_kernel/ -DRAW_DATATYPE_U64 -o $JENT_GETRAWENTROPY getrawentropy.c
+	gcc -Wall -pedantic -Wextra -I../../../ -I../../../linux_kernel/ -DRAW_DATATYPE_U64 -o $JENT_GETRAWENTROPY getrawentropy.c ||
+		fail "building getrawentropy failed"
+}
+
+# $1: output file, remaining arguments passed on to getrawentropy
+record()
+{
+	out=$1
+	shift
+
+	if ! $JENT_GETRAWENTROPY "$@" > $out
+	then
+		rm -f $out
+		fail "getrawentropy failed recording $out"
+	fi
 }
 
 cleanup()
@@ -42,7 +66,7 @@ cleanup()
 
 initialization()
 {
-	local uid=$(id -u)
+	uid=$(id -u)
 	if [ $uid -ne 0 ]
 	then
 		echo "Execute script as root!"
@@ -59,22 +83,24 @@ initialization()
 		fi
 	fi
 
-	trap "rm -f $JENT_GETRAWENTROPY; exit" 0 1 2 3 15
+	# Keep the exit status of the script across the cleanup.
+	trap 'rc=$?; rm -f $JENT_GETRAWENTROPY; exit $rc' 0
+	trap 'exit 1' 1 2 3 15
 }
 
 raw_entropy_restart()
 {
 	echo "Obtaining $NUM_RESTART raw entropy measurement with $NUM_EVENTS_RESTART restarts from Jitter RNG"
 
-	local cmdopts="--max-mem $MAX_MEMORY_SIZE -f $DEBUGFS_DIR --param-dir $PARAM_DIR $@"
-	local ctr=0
+	cmdopts="--max-mem $MAX_MEMORY_SIZE -f $DEBUGFS_DIR --param-dir $PARAM_DIR $*"
+	ctr=0
 
 	build
 
 	while [ $ctr -lt $NUM_RESTART ]
 	do
-		printf -v ctrval "%04d" $ctr
-		$JENT_GETRAWENTROPY -s $NUM_EVENTS_RESTART $cmdopts >  $OUTDIR/$NONIID_RESTART_DATA-$ctrval.data
+		ctrval=$(printf "%04d" "$ctr")
+		record $OUTDIR/$NONIID_RESTART_DATA-$ctrval.data -s $NUM_EVENTS_RESTART $cmdopts
 
 		ctr=$((ctr+1))
 	done
@@ -86,10 +112,10 @@ raw_entropy()
 {
 	echo "Obtaining $NUM_EVENTS raw entropy measurement from Jitter RNG"
 
-	local cmdopts="--max-mem $MAX_MEMORY_SIZE -f $DEBUGFS_DIR --param-dir $PARAM_DIR $@"
+	cmdopts="--max-mem $MAX_MEMORY_SIZE -f $DEBUGFS_DIR --param-dir $PARAM_DIR $*"
 
 	build
-	$JENT_GETRAWENTROPY -s $NUM_EVENTS $cmdopts > $OUTDIR/$NONIID_DATA-0001.data
+	record $OUTDIR/$NONIID_DATA-0001.data -s $NUM_EVENTS $cmdopts
 	cleanup
 }
 
@@ -97,10 +123,10 @@ raw_entropy_ntg1_hash()
 {
 	echo "Obtaining $NUM_EVENTS raw entropy measurement from Jitter RNG"
 
-	local cmdopts="--max-mem $MAX_MEMORY_SIZE --hashloop -f $DEBUGFS_DIR --param-dir $PARAM_DIR $@"
+	cmdopts="--max-mem $MAX_MEMORY_SIZE --hashloop -f $DEBUGFS_DIR --param-dir $PARAM_DIR $*"
 
 	build
-	$JENT_GETRAWENTROPY -s $NUM_EVENTS $cmdopts > $OUTDIR/$NONIID_HASH_DATA-0001.data
+	record $OUTDIR/$NONIID_HASH_DATA-0001.data -s $NUM_EVENTS $cmdopts
 	cleanup
 }
 
@@ -108,15 +134,15 @@ raw_entropy_ntg1_hash_restart()
 {
 	echo "Obtaining $NUM_RESTART raw entropy measurement with $NUM_EVENTS_RESTART restarts from Jitter RNG"
 
-	local cmdopts="--max-mem $MAX_MEMORY_SIZE --hashloop -f $DEBUGFS_DIR --param-dir $PARAM_DIR $@"
-	local ctr=0
+	cmdopts="--max-mem $MAX_MEMORY_SIZE --hashloop -f $DEBUGFS_DIR --param-dir $PARAM_DIR $*"
+	ctr=0
 
 	build
 
 	while [ $ctr -lt $NUM_RESTART ]
 	do
-		printf -v ctrval "%04d" $ctr
-		$JENT_GETRAWENTROPY -s $NUM_EVENTS_RESTART $cmdopts >  $OUTDIR/$NONIID_HASH_RESTART_DATA-$ctrval.data
+		ctrval=$(printf "%04d" "$ctr")
+		record $OUTDIR/$NONIID_HASH_RESTART_DATA-$ctrval.data -s $NUM_EVENTS_RESTART $cmdopts
 
 		ctr=$((ctr+1))
 	done
@@ -128,10 +154,10 @@ raw_entropy_ntg1_memacc()
 {
 	echo "Obtaining $NUM_EVENTS raw entropy measurement from Jitter RNG"
 
-	local cmdopts="--max-mem $MAX_MEMORY_SIZE --memaccess -f $DEBUGFS_DIR --param-dir $PARAM_DIR $@"
+	cmdopts="--max-mem $MAX_MEMORY_SIZE --memaccess -f $DEBUGFS_DIR --param-dir $PARAM_DIR $*"
 
 	build
-	$JENT_GETRAWENTROPY -s $NUM_EVENTS $cmdopts > $OUTDIR/$NONIID_MEMLOOP_DATA-0001.data
+	record $OUTDIR/$NONIID_MEMLOOP_DATA-0001.data -s $NUM_EVENTS $cmdopts
 	cleanup
 }
 
@@ -139,15 +165,15 @@ raw_entropy_ntg1_memacc_restart()
 {
 	echo "Obtaining $NUM_RESTART raw entropy measurement with $NUM_EVENTS_RESTART restarts from Jitter RNG"
 
-	local cmdopts="--max-mem $MAX_MEMORY_SIZE --memaccess -f $DEBUGFS_DIR --param-dir $PARAM_DIR $@"
-	local ctr=0
+	cmdopts="--max-mem $MAX_MEMORY_SIZE --memaccess -f $DEBUGFS_DIR --param-dir $PARAM_DIR $*"
+	ctr=0
 
 	build
 
 	while [ $ctr -lt $NUM_RESTART ]
 	do
-		printf -v ctrval "%04d" $ctr
-		$JENT_GETRAWENTROPY -s $NUM_EVENTS_RESTART $cmdopts >  $OUTDIR/$NONIID_MEMLOOP_RESTART_DATA-$ctrval.data
+		ctrval=$(printf "%04d" "$ctr")
+		record $OUTDIR/$NONIID_MEMLOOP_RESTART_DATA-$ctrval.data -s $NUM_EVENTS_RESTART $cmdopts
 
 		ctr=$((ctr+1))
 	done

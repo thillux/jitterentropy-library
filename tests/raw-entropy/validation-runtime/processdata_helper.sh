@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Process the entropy data
 
@@ -30,8 +30,7 @@ BUILD_EXTRACT=${BUILD_EXTRACT:-"yes"}
 # specify the list of significant bits and length that you want to analize.
 # Indicate first the mask in hexa format and then the number of
 # bits separated by a colon.
-# The tool generates one set of var and single data files, and the EA results
-# for each element.
+# The tool generates one data file, and the EA results, for each element.
 # The mask can have a maximum of 8 bits on, the EA tool only manages samples
 # up to one byte.
 
@@ -42,8 +41,10 @@ MASK_LIST="FF:8"
 # List used for ARM Cortext A9 and A7 processors
 #MASK_LIST="FF:4,8 7F8:4,8"
 
-# Maximum number of entries to be extracted from the original file
-MAX_EVENTS=1000000
+# Number of entries to be extracted from each original file: a recording
+# made with a NUM_EVENTS override (see recording_userspace/README.md) is
+# analyzed with the same NUM_EVENTS. extractlsb fails on a file with fewer.
+MAX_EVENTS=${MAX_EVENTS:-${NUM_EVENTS:-1000000}}
 
 ############################################################
 # Code only after this line -- do not change               #
@@ -80,7 +81,11 @@ fi
 
 rm -f $RESULTS_DIR/*.txt $RESULTS_DIR/*.data  $RESULTS_DIR/*.log
 
-trap "if [ "$BUILD_EXTRACT" = "yes" ]; then make clean; fi" 0 1 2 3 15
+# Evaluated at exit, not when set: processdata_ntg1.sh sources this once per
+# set, and only the first builds extractlsb. A signal exits, so that the
+# EXIT trap cleans up rather than the script going on.
+trap 'if [ "${EXTRACT_BUILT:-}" = "yes" ]; then make clean; fi' 0
+trap 'exit 1' 1 2 3 15
 
 
 if [ "$BUILD_EXTRACT" = "yes" ]
@@ -88,6 +93,7 @@ then
 	echo "Building $EXTRACT ..."
 	make clean
 	make
+	EXTRACT_BUILT="yes"
 else
 	make
 fi
@@ -109,7 +115,7 @@ do
 		mask=${item%:*}
 		bits=${item#*:}
 
-		$EXTRACT $file $filepath.${mask}bitout.data $MAX_EVENTS $mask 2>&1 | tee -a $LOGFILE
+		$EXTRACT $file $filepath.${mask}bitout.data "$MAX_EVENTS" $mask 2>&1 | tee -a $LOGFILE
 		if [ $? -ne 0 ]
 		then
 			echo "ERROR: Extraction of $file (mask $mask) failed" | tee -a $LOGFILE
@@ -139,22 +145,15 @@ do
 		for bits in $bits_list
 		do
 			outfile=${filepath}.minentropy_${mask}_${bits}bits.txt
-			inprocess_file=$outfile
-			if [ ! -f $outfile ]
+			echo "Analyzing entropy for $infile ${bits}-bit" | tee -a $LOGFILE
+			$EATOOL_NONIID -i -a -v $infile ${bits} > $outfile
+			if [ $? -ne 0 ]
 			then
-				echo "Analyzing entropy for $infile ${bits}-bit" | tee -a $LOGFILE
-				#python -u $EATOOL_NONIID -v $infilesingle $bits > $outfile
-				$EATOOL_NONIID -i -a -v $infile ${bits} > $outfile
-				if [ $? -ne 0 ]
-				then
-					echo "ERROR: Entropy analysis of $infile (${bits} bits) failed" | tee -a $LOGFILE
-					# do not leave a partial result behind that
-					# would be skipped as complete on a re-run
-					rm -f $outfile
-					exit 1
-				fi
-			else
-				echo "File $outfile already generated"
+				# keep what the tool said, the results are cleared
+				# above on every run
+				tail -n 5 $outfile | tee -a $LOGFILE
+				echo "ERROR: Entropy analysis of $infile (${bits} bits) failed" | tee -a $LOGFILE
+				exit 1
 			fi
 		done
 	done

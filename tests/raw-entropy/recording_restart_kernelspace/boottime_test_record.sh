@@ -1,17 +1,23 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright (C) 2023 - 2026, Stephan Mueller <smueller@chronox.de>
 #
 # Test for analyzing the boot time entropy by power cycling the test machine
 # many times and record the first time stamps.
 #
+# The test applies to the Jitter RNG of the vanilla kernel (crypto/), whose
+# test interface buffers the first entropy events since boot. The out-of-tree
+# module in linux_kernel/ has no such boot time buffer.
+#
 # Test execution:
-#	1. Enable kernel option `CONFIG_CRYPTO_JITTERENTROPY_TESTINTERFACE`,
+#	1. Enable kernel option `CONFIG_CRYPTO_JITTERENTROPY_TESTINTERFACE`
+#	   (offered with `CONFIG_CRYPTO_FIPS` and `CONFIG_EXPERT`),
 #	   enable configuration option `CONFIG_CRYPTO_USER_API_RNG`,
 #	   compile, install and reboot the kernel, and ensure that the
 #	   Linux kernel command line contains
-#	   `jitterentropy_rng.boot_raw_hires_test=1`
-#	2. Compile getrawentropy.c and install into /usr/local/sbin
+#	   `jitterentropy_testing.boot_raw_hires_test=1`
+#	2. Compile getrawentropy.c for the kernel version as documented in
+#	   that file and install into /usr/local/sbin
 #	3. Copy this file to /usr/local/sbin and make it executable and do not
 #	   forget restorecon if applicable
 #	4. Copy boottime_test_record.service to /etc/systemd/system/
@@ -42,8 +48,9 @@ then
 	mkdir -p $DIR
 fi
 
-#testruns=$(ls $OUTFILE* | wc -l | cut -d" " -f1)
-testruns=$(cat $STATE)
+# Decimal run counter: 10# as a leading zero would otherwise make it octal
+testruns=$(cat $STATE 2>/dev/null)
+testruns=$((10#${testruns:-0}))
 echo $((testruns+1)) > $STATE
 
 #add leading zeros
@@ -52,15 +59,18 @@ echo $((testruns+1)) > $STATE
 # for i in jent_raw_noise_restart.??.data; do mv $i $(echo $i | cut -d. -f1).000$(echo $i | cut -d. -f2).$(echo $i | cut -d. -f3) ; done
 # for i in jent_raw_noise_restart.???.data; do mv $i $(echo $i | cut -d. -f1).00$(echo $i | cut -d. -f2).$(echo $i | cut -d. -f3) ; done
 # for i in jent_raw_noise_restart.????.data; do mv $i $(echo $i | cut -d. -f1).0$(echo $i | cut -d. -f2).$(echo $i | cut -d. -f3) ; done
-printf -v testruns "%05d" $testruns
+# Zero-padded only for the file name, the counter stays decimal
+printf -v run "%05d" $testruns
 
 if [ ! -x "$KCAPIRNG" ]
 then
-	echo "Test tool $KCAPIRNG not found" > $OUTFILE.$testruns.data
+	echo "Test tool $KCAPIRNG not found" > $OUTFILE.$run.data
 	echo "Test tool $KCAPIRNG not found"
 	testruns=$TESTS
 else
-	( (  /usr/local/sbin/getrawentropy -f /sys/kernel/debug/jitterentropy_testing/jent_raw_hires -s 1001 > $OUTFILE.$testruns.data ) & )
+	# The vanilla kernel interface delivers time stamps, --timestamps
+	# records their deltas as consumed by the Jitter RNG
+	( (  /usr/local/sbin/getrawentropy --timestamps -f /sys/kernel/debug/jitterentropy_testing/jent_raw_hires -s 1001 > $OUTFILE.$run.data ) & )
 	$KCAPIRNG -n "jitterentropy_rng" -b 2000
 fi
 
@@ -70,8 +80,6 @@ if [ $testruns -ge $TESTS ]; then
 	systemctl disable boottime_test_record
 
 	uname -a > $OUTDIR/platform.txt &&
-	cat /proc/cpuinfo >> $OUTDIR/platform.txt &&
-	echo "" >> $OUTDIR/platform.txt &&
 	cat /proc/cpuinfo >> $OUTDIR/platform.txt &&
 	echo "" >> $OUTDIR/platform.txt &&
 	echo "lspci" >> $OUTDIR/platform.txt &&

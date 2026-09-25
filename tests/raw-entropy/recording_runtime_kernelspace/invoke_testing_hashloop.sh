@@ -12,15 +12,15 @@
 
 raw_entropy_ntg1_hashloop()
 {
-	local hashloop=$1
+	hashloop=$1
 	shift
 
 	echo "---"
 	echo "Obtaining $NUM_EVENTS raw entropy measurement from Jitter RNG"
 
-	local cmdopts="--hloopcnt ${hashloop} --hashloop -f $DEBUGFS_DIR --param-dir $PARAM_DIR $@"
+	cmdopts="--hloopcnt ${hashloop} --hashloop -f $DEBUGFS_DIR --param-dir $PARAM_DIR $*"
 
-	$JENT_GETRAWENTROPY -s $NUM_EVENTS $cmdopts > $OUTDIR/${NONIID_HASH_DATA}_${hashloop}-0001.data
+	record $OUTDIR/${NONIID_HASH_DATA}_${hashloop}-0001.data -s $NUM_EVENTS $cmdopts
 
 	echo "---"
 }
