@@ -39,16 +39,28 @@
  * DAMAGE.
  */
 
-#ifndef _JITTERENTROPY_UUID_H
-#define _JITTERENTROPY_UUID_H
-
-/* "8-4-4-4-12" including the NUL, defined identically in jitterentropy.h. */
-#define JENT_UUID_STRLEN 37
-
 /*
- * Generate an RFC 9562 version 4 UUID string of JENT_UUID_STRLEN bytes, or a
- * version 8 one hashed from a counter and the time without a CSPRNG.
+ * JENT_O_CLOEXEC, the open() flag that keeps a descriptor from leaking into a
+ * child that a concurrent fork() and exec() starts. O_CLOEXEC is POSIX.1-2008
+ * and absent from older systems, where the window stays open rather than the
+ * build failing.
+ *
+ * It is O_CLOEXEC out of <fcntl.h> that is tested, so a backend includes this
+ * header right after its <fcntl.h>; like every arch header it includes nothing
+ * itself. Included too early, it settles on 0 without a word, which is why
+ * it is kept apart from jitterentropy-arch-compat.h, the one that has to come
+ * before every system header.
  */
-void jent_uuid_generate(char *out);
 
-#endif /* _JITTERENTROPY_UUID_H */
+#ifndef _JITTERENTROPY_ARCH_CLOEXEC_H
+#define _JITTERENTROPY_ARCH_CLOEXEC_H
+
+#ifndef JENT_O_CLOEXEC
+# ifdef O_CLOEXEC
+#  define JENT_O_CLOEXEC O_CLOEXEC
+# else
+#  define JENT_O_CLOEXEC 0
+# endif
+#endif
+
+#endif /* _JITTERENTROPY_ARCH_CLOEXEC_H */

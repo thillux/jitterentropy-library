@@ -37,8 +37,6 @@ void jent_get_nstime_internal(struct rand_data *ec, uint64_t *out);
 int jent_notime_enable(struct rand_data *ec, unsigned int flags);
 void jent_notime_disable(struct rand_data *ec);
 int jent_notime_switch(struct jent_notime_thread *new_thread);
-void jent_notime_force(void);
-int jent_notime_forced(void);
 
 #else /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 
@@ -47,7 +45,7 @@ static inline void jent_notime_block_switch(void) { }
 static inline int jent_notime_set_cpu(unsigned long cpu)
 {
 	(void)cpu;
-	return -1;
+	return -EOPNOTSUPP;
 }
 
 static inline int jent_notime_settick(struct rand_data *ec)
@@ -83,12 +81,8 @@ static inline void jent_notime_disable(struct rand_data *ec)
 static inline int jent_notime_switch(struct jent_notime_thread *new_thread)
 {
 	(void)new_thread;
-	return -1;
+	return -EOPNOTSUPP;
 }
-
-static inline void jent_notime_force(void) { }
-
-static inline int jent_notime_forced(void) { return 0; }
 
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 

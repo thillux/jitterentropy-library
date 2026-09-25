@@ -49,7 +49,8 @@
  *
  *   - Linux kernel              -> get_random_bytes()
  *   - Windows (MSVC / MinGW)    -> BCryptGenRandom()
- *   - Apple / *BSD              -> arc4random_buf()
+ *   - Apple / *BSD, and the     -> arc4random_buf()
+ *     FreeBSD kernel
  *   - Linux userspace           -> getrandom(), /dev/urandom fallback
  *   - other Unix-like           -> /dev/urandom
  *   - anything else (baremetal) -> none, and the call fails
@@ -67,12 +68,7 @@
 #ifndef _JITTERENTROPY_ARCH_RANDOM_H
 #define _JITTERENTROPY_ARCH_RANDOM_H
 
-#ifdef LINUX_KERNEL
-#include <linux/types.h>
-#else
-#include <stddef.h>
-#include <stdint.h>
-#endif
+/* No includes, as in every arch/ header: jitterentropy.h has the types. */
 
 /*
  * Fill @buf with @len bytes from whichever of the above this target has.

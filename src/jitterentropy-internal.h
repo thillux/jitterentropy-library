@@ -44,14 +44,7 @@
 
 #include "jitterentropy.h"
 
-/*
- * Architecture- and OS-specific helpers (timestamp, secure memory, cache
- * size discovery, online CPU count, FIPS mode detection, scheduler yield,
- * atomic access to the process-wide latches) live in dedicated shared headers.
- * The ones that can be expressed inline select the right implementation
- * through #ifdefs here; the rest declare what the matching source file under
- * arch/ defines, which is where a platform's own headers stay confined.
- */
+/* Architecture- and OS-specific helpers, implemented under arch/. */
 #include "arch/jitterentropy-arch-atomic.h"
 #include "arch/jitterentropy-arch-timer.h"
 #include "arch/jitterentropy-arch-memory.h"
@@ -63,30 +56,8 @@
 #include "jitterentropy-uuid.h"
 
 #ifdef LINUX_KERNEL
-/*
- * Kernel div64 primitives backing jent_udiv64()/jent_umod64() below. The
- * header is deliberately lightweight (types, math, the arch div64
- * primitives), so it is safe for the -O0 entropy-collection core including
- * this file.
- */
 #include <linux/math64.h>	/* div64_u64(), div64_u64_rem() */
-/*
- * memcpy()/memset() are used by the core itself (jitterentropy-base.c,
- * jitterentropy-noise.c, jitterentropy-sha3.c). They used to arrive here by
- * accident, dragged in behind <linux/timex.h> via the arch timer header; that
- * header now lives in arch/jitterentropy-arch-timer.c and the core no longer
- * sees it, so the dependency is stated where it is actually used. <linux/
- * string.h> is itself fine at -O0 - it was already being compiled that way
- * through the transitive path this replaces.
- */
 #include <linux/string.h>	/* memcpy(), memset() */
-/*
- * Reached the core the same accidental way: -EAGAIN is returned by
- * jitterentropy-gcd.c and jitterentropy-health.c, and the kernel's
- * fallthrough attribute backs JENT_FALLTHROUGH below for kernel builds. Both
- * used to arrive behind <linux/timex.h> -> <linux/kernel.h>. Neither header is
- * heavier than the ones above and both are safe for the -O0 core.
- */
 #include <linux/errno.h>	/* EAGAIN */
 #include <linux/compiler.h>	/* fallthrough */
 #endif
@@ -101,8 +72,6 @@ extern "C" {
 # define UINT32_MAX	(4294967295U)
 #endif
 #ifndef UINT64_C
-/* #ifdef, not #if: kernel builds run with -Wundef and 32-bit targets do not
- * define __LP64__ at all. */
 # ifdef __LP64__
 #  define UINT64_C(c)   c ## UL
 # else
@@ -113,24 +82,11 @@ extern "C" {
 /* The kernel supplies a fallthrough macro of its own. */
 #define JENT_FALLTHROUGH	fallthrough
 
-/*
- * Test interface support (see jitterentropy-base.c): allocate an entropy
- * collector without running the startup entropy collection and its
- * health-test reset ladder. Only intended for the kernel test interface
- * (linux_kernel/jitterentropy_testing.c).
- */
+/* A collector without the startup, for linux_kernel/jitterentropy_testing.c */
 struct rand_data *jent_entropy_collector_alloc_raw(unsigned int osr,
 						   unsigned int flags);
 
-/*
- * 64-bit division / modulo with a 64-bit divisor.
- *
- * The plain C operators on 64-bit operands are lowered to libgcc helper
- * calls (__udivdi3, __aeabi_uldivmod, ...) on 32-bit kernels, and the kernel
- * does not provide those helpers; route the operations through the kernel's
- * div64 primitives instead. On 64-bit kernels both primitives are inline
- * plain divisions, so code generation there is identical to the operators.
- */
+/* 64-bit division: 32-bit kernels have no libgcc helpers for the operators. */
 static inline uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
 {
 	return div64_u64(dividend, divisor);
@@ -146,20 +102,7 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 
 #else /* LINUX_KERNEL */
 
-/*
- * Deliberately JENT_-prefixed rather than the bare lowercase "fallthrough".
- * This header is included before the platform headers in several translation
- * units, and a macro by that name silently rewrites any system header that
- * probes for the attribute - Apple's <os/base.h>, reached through
- * <mach/mach.h>, does exactly that with __has_attribute(fallthrough) and
- * fails to compile once the bare macro is in scope.
- *
- * __has_attribute() itself must be probed with defined() first: compilers
- * that do not provide it (MSVC) replace the unknown identifier with 0 and
- * then choke on the leftover "(__fallthrough__)" argument list - a constraint
- * violation, which MSVC reports as warning C4067 in every translation unit
- * including this header.
- */
+/* Not the bare "fallthrough", which breaks system headers probing for it. */
 #if defined(__has_attribute)
 # if __has_attribute(__fallthrough__)
 #  define JENT_FALLTHROUGH	__attribute__((__fallthrough__))
@@ -169,11 +112,16 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 # define JENT_FALLTHROUGH	do {} while (0)
 #endif
 
-/*
- * 64-bit division / modulo with a 64-bit divisor; see the kernel branch
- * above for the rationale. Userspace links against libgcc (or an
- * equivalent), so the plain operators are used directly.
- */
+/* Keep AddressSanitizer's redzones and fake stack out of a function. */
+#if defined(__has_attribute)
+# if __has_attribute(__no_sanitize_address__)
+#  define JENT_NO_SANITIZE_ADDRESS	__attribute__((__no_sanitize_address__))
+# endif
+#endif
+#ifndef JENT_NO_SANITIZE_ADDRESS
+# define JENT_NO_SANITIZE_ADDRESS
+#endif
+
 static inline uint64_t jent_udiv64(uint64_t dividend, uint64_t divisor)
 {
 	return dividend / divisor;
@@ -186,44 +134,7 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 
 #endif /* LINUX_KERNEL */
 
-/*
- * An instance that measures a clock rather than generating entropy from it:
- * the startup's own collector, and the raw noise recording. Both want the
- * deltas as the clock produces them, and the first of them is what
- * establishes the common divisor the others are normalized by - so these are
- * the only instances allowed to run without one.
- *
- * Internal, and not in jitterentropy.h: the library sets it on the flags it
- * passes down, a caller never does. The public allocation clears it. The bit
- * is above the public flags and below the hash loop field; internal flags
- * grow downwards from here.
- */
-#define JENT_INT_MEASURE_CLOCK	(UINT32_C(1) << 23)
-
-/*
- * JENT_-prefixed, and defined outside the LINUX_KERNEL split above, for the
- * same reason JENT_FALLTHROUGH is: the bare names belong to the environment,
- * not to this library.
- *
- * jitterentropy.h deliberately does not pull in <linux/module.h> (and so not
- * <linux/kernel.h>), which keeps the -O0 entropy core free of headers that do
- * not compile without optimisation - but it also means the kernel's
- * ARRAY_SIZE()/BUILD_BUG_ON() are not available to the core, so equivalents
- * have to be defined here.
- *
- * Spelling them with the kernel's names and an #ifndef guard is what this did
- * before, and it only worked by accident: some other header had to define them
- * first for the guard to suppress ours. That held while <linux/timex.h> pulled
- * <linux/kernel.h> into every translation unit; once the timer backend moved
- * out (see arch/jitterentropy-arch-timer.c) our definitions landed first
- * instead, and every file that later included a kernel header got a
- * "'ARRAY_SIZE' redefined" warning. A distinct name cannot collide in either
- * order, on any kernel, so no guard is needed.
- *
- * linux_kernel/ is deliberately not converted: that layer includes
- * <linux/kernel.h> itself and uses the kernel's own macros, as kernel code
- * should.
- */
+/* JENT_-prefixed: the kernel's own macros are not in scope, or collide. */
 #define JENT_BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
 
 #define JENT_ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
@@ -319,35 +230,33 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
  * If the memory updates should dominantly result in a memory update, then
  * the value should be set to at least 3.
  * The actual size of the memory region is never larger than requested by
- * the passed in JENT_MAX_MEMSIZE_* flag (if provided) or JENT_MEMORY_SIZE
- * (if no JENT_MAX_MEMSIZE_* flag is provided).
+ * the passed in JENT_MAX_MEMSIZE_* flag (if provided); without one it is
+ * derived from the cache size, or JENT_DEFAULT_MEMORY_BITS where that is
+ * unknown (see jent_memsize()).
  */
 #ifndef JENT_CACHE_SHIFT_BITS
 #define JENT_CACHE_SHIFT_BITS 0
 #endif
 
 /*
- * Ceiling for the memory size that jent_update_memsize() derives on its own
- * from the discovered cache geometry. It does not constrain a size the caller
- * requested explicitly with a JENT_MAX_MEMSIZE_* flag - that is the caller's
- * decision to make - only the automatic one.
- *
- * On a 64-bit target this is JENT_MAX_MEMSIZE_MAX, i.e. no additional limit.
- * On a 32-bit target the address space is the binding constraint rather than
- * the cache: a two-socket machine with a large L3 makes JENT_CACHE_ALL derive
- * the full 512 MB, which the collector then both maps and mlock()s. That is a
- * sixth of the usable address space of a 32-bit process and well beyond a
- * typical RLIMIT_MEMLOCK, so jent_zalloc() fails and the whole collector
- * allocation fails with it. Capping the derived value at 64 MB keeps the
- * automatic path working on i686, armv7, RV32 and 31-bit s390.
- *
- * UINTPTR_MAX is the pointer-width test; where it is unavailable (the Linux
- * kernel build does not define it) the 64-bit branch is taken, which leaves
- * that configuration's behaviour unchanged.
+ * Ceiling for the memory size derived from the cache size, not for one the
+ * caller requested: 32-bit address spaces cannot always map 512 MB.
  */
-#if defined(UINTPTR_MAX) && (UINTPTR_MAX <= 0xffffffffUL)
+#if defined(LINUX_KERNEL)
+# ifndef BITS_PER_LONG
+#  error "BITS_PER_LONG missing: <linux/types.h> no longer provides it"
+# endif
+# if BITS_PER_LONG == 32
+#  define JENT_MAX_AUTO_MEMSIZE JENT_FLAGS_TO_MAX_MEMSIZE(JENT_MAX_MEMSIZE_64MB)
+# endif
+#elif defined(__SIZEOF_POINTER__)
+# if __SIZEOF_POINTER__ <= 4
+#  define JENT_MAX_AUTO_MEMSIZE JENT_FLAGS_TO_MAX_MEMSIZE(JENT_MAX_MEMSIZE_64MB)
+# endif
+#elif defined(UINTPTR_MAX) && (UINTPTR_MAX <= 0xffffffffUL)
 # define JENT_MAX_AUTO_MEMSIZE JENT_FLAGS_TO_MAX_MEMSIZE(JENT_MAX_MEMSIZE_64MB)
-#else
+#endif
+#ifndef JENT_MAX_AUTO_MEMSIZE
 # define JENT_MAX_AUTO_MEMSIZE JENT_FLAGS_TO_MAX_MEMSIZE(JENT_MAX_MEMSIZE_MAX)
 #endif
 
@@ -436,9 +345,10 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
  * - is instantiated with an OSR of 0 provided to the initialization API
  *
  * During initial health tests or jent_read_entropy_safe, the RNG instance
- * may re-initialize with an incremented OSR, which stops at JENT_OSR_MAX
+ * may re-initialize with an incremented OSR, which stops at JENT_MAX_OSR
  * and returns a failure condition. Otherwise this would run "forever".
- * Set another value instead of the default 20, if necessary.
+ * Set another value instead of the default 20, if necessary - the health
+ * test cutoff tables must then be extended (tests/health/cutoffs.py).
  */
 #ifndef JENT_MIN_OSR
 #define JENT_MIN_OSR	3
@@ -454,6 +364,32 @@ static inline uint64_t jent_umod64(uint64_t dividend, uint64_t divisor)
 
 #define JENT_SHA3_256_SIZE_DIGEST_BITS	256
 #define JENT_SHA3_256_SIZE_DIGEST	(JENT_SHA3_256_SIZE_DIGEST_BITS >> 3)
+
+#define JENT_SHA3_SIZE_BLOCK(bits)	((1600 - 2 * bits) >> 3)
+
+#define JENT_SHA3_256_SIZE_BLOCK                                               \
+	JENT_SHA3_SIZE_BLOCK(JENT_SHA3_256_SIZE_DIGEST_BITS)
+
+#define JENT_XDRBG_SIZE_STATE		64
+
+/* Here, not in jitterentropy-sha3.h: struct rand_data embeds it. */
+struct jent_sha_ctx {
+	uint64_t state[25];
+	uint8_t partial[JENT_SHA3_256_SIZE_BLOCK];
+	size_t msg_len;
+	uint8_t r;
+	uint8_t rword;
+	/*
+	 * This implementation only supports up to rate-size digests for XOFs,
+	 * thus the data type can be appropriately small.
+	 */
+	uint8_t digestsize;
+	uint8_t padding;
+	uint8_t initially_seeded:1;
+
+	/* XDRBG scratch, in the collector's secure memory, not on the stack. */
+	uint8_t xdrbg_block[JENT_XDRBG_SIZE_STATE + JENT_SHA3_256_SIZE_DIGEST];
+};
 
 /*
  * The output 256 bits can receive more than 256 bits of min entropy,
@@ -489,7 +425,7 @@ struct rand_data
 	 * of the RNG are marked as SENSITIVE. A user must not
 	 * access that information while the RNG executes its loops to
 	 * calculate the next random value. */
-	void *hash_state;		/* SENSITIVE hash state entropy pool */
+	struct jent_sha_ctx hash_state;	/* SENSITIVE hash state entropy pool */
 	uint64_t prev_time;		/* SENSITIVE Previous time stamp */
 #define DATA_SIZE_BITS (JENT_SHA3_256_SIZE_DIGEST_BITS)
 
@@ -501,30 +437,11 @@ struct rand_data
 	unsigned int flags;		/* Flags used to initialize */
 	unsigned int osr;		/* Oversampling rate */
 
-	/* RFC 4122 version 4 identifier, stable for the collector's lifetime. */
-	char uuid[JENT_UUID_STRLEN];
+	char uuid[JENT_UUID_STRLEN];	/* RFC 9562 instance identifier */
 
-	/*
-	 * Number of times this instance has been reinitialized (reallocated on
-	 * health-test recovery). Carried over, incremented, across the identity-
-	 * preserving reallocation in jent_health_failure_reset().
-	 */
-	unsigned int reinit_count;
-
-	/*
-	 * Per-instance output accounting, reported by jent_status(). Both are
-	 * carried over across the identity-preserving reallocation in
-	 * jent_health_failure_reset() so the totals span the instance's whole
-	 * lifetime.
-	 *
-	 * read_invocations counts caller read requests: jent_read_entropy()
-	 * increments it only on success, so a jent_read_entropy_safe() request
-	 * maps to one invocation regardless of how many internal health-test
-	 * retries it takes (failed attempts never count).
-	 * bytes_output counts the random bytes actually delivered to callers.
-	 */
-	uint64_t read_invocations;
-	uint64_t bytes_output;
+	unsigned int reinit_count;	/* Reallocations on health failure */
+	uint64_t read_invocations;	/* Successful reads, for jent_status() */
+	uint64_t bytes_output;		/* Bytes delivered, for jent_status() */
 
 	/* Initialization state supporting AIS 20/31 NTG.1 */
 	enum jent_startup_state startup_state;
@@ -561,6 +478,7 @@ struct rand_data
 					 * window. */
 	uint64_t apt_base;		/* APT base reference */
 	unsigned int health_failure;	/* Permanent health failure */
+	unsigned int health_failure_reported; /* Bits the callback saw */
 
 	/* RCT with memory */
 	unsigned short rct_mem_ctr;	/* Loop iteration for generating random bytes */
@@ -572,23 +490,22 @@ struct rand_data
 	unsigned int apt_base_set:1;	/* APT base reference set? */
 	unsigned int is_fips_enabled:1;
 	unsigned int enable_notime:1;	/* Use internal high-res timer */
-	unsigned int max_mem_set:1;	/* Maximum memory configured by user */
 	unsigned int in_recovery:1;	/* Flag to indicate a recovery op. */
+	unsigned int rct_mem_primed:1;	/* RCT-mem count carried into the
+					 * next window */
 
-	/*
-	 * A jent_selftest() run bound to this instance failed. Deliberately
-	 * not a bit in health_failure: that word only reports under FIPS,
-	 * while a broken conditioning component must stop the output in every
-	 * mode. A full word rather than a bitfield: the self test may run on
-	 * another thread, and setting a bitfield would rewrite its neighbors.
-	 */
-	unsigned int selftest_failed:1;
+	unsigned int noise_stopped:1;	/* Noise source stopped delivering,
+					 * stops the output in every mode */
+
+	/* Bound jent_selftest() failed; no bitfield, set from another thread */
+	int selftest_failed;
 
 #ifdef JENT_CONF_ENABLE_INTERNAL_TIMER
 	volatile uint8_t notime_interrupt;	/* indicator to interrupt ctr */
 	volatile uint64_t notime_timer;		/* high-res timer mock-up */
 	uint64_t notime_prev_timer;		/* previous timer value */
 	void *notime_thread_ctx;		/* register thread data */
+	unsigned int notime_running;		/* a started thread to stop */
 #endif /* JENT_CONF_ENABLE_INTERNAL_TIMER */
 
 	uint64_t jent_common_timer_gcd;	/* Common divisor for all time deltas */
@@ -652,6 +569,34 @@ struct rand_data
 	unsigned int lag_scoreboard[JENT_LAG_HISTORY_SIZE];
 #endif /* JENT_HEALTH_LAG_PREDICTOR */
 };
+
+/* The window of the RCT with memory: the measurements of one output block. */
+#define JENT_MEASURE_JITTER_LOOP_CTR(_osr, _safety_factor)                     \
+	((DATA_SIZE_BITS + (_safety_factor)) * (_osr))
+
+/*
+ * The health test RCT with memory operates on multiples of three time deltas.
+ * Therefore, round up the jitter loop counter to the nearest multiple of three.
+ */
+#define JENT_ROUNDUP_TO_THREE(x)                                               \
+	(jent_udiv64((x) + 2, 3) * 3)
+#define JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR(_osr, _safety_factor)            \
+	JENT_ROUNDUP_TO_THREE(                                                 \
+		JENT_MEASURE_JITTER_LOOP_CTR(_osr, _safety_factor))
+
+/* 0 when the window does not fit the counters or cover one output block. */
+static inline unsigned short jent_rct_mem_window(const struct rand_data *ec)
+{
+	unsigned int safety_factor = ec->is_fips_enabled ?
+				     ENTROPY_SAFETY_FACTOR : 0;
+	uint64_t nosr = JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR((uint64_t)ec->osr,
+							      safety_factor);
+
+	if (nosr > USHRT_MAX || nosr < DATA_SIZE_BITS)
+		return 0;
+
+	return (unsigned short)nosr;
+}
 
 #ifdef __cplusplus
 }

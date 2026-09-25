@@ -36,7 +36,9 @@ unsigned int jent_measure_jitter_ntg1_sha3(struct rand_data *ec,
 unsigned int jent_measure_jitter(struct rand_data *ec,
 				 uint64_t loop_cnt,
 				 uint64_t *ret_current_delta);
+void jent_measure_jitter_prime(struct rand_data *ec);
 void jent_random_data(struct rand_data *ec);
+void jent_random_data_recovery(struct rand_data *ec, unsigned int loops);
 void jent_read_random_block(struct rand_data *ec, char *dst, size_t dst_len);
 
 #ifdef __cplusplus
