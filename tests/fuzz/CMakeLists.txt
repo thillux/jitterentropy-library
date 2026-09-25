@@ -10,7 +10,7 @@
 # tests/health and the unit tests do. It exists because fuzz-api cannot search:
 # every operation there measures the machine's real timer and the run manages
 # single-digit executions per second, while nothing in fuzz-health measures
-# anything and it runs four orders of magnitude faster.
+# anything and it judges orders of magnitude more measurements per second.
 #
 # Two programs are built from each harness:
 #
@@ -28,10 +28,13 @@
 # assert() and a build that defines NDEBUG would fuzz nothing but crashes. The
 # source undefines it itself, so a Release build needs no flag here.
 
+# ${PROJECT_NAME} is the library target, as the root CMakeLists.txt names it.
+# Not ${CMAKE_PROJECT_NAME}: that is the top-level project, which is someone
+# else's when this tree is pulled in with add_subdirectory().
 add_executable(fuzz-api-standalone fuzz-api.c)
 target_compile_definitions(fuzz-api-standalone PRIVATE JENT_FUZZ_STANDALONE)
 target_compile_options(fuzz-api-standalone PRIVATE ${JITTER_C_FLAGS})
-target_link_libraries(fuzz-api-standalone PRIVATE ${CMAKE_PROJECT_NAME})
+target_link_libraries(fuzz-api-standalone PRIVATE ${PROJECT_NAME})
 add_test(NAME fuzz-api-standalone COMMAND fuzz-api-standalone)
 
 # Absorbs src/jitterentropy-health.c to reach jent_health_insert_timestamp()
@@ -53,7 +56,7 @@ if(ENABLE_FUZZING)
     target_compile_options(fuzz-api PRIVATE ${JITTER_C_FLAGS}
                            -fsanitize=fuzzer)
     target_link_options(fuzz-api PRIVATE -fsanitize=fuzzer)
-    target_link_libraries(fuzz-api PRIVATE ${CMAKE_PROJECT_NAME})
+    target_link_libraries(fuzz-api PRIVATE ${PROJECT_NAME})
 
     add_executable(fuzz-health fuzz-health.c)
     target_compile_definitions(fuzz-health PRIVATE JENT_STATIC_LIB)
@@ -91,5 +94,5 @@ endif()
 # it exercises and links no library at all.
 if(WIN32 AND BUILD_SHARED_LIBS)
     set_tests_properties(fuzz-api-standalone PROPERTIES ENVIRONMENT_MODIFICATION
-        "PATH=path_list_prepend:$<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>")
+        "PATH=path_list_prepend:$<TARGET_FILE_DIR:${PROJECT_NAME}>")
 endif()

@@ -356,8 +356,10 @@ int main(int argc, char *argv[])
 	}
 
 	/*
-	 * The self test is module-wide rather than a field of this instance,
-	 * so the status document has nothing to compare it against. What is
+	 * The self test is this instance's own, but an action rather than a
+	 * field: it runs the known answer tests bound to the collector behind
+	 * this file and returns a verdict, which the status document has no
+	 * value to compare against. What is
 	 * checked is the privilege rule: it runs for a caller holding
 	 * CAP_SYS_ADMIN and is refused to one without it. euid 0 stands in for
 	 * the capability - a non-root caller that holds it through a file

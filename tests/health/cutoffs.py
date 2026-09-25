@@ -25,8 +25,10 @@ The cutoffs:
     for so the test can still fail. margin is 1, or 8 for the NTG.1 tables.
 
   Lag predictor, global cutoff
-    qbinom(1 - alpha, JENT_LAG_WINDOW_SIZE - JENT_LAG_HISTORY_SIZE,
-           2^(-1/osr))
+    C = 1 + qbinom(1 - alpha, JENT_LAG_WINDOW_SIZE - JENT_LAG_HISTORY_SIZE,
+                   2^(-1/osr))
+    one above the quantile, because the test fires once the count of correct
+    predictions reaches C, so P(X >= C) is what has to stay within alpha.
 
   Lag predictor, local cutoff
     The shortest run of correct predictions whose probability of occurring
@@ -38,16 +40,25 @@ The cutoffs:
     with x the root near 1 of 1 - x + q p^r x^(r+1).
 
   Repetition count test with memory
-    floor(n p + tau * sqrt(n p' (1 - p'))), capped at n and, for the
-    permanent cutoff, at n + 1. n = 321/3 * osr is the number of observations
-    a window makes, p = 2^(1 - margin/osr) is twice the 2^(-H) of the
-    heuristic entropy H = margin/osr, and p' = min(p, 1/2) holds the variance
-    at its maximum once p passes 1/2. tau is the 4 and 5 of the significance
-    levels pnorm(-4) and pnorm(-5) the source quotes.
+    floor(n p + tau * sqrt(n p' (1 - p'))), capped: at n for the two
+    intermittent cutoffs and at n + 1 for the two permanent ones. n = 321/3 *
+    osr is the number of observations a window makes - 321 being
+    DATA_SIZE_BITS + ENTROPY_SAFETY_FACTOR, read from the header - p = 2^(1 - margin/osr)
+    is twice the 2^(-H) of the heuristic entropy H = margin/osr, and
+    p' = min(p, 1/2) holds the variance at its maximum once p passes 1/2. tau
+    is the 4 and 5 of the significance levels pnorm(-4) and pnorm(-5) the
+    source quotes.
 
-    In the common case, margin 1, p >= 1 at every oversampling rate, so both
-    cutoffs are the cap - which is what "these values effectively disables the
-    health test" beside them means.
+    The caps are what the formula runs into wherever p >= 1 - at every
+    oversampling rate in the common case, margin 1, and from osr 8 on for
+    NTG.1 - because the mean alone then exceeds the n observations a window
+    makes. A permanent cutoff of n + 1 is one past anything a window can
+    count, so no window raises it: even a counter primed across a reallocation
+    reaches the intermittent cutoff first - the tables rise with osr and a
+    reset always raises it - and the recovery loop starts a fresh count. An
+    intermittent cutoff of n is reached by a window whose every observation is
+    stuck. See rct_mem_table() for why the intermittent cap is n and not
+    n + 1.
 
 alpha is 2^-30 for the RCT and the APT and 2^-22 for the lag predictor, whose
 window is much larger; the permanent cutoffs use its square. The margin is the
@@ -60,6 +71,7 @@ Usage:
 """
 
 import argparse
+import os
 import re
 import sys
 
@@ -69,26 +81,117 @@ try:
 except ImportError:
     sys.exit("this script needs mpmath (pip install mpmath)")
 
-# src/jitterentropy-internal.h
-APT_WINDOW_SIZE = 512
-LAG_WINDOW_SIZE = 1 << 17
-LAG_HISTORY_SIZE = 8
+# The window sizes and the rate range are read out of the header that defines
+# them, src/jitterentropy-internal.h, by load_header(): written out here, a
+# change of JENT_APT_WINDOW_SIZE would move the tables in the source and here
+# not at all, and --check would compare the new tables against the old
+# derivation - or, with both regenerated from this script, stay green on
+# cutoffs no longer derived for the window they guard.
+APT_WINDOW_SIZE = None
+LAG_WINDOW_SIZE = None
+LAG_HISTORY_SIZE = None
 
-# JENT_MAX_OSR, the highest oversampling rate the library accepts: every
-# table covers 1 up to it, which a build assertion in the source enforces.
-MAX_OSR = 20
+# JENT_MAX_OSR: every table has exactly one entry per rate from 1 up to it
+# (asserted in the source).
+MAX_OSR = None
 
-# The 8-fold entropy margin of NTG.1 operation.
+# The window of the repetition count test with memory:
+# JENT_ADJUSTED_MEASURE_JITTER_LOOP_CTR(osr, ENTROPY_SAFETY_FACTOR), the
+# (DATA_SIZE_BITS + ENTROPY_SAFETY_FACTOR) * osr deltas jent_random_data_one()
+# generates for one output block rounded up to a multiple of three, of which
+# tau = 3 leaves every third one observed. See rct_mem_observations().
+RCT_MEM_BLOCK_BITS = None
+
+# The 8-fold entropy margin of NTG.1 operation. The APT and RCT-mem tables
+# carry it in their values; the RCT gets it at run time from the factor
+# jent_health_init() passes jent_rct_init(), which --check reads back.
 NTG1_MARGIN = 8
 
-# The window of the repetition count test with memory: the 321 * osr deltas
-# jent_random_data_one() generates for one output block, of which tau = 3
-# leaves every third one observed. The cutoffs sit that many standard
+# The cutoffs of the repetition count test with memory sit that many standard
 # deviations above the mean.
-RCT_MEM_WINDOW = 321
 RCT_MEM_TAU = 3
 RCT_MEM_SIGMA = 4
 RCT_MEM_SIGMA_PERMANENT = 5
+
+# The macros load_header() takes from src/jitterentropy-internal.h, and the
+# ones their values may refer to.
+HEADER_MACROS = ["JENT_APT_WINDOW_SIZE", "JENT_LAG_WINDOW_SIZE",
+                 "JENT_LAG_HISTORY_SIZE", "JENT_MAX_OSR", "DATA_SIZE_BITS",
+                 "ENTROPY_SAFETY_FACTOR", "JENT_SHA3_256_SIZE_DIGEST_BITS"]
+
+
+def header_macros(path):
+    """The integer macros of @path that HEADER_MACROS names, evaluated.
+
+    Only what those few definitions use is understood: decimal literals with
+    an optional U suffix, +, <<, parentheses and each other's names. Anything
+    else is refused rather than guessed at.
+    """
+    text = open(path).read()
+    raw = {}
+
+    for m in re.finditer(r"^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]+([^\n]*?)"
+                         r"[ \t]*(?:/\*.*)?$", text, re.M):
+        if m.group(1) in HEADER_MACROS:
+            if m.group(1) in raw:
+                sys.exit("%s: %s is defined more than once"
+                         % (path, m.group(1)))
+            raw[m.group(1)] = m.group(2)
+
+    values = {}
+
+    def evaluate(name, depth=0):
+        if name in values:
+            return values[name]
+        if name not in raw or depth > len(HEADER_MACROS):
+            sys.exit("%s: cannot find or resolve %s" % (path, name))
+        expr = re.sub(r"\b(\d+)[uU]\b", r"\1", raw[name])
+        expr = re.sub(r"\b([A-Z_][A-Z0-9_]*)\b",
+                      lambda m: str(evaluate(m.group(1), depth + 1)), expr)
+        if not re.fullmatch(r"[\d\s()+<]*", expr):
+            sys.exit("%s: cannot evaluate %s = %s" % (path, name, raw[name]))
+        values[name] = int(eval(expr, {"__builtins__": {}}))
+        return values[name]
+
+    return {name: evaluate(name) for name in HEADER_MACROS}
+
+
+def load_header(path):
+    """Take the window sizes and JENT_MAX_OSR from @path."""
+    global APT_WINDOW_SIZE, LAG_WINDOW_SIZE, LAG_HISTORY_SIZE, MAX_OSR
+    global RCT_MEM_BLOCK_BITS
+
+    macros = header_macros(path)
+    APT_WINDOW_SIZE = macros["JENT_APT_WINDOW_SIZE"]
+    LAG_WINDOW_SIZE = macros["JENT_LAG_WINDOW_SIZE"]
+    LAG_HISTORY_SIZE = macros["JENT_LAG_HISTORY_SIZE"]
+    MAX_OSR = macros["JENT_MAX_OSR"]
+    RCT_MEM_BLOCK_BITS = (macros["DATA_SIZE_BITS"]
+                          + macros["ENTROPY_SAFETY_FACTOR"])
+
+
+def rct_mem_observations(osr):
+    """The observations one window of the RCT with memory makes."""
+    return (RCT_MEM_BLOCK_BITS * osr + RCT_MEM_TAU - 1) // RCT_MEM_TAU
+
+
+def source_ntg1_rct_margin(path):
+    """The safety factor jent_health_init() passes jent_rct_init() for NTG.1."""
+    text = open(path).read()
+    case = re.search(r"case jent_health_init_type_ntg1:(.*?)break;", text,
+                     re.S)
+    if not case:
+        return None
+    factor = re.search(r"jent_rct_init\(\s*ec\s*,\s*(\d+)\s*\)",
+                       case.group(1))
+    return int(factor.group(1)) if factor else None
+
+
+# How far above the n observations of a window the formula may be capped.
+# See rct_mem_table(): the intermittent cutoffs are capped one lower than the
+# permanent ones, so that they stay reachable within their window.
+RCT_MEM_CAP_INTERMITTENT = 0
+RCT_MEM_CAP_PERMANENT = 1
 
 
 def upper_tail(m, n, p):
@@ -204,14 +307,31 @@ def rct_mem_table(margin, sigmas, cap_offset):
 
     The mean plus @sigmas standard deviations of the stuck count over the
     n = 321/tau * osr observations a window makes, rounded down and capped at
-    n (n + 1 for the permanent cutoff), which is where the test can no longer
-    fail. p is twice the 2^(-H) of the heuristic entropy H = margin/osr, and
-    the variance is held at its maximum once p passes 1/2.
+    n + @cap_offset.
+
+    The cap is not cosmetic: with p = 2^(1 - margin/osr) >= 1 the mean alone
+    is at or above n, so the formula asks for a cutoff no window can ever
+    count up to. Which cap is applied is a choice, and the two differ:
+
+      RCT_MEM_CAP_PERMANENT = 1 - n + 1, one past the largest count a window
+        can reach, so no window can raise a permanent failure: even one
+        continuing from jent_rct_mem_duplicate()'s priming passes the
+        intermittent cutoff first, and its recovery loop starts a fresh count.
+
+      RCT_MEM_CAP_INTERMITTENT = 0 - n, a window whose every observation is
+        stuck. This is one below what the formula says, deliberately: capping
+        at n + 1 like the permanent cutoff would leave the intermittent test
+        and the recovery loop behind it unable to fire at all within their
+        window. The cost is a bound that is slightly conservative wherever
+        the cap binds; the gain is that a dead noise source is still caught.
+
+    p is twice the 2^(-H) of the heuristic entropy H = margin/osr, and the
+    variance is held at its maximum once p passes 1/2.
     """
     table = []
 
     for osr in range(1, MAX_OSR + 1):
-        n = RCT_MEM_WINDOW // RCT_MEM_TAU * osr
+        n = rct_mem_observations(osr)
         p = power(2, 1 - mpf(margin) / osr)
         var_p = min(p, mpf(1) / 2)
         cutoff = int(floor(n * p + sigmas * sqrt(n * var_p * (1 - var_p))))
@@ -229,7 +349,8 @@ def apt_table(margin, alpha):
 
 def lag_global_table(alpha):
     n = LAG_WINDOW_SIZE - LAG_HISTORY_SIZE
-    return [qbinom(alpha, n, power(2, mpf(-1) / osr))
+    # jent_lag_insert() fires at count >= C: P(X >= qbinom + 1) <= alpha.
+    return [1 + qbinom(alpha, n, power(2, mpf(-1) / osr))
             for osr in range(1, MAX_OSR + 1)]
 
 
@@ -259,13 +380,16 @@ TABLES = [
     ("jent_apt_cutoff_permanent_lookup_ntg1", "unsigned int",
      lambda: apt_table(NTG1_MARGIN, mpf(2) ** -60)),
     ("jent_rct_mem_cutoff_lookup", "unsigned short",
-     lambda: rct_mem_table(1, RCT_MEM_SIGMA, 0)),
+     lambda: rct_mem_table(1, RCT_MEM_SIGMA, RCT_MEM_CAP_INTERMITTENT)),
     ("jent_rct_mem_cutoff_permanent_lookup", "unsigned short",
-     lambda: rct_mem_table(1, RCT_MEM_SIGMA_PERMANENT, 1)),
+     lambda: rct_mem_table(1, RCT_MEM_SIGMA_PERMANENT,
+                           RCT_MEM_CAP_PERMANENT)),
     ("jent_rct_mem_cutoff_lookup_ntg1", "unsigned short",
-     lambda: rct_mem_table(NTG1_MARGIN, RCT_MEM_SIGMA, 0)),
+     lambda: rct_mem_table(NTG1_MARGIN, RCT_MEM_SIGMA,
+                           RCT_MEM_CAP_INTERMITTENT)),
     ("jent_rct_mem_cutoff_permanent_lookup_ntg1", "unsigned short",
-     lambda: rct_mem_table(NTG1_MARGIN, RCT_MEM_SIGMA_PERMANENT, 1)),
+     lambda: rct_mem_table(NTG1_MARGIN, RCT_MEM_SIGMA_PERMANENT,
+                           RCT_MEM_CAP_PERMANENT)),
 ]
 
 # The RCT has no table: src/jitterentropy-health.h states the cutoff as a
@@ -286,7 +410,7 @@ def format_table(name, ctype, values):
         row = ", ".join("%*d" % (width, v) for v in chunk)
         lines.append(("\t{ " if i == 0 else "\t  ") + row)
 
-    return ("static const %s %s[%d] =\n" % (ctype, name, len(values))
+    return ("static const %s %s[] =\n" % (ctype, name)
             + ",\n".join(lines) + " };")
 
 
@@ -346,6 +470,13 @@ def main():
 
     mp.dps = args.dps
 
+    # The header sits beside the source the tables are checked against, or
+    # for printing beside this script's source tree.
+    srcdir = (os.path.dirname(os.path.abspath(args.check)) if args.check
+              else os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                os.pardir, os.pardir, "src"))
+    load_header(os.path.join(srcdir, "jitterentropy-internal.h"))
+
     tables = TABLES
     if args.table:
         tables = [t for t in TABLES if t[0] in args.table]
@@ -377,14 +508,25 @@ def main():
                              else "MISMATCH: header has %s, computed x * %d"
                                   % (macros.get(name), computed))
 
-        # jent_rct_init() applies the NTG.1 margin to the macro above with
-        # integer arithmetic; that has to agree with the entropy rate 8/osr.
-        intermittent = RCT_MACROS[0][1]
-        ntg1 = [(rct_cutoff(osr, intermittent) + NTG1_MARGIN - 1)
-                // NTG1_MARGIN for osr in range(1, MAX_OSR + 1)]
-        failed += report("RCT NTG.1 margin",
-                         ntg1 == rct_table(NTG1_MARGIN, intermittent),
-                         "%d values" % len(ntg1))
+        # jent_rct_init() applies the NTG.1 margin jent_health_init() passes
+        # it to the macros above with integer arithmetic; the factor in the
+        # source has to be that margin, and the rounding has to agree with
+        # the entropy rate margin/osr.
+        margin = source_ntg1_rct_margin(args.check)
+        if margin != NTG1_MARGIN:
+            failed += report("RCT NTG.1 margin", False,
+                             "MISMATCH: jent_rct_init() gets %s for NTG.1, "
+                             "expected %d" % (margin, NTG1_MARGIN))
+        else:
+            ntg1_ok = True
+            for _name, alpha in RCT_MACROS:
+                ntg1 = [(rct_cutoff(osr, alpha) + margin - 1) // margin
+                        for osr in range(1, MAX_OSR + 1)]
+                ntg1_ok &= ntg1 == rct_table(NTG1_MARGIN, alpha)
+            failed += report("RCT NTG.1 margin", ntg1_ok,
+                             "jent_rct_init(ec, %d), %d values"
+                             % (margin, 2 * MAX_OSR) if ntg1_ok
+                             else "MISMATCH: rounding disagrees")
 
     for name, _ctype, compute in tables:
         computed = compute()

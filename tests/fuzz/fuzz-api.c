@@ -24,8 +24,9 @@
  * The API as a hostile caller uses it: null pointers where an object is
  * expected, lengths of zero and of SIZE_MAX, oversampling rates far outside
  * the range the library clamps, flag words with every undefined bit set,
- * collectors freed twice, entropy read from an instance that was never
- * initialized, calls in an order no documented sequence produces.
+ * a collector freed and then freed again as a null pointer, entropy read from
+ * an instance that was never initialized, calls in an order no documented
+ * sequence produces.
  *
  * The library is linked rather than absorbed - what is under test is the
  * surface jitterentropy.h declares, which is what an application reaches, and
@@ -73,15 +74,7 @@
  *     and the four an input may hold at once are past the RSS limit libFuzzer
  *     stops the run at. The size does not change how the pool is walked - the
  *     number of accesses is the same - so nothing but the footprint is given
- *     up here, and
- *   - JENT_FORCE_INTERNAL_TIMER is masked out of everything that could reach
- *     jent_entropy_init_ex(): forcing the internal timer is one-way
- *     process-wide state, so one input would put every later input in the
- *     fuzzer's process on the counting thread. The refusal paths of that flag
- *     are covered by unit-base-api and unit-notime, and the contradiction
- *     with JENT_DISABLE_INTERNAL_TIMER is still exercised through
- *     jent_entropy_collector_alloc(), which rejects it before anything is
- *     forced.
+ *     up here.
  */
 
 /*
@@ -110,7 +103,7 @@
 /* The largest documented return code of jent_entropy_init*(). */
 #define FZ_INIT_LAST	EGCD
 
-/* Collectors held at once, so that a run can free the wrong one, or one twice. */
+/* Collectors held at once, so that a run can free the wrong one. */
 #define FZ_SLOTS	4
 /* Calls per input: the noise source measures real time, so runs are not free. */
 #define FZ_MAX_OPS	8
@@ -134,7 +127,14 @@
  * above the default rather than anywhere near the JENT_HASHLOOP_128 the field
  * can express. See the head of the file.
  */
-#define FZ_MAX_HASHLOOP_FIELD	1	/* JENT_HASHLOOP_2 */
+#define FZ_MAX_HASHLOOP_FIELD	2	/* JENT_HASHLOOP_2 */
+
+/*
+ * The flag bits jitterentropy.h reserves (9 to 22), and the four of them whose
+ * being set together makes fz_flags() leave the lot in place.
+ */
+#define FZ_RESERVED_FLAGS	0x007ffe00u
+#define FZ_RESERVED_KEEP	0x00780000u
 
 struct fz_state {
 	const uint8_t *data;
@@ -225,13 +225,23 @@ static unsigned int fz_flags(struct fz_state *s)
 			JENT_HASHLOOP_TO_FLAGS(hashloop);
 	}
 
+	/*
+	 * The reserved bits are refused outright (EPROGERR, a NULL
+	 * collector), so a random word - which almost always has one of the
+	 * fourteen set - would reach nothing past the flag check. Cleared
+	 * unless the top four of them are all set: one input in sixteen still
+	 * carries them, which keeps the refusal itself exercised and is what
+	 * fz_flags_reserved() asserts against.
+	 */
+	if ((flags & FZ_RESERVED_KEEP) != FZ_RESERVED_KEEP)
+		flags &= ~(unsigned int)FZ_RESERVED_FLAGS;
+
 	return flags;
 }
 
-/* The same, for the calls that must not force the internal timer. See above. */
-static unsigned int fz_flags_no_force(struct fz_state *s)
+static int fz_flags_reserved(unsigned int flags)
 {
-	return fz_flags(s) & ~(unsigned int)JENT_FORCE_INTERNAL_TIMER;
+	return (flags & FZ_RESERVED_FLAGS) != 0;
 }
 
 /* A length, folded onto the boundaries of what the buffer below can hold. */
@@ -329,8 +339,12 @@ static void fz_op_alloc(struct fz_state *s, struct rand_data **slots)
 {
 	unsigned int slot = fz_u8(s) % FZ_SLOTS;
 	unsigned int osr = fz_osr(s);
-	unsigned int flags = fz_flags_no_force(s);
+	unsigned int flags = fz_flags(s);
 	struct rand_data *ec = jent_entropy_collector_alloc(osr, flags);
+
+	/* A reserved bit is refused, whatever else the flags say. */
+	if (fz_flags_reserved(flags))
+		assert(ec == NULL);
 
 	/*
 	 * Overwriting a slot that still holds a collector leaks it, so the old
@@ -482,13 +496,15 @@ static void fz_op_selftest(struct fz_state *s, struct rand_data **slots)
 static void fz_op_init(struct fz_state *s, struct rand_data **slots)
 {
 	unsigned int osr = fz_osr(s);
-	unsigned int flags = fz_flags_no_force(s);
+	unsigned int flags = fz_flags(s);
 	int ret;
 
 	(void)slots;
 
 	ret = jent_entropy_init_ex(osr, flags);
 	assert(ret >= 0 && ret <= FZ_INIT_LAST);
+	if (fz_flags_reserved(flags))
+		assert(ret == EPROGERR);
 
 	if (fz_u8(s) & 1) {
 		ret = jent_entropy_init();
@@ -549,7 +565,12 @@ static void fz_op_misc(struct fz_state *s, struct rand_data **slots)
 		 * A CPU index no machine has: advisory, so the answer is a
 		 * status and not a promise, and it must not be a stray value.
 		 */
-		assert(jent_entropy_set_notime_cpu((unsigned long)-1) != 1);
+		{
+			int ret = jent_entropy_set_notime_cpu(
+					(unsigned long)-1);
+
+			assert(ret == 0 || ret == -EAGAIN);
+		}
 
 		/* No implementation at all, which has to be refused. */
 		assert(jent_entropy_switch_notime_impl(NULL) != 0);

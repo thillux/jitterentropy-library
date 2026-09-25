@@ -236,24 +236,30 @@ static int jent_one_test(const char *pathname, unsigned long rounds,
 	 * disable the Jitter RNG. However, as we are in test mode, we
 	 * *want* to also know about insufficient entropy.
 	 * Thus, only perform the cryptographic self tests and go on.
+	 *
+	 * Those self tests are the whole reason this call is here, and its
+	 * verdict used to be thrown away: a SHA-3 or GCD known answer test
+	 * that failed still produced a recording, and that recording then fed
+	 * the SP800-90B pipeline as though the conditioning under it worked.
+	 * Unlike a health test verdict this one is not about the noise source
+	 * and there is nothing to learn from carrying on.
 	 */
-#if 0
-	ret = jent_entropy_init_ex(osr, flags);
+	ret = jent_entropy_init_common_pre(flags);
 	if (ret) {
-		printf("The initialization failed with error code %d\n", ret);
+		printf("The conditioning self test failed with error code %d (%s)\n",
+		       ret,
+		       (ret == EHASH) ? "SHA-3 known answer test" :
+		       (ret == EGCD) ? "GCD known answer test" :
+				       "unexpected startup failure");
+		ret = 1;
 		goto out;
 	}
-#else
-	jent_entropy_init_common_pre(flags);
-#endif
 
 	/*
 	 * Use the internal allocation to prevent checking and updating the
 	 * OSR, memory size or hash loop count.
 	 */
-	ec = jent_entropy_collector_alloc_internal(osr,
-						  flags |
-						  JENT_INT_MEASURE_CLOCK);
+	ec = jent_entropy_collector_alloc_internal(osr, flags, 0, 1);
 	if (!ec) {
 		printf("Allocation of the entropy collector failed\n");
 		/*
@@ -375,6 +381,24 @@ static int jent_one_test(const char *pathname, unsigned long rounds,
 		if (health_test_result & JENT_RCT_FAILURE) printf(" RCT");
 		if (health_test_result & JENT_APT_FAILURE) printf(" APT");
 		if (health_test_result & JENT_LAG_FAILURE) printf(" Lag");
+		if (health_test_result & JENT_RCT_MEM_FAILURE) printf(" RCT-mem");
+		if (health_test_result & JENT_RCT_FAILURE_PERMANENT)
+			printf(" RCT-permanent");
+		if (health_test_result & JENT_APT_FAILURE_PERMANENT)
+			printf(" APT-permanent");
+		if (health_test_result & JENT_LAG_FAILURE_PERMANENT)
+			printf(" Lag-permanent");
+		if (health_test_result & JENT_RCT_MEM_FAILURE_PERMANENT)
+			printf(" RCT-mem-permanent");
+		/* A bit this tool does not know yet, not an empty list */
+		if (health_test_result &
+		    ~(unsigned int)(JENT_RCT_FAILURE | JENT_APT_FAILURE |
+				    JENT_LAG_FAILURE | JENT_RCT_MEM_FAILURE |
+				    JENT_RCT_FAILURE_PERMANENT |
+				    JENT_APT_FAILURE_PERMANENT |
+				    JENT_LAG_FAILURE_PERMANENT |
+				    JENT_RCT_MEM_FAILURE_PERMANENT))
+			printf(" (unknown 0x%x)", health_test_result);
 		printf("\n");
 	}
 
