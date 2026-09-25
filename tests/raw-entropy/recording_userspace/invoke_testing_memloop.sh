@@ -4,8 +4,9 @@
 # the memory access with all supported memory sizes and measures its execution
 # time.
 #
-# The testing disables the maximum memory check to allow analyzing all
-# memory sizes.
+# The memory size is selected with --max-mem, which the library applies as
+# given (up to JENT_MAX_MEMSIZE_MAX) rather than deriving it from the cache
+# size, so all memory sizes can be analyzed.
 #
 # Specifically with the deterministic memory access pattern, the measurement
 # is intended to show the access variations of the "just" the cache that
@@ -34,22 +35,22 @@
 
 raw_entropy_ntg1_memloop()
 {
-	local memsize=$1
+	memsize=$1
 	shift
-	local testtype=$1
+	testtype=$1
 	shift
 
 	echo "---"
 	echo "Obtaining $NUM_EVENTS raw entropy measurement from Jitter RNG"
 
-	local cmdopts="--max-mem ${memsize} --memaccess $@"
+	cmdopts="--max-mem ${memsize} --memaccess $*"
 
 	if [ -n "$FORCE_NOTIME_NOISE_SOURCE" ]
 	then
 		cmdopts="$cmdopts --disable-internal-timer"
 	fi
 
-	$JENT_HASHTIME $NUM_EVENTS 1 $OUTDIR/${NONIID_MEMLOOP_DATA}_${testtype}${memsize} $cmdopts
+	hashtime_record $NUM_EVENTS 1 $OUTDIR/${NONIID_MEMLOOP_DATA}_${testtype}${memsize} $cmdopts
 
 	echo "---"
 }
@@ -58,7 +59,8 @@ initialization
 
 ################################################################################
 # Measure with deterministic memory access
-CFLAGS="-DJENT_TEST_MEASURE_RAW_MEMORY_ACCESS -DJENT_TESTING_MEMSIZE_NO_BOUNDSCHECK" make -s -f Makefile.hashtime
+CFLAGS="-DJENT_TEST_MEASURE_RAW_MEMORY_ACCESS" make -s -f Makefile.hashtime ||
+	fail "building jitterentropy-hashtime failed"
 
 size=1
 while [ $size -le 20 ]

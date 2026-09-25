@@ -12,17 +12,24 @@
 #
 
 CC		?= gcc
+# "override" on every append, as the top level Makefile has: a plain += is
+# ignored for a variable set on the make command line, so "make CFLAGS=-g"
+# here used to drop -DJENT_STATIC_LIB, the internal timer define and every
+# -I, and the build failed on the first missing header. The root "check"
+# target already clears MAKEOVERRIDES before recursing, so this is the same
+# guarantee for anyone running make in this directory directly.
+#
 # -O0 is mandatory, not a preference: the entropy core absorbed by the
 # unit-base programs refuses to compile at any other level (see the #error in
 # src/jitterentropy-base.c). -flto is dropped for the same reason.
-CFLAGS		+= -Wextra -Wall -pedantic -fPIC -O0 -std=c11
-CFLAGS		+= -DJENT_CONF_ENABLE_INTERNAL_TIMER -DJENT_STATIC_LIB -pthread
+override CFLAGS	+= -Wextra -Wall -pedantic -fPIC -O0 -std=c11
+override CFLAGS	+= -DJENT_CONF_ENABLE_INTERNAL_TIMER -DJENT_STATIC_LIB -pthread
 #Hardening
-CFLAGS		+= -fstack-protector-strong -fwrapv --param ssp-buffer-size=4 -fvisibility=hidden -fPIE -Wconversion -Wcast-align -Wmissing-field-initializers -Wshadow -Wswitch-enum
+override CFLAGS	+= -fstack-protector-strong -fwrapv --param ssp-buffer-size=4 -fvisibility=hidden -fPIE -Wconversion -Wcast-align -Wmissing-field-initializers -Wshadow -Wswitch-enum
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
-LDFLAGS		+= -Wl,-z,relro,-z,now,--as-needed -pie
+override LDFLAGS	+= -Wl,-z,relro,-z,now,--as-needed -pie
 endif
 
 # One program per unit-*.c, which is what CMakeLists.txt in this directory
@@ -74,15 +81,10 @@ else
 LIBRARIES	:=
 endif
 
-CFLAGS		+= $(foreach includedir,$(INCLUDE_DIRS),-I$(includedir))
-LDFLAGS		+= $(foreach librarydir,$(LIBRARY_DIRS),-L$(librarydir))
-LDFLAGS		+= $(foreach library,$(LIBRARIES),-l$(library))
+override CFLAGS	+= $(foreach includedir,$(INCLUDE_DIRS),-I$(includedir))
+override LDFLAGS	+= $(foreach librarydir,$(LIBRARY_DIRS),-L$(librarydir))
+override LDFLAGS	+= $(foreach library,$(LIBRARIES),-l$(library))
 
-###############################################################################
-#
-# Get version name and cross check
-#
-###############################################################################
 ###############################################################################
 #
 # Define files to be compiled
@@ -95,6 +97,28 @@ C_GCOV += ${C_SRCS:.c=.gcno}
 C_GCOV += ${C_SRCS:.c=.gcov}
 OBJS := $(C_OBJS)
 
+# What each program was really compiled from, written beside it as it compiles
+# (-MMD). Every unit-*.c #includes the src/ and arch/ sources it exercises
+# rather than linking them, and make sees none of that: with only
+# "unit-health: unit-health.c" to go on it reported "nothing to be done" after
+# an edit to src/jitterentropy-health.c and left the previous binaries in
+# place, so the suite went on passing against code that no longer existed. The
+# binaries are gitignored, so they survived branch switches too, and CI never
+# noticed because it checks out fresh every run.
+#
+# -MP adds an empty rule per dependency, which keeps a deleted or renamed file
+# from stopping the build with "No rule to make target". Same idiom as the top
+# level Makefile, and CPPFLAGS rather than CFLAGS for the same reason: the
+# clang --analyze rule below passes CFLAGS and would otherwise write .d files
+# for the .plist targets.
+#
+# -MT in the recipe because these programs are compiled and linked in one
+# step: the target the compiler writes into the .d file defaults to the source
+# name with an object suffix - "unit-health.o", which nothing here builds -
+# and the dependencies would attach to no target at all.
+override CPPFLAGS += -MMD -MP
+DEPS := $(NAMES:=.d)
+
 analyze_srcs = $(filter %.c, $(sort $(C_SRCS)))
 analyze_plists = $(analyze_srcs:%.c=%.plist)
 
@@ -102,25 +126,25 @@ analyze_plists = $(analyze_srcs:%.c=%.plist)
 
 all: $(NAMES)
 
-debug: CFLAGS += -g -DDEBUG
+debug: override CFLAGS += -g -DDEBUG
 debug: DBG-all
 
-asanaddress: CFLAGS += -g -DDEBUG -fsanitize=address -fno-omit-frame-pointer
-asanaddress: LDFLAGS += -fsanitize=address
+asanaddress: override CFLAGS += -g -DDEBUG -fsanitize=address -fno-omit-frame-pointer
+asanaddress: override LDFLAGS += -fsanitize=address
 asanaddress: DBG-all
 
-asanthread: CFLAGS += -g -DDEBUG -fsanitize=thread -fno-omit-frame-pointer
-asanthread: LDFLAGS += -fsanitize=thread
+asanthread: override CFLAGS += -g -DDEBUG -fsanitize=thread -fno-omit-frame-pointer
+asanthread: override LDFLAGS += -fsanitize=thread
 asanthread: DBG-all
 
-leak: CFLAGS += -g -DDEBUG -fsanitize=leak -fno-omit-frame-pointer
-leak: LDFLAGS += -fsanitize=leak
+leak: override CFLAGS += -g -DDEBUG -fsanitize=leak -fno-omit-frame-pointer
+leak: override LDFLAGS += -fsanitize=leak
 leak: DBG-all
 
 # Compile for the use of GCOV
 # Usage after compilation: gcov <file>.c
-gcov: CFLAGS += -g -DDEBUG -fprofile-arcs -ftest-coverage
-gcov: LDFLAGS += -fprofile-arcs
+gcov: override CFLAGS += -g -DDEBUG -fprofile-arcs -ftest-coverage
+gcov: override LDFLAGS += -fprofile-arcs
 gcov: DBG-all
 
 ###############################################################################
@@ -130,12 +154,15 @@ gcov: DBG-all
 ##############################################################################
 
 $(NAMES): %: %.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CPPFLAGS) -MT $@ -MF $@.d $(CFLAGS) -o $@ $< $(LDFLAGS)
 
-# The mocked time source is compiled into this one program only.
-unit-mock: CFLAGS += -DJENT_CONF_ENABLE_MOCK_TIMER
+# Absent before the first build, hence the "-".
+-include $(DEPS)
 
-DBG-all: CFLAGS += -g -DDEBUG
+# The mocked time source is compiled into these programs only.
+unit-health unit-mock unit-stack-residue: override CFLAGS += -DJENT_CONF_ENABLE_MOCK_TIMER
+
+DBG-all: override CFLAGS += -g -DDEBUG
 DBG-all: $(NAMES)
 
 check: $(NAMES)
@@ -160,7 +187,7 @@ install:
 ###############################################################################
 
 clean:
-	@- $(RM) $(NAMES)
+	@- $(RM) $(NAMES) $(DEPS)
 	@- $(RM) $(C_GCOV)
 	@- $(RM) *.gcov
 	@- $(RM) $(analyze_plists)

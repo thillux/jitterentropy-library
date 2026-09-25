@@ -230,11 +230,22 @@ static void ze_check_wiped(const void *ptr, size_t len, const char *what)
 			before++;
 	}
 
-	if (!before)
-		printf("  note: %s held nothing before the release\n", what);
+	/*
+	 * Both failures, not notes or skips: an allocation that is never
+	 * released - a leak of the very state the wipe is for - and one that
+	 * was all zero to begin with would otherwise pass exactly as a wipe
+	 * does. test_zfree_wipes() treats a release it did not see the same
+	 * way.
+	 */
+	jent_ut_checks++;
+	if (!before) {
+		JENT_UT_FAIL("%s: it held nothing before the release", what);
+		return;
+	}
 
+	jent_ut_checks++;
 	if (!ze_releases) {
-		JENT_UT_SKIP(what, "its release was not seen");
+		JENT_UT_FAIL("%s: its release was not seen", what);
 		return;
 	}
 
@@ -248,12 +259,14 @@ static void ze_check_wiped(const void *ptr, size_t len, const char *what)
 static void test_zfree_wipes(void)
 {
 	static const struct {
+		int unlocked;
 		unsigned int flags;
 		const char *name;
 	} modes[] = {
-		{ 0,			"ordinary memory is wiped on release" },
-		{ JENT_FORCE_SECURE_MEM,
+		{ 0, 0,			"ordinary memory is wiped on release" },
+		{ 0, JENT_FORCE_SECURE_MEM,
 					"secure memory is wiped on release" },
+		{ 1, 0,			"unlocked memory is wiped on release" },
 	};
 	size_t m;
 
@@ -266,7 +279,9 @@ static void test_zfree_wipes(void)
 #else
 	for (m = 0; m < sizeof(modes) / sizeof(modes[0]); m++) {
 		const size_t len = 4096;
-		unsigned char *p = jent_zalloc(len, modes[m].flags);
+		unsigned char *p = modes[m].unlocked ?
+				   jent_zalloc_unlocked(len) :
+				   jent_zalloc(len, modes[m].flags);
 
 		if (!p) {
 			JENT_UT_SKIP(modes[m].name, "allocation failed");
@@ -290,24 +305,23 @@ static void test_zfree_wipes(void)
 }
 
 /*
- * The collector's state, which is what the wipe exists for. Three allocations
+ * The collector's state, which is what the wipe exists for. Two allocations
  * carry it and each is released by jent_entropy_collector_free():
  *
- *   - the entropy pool, the memory the noise source walks,
- *   - the SHAKE state, which holds the collected entropy itself, and
+ *   - the entropy pool, the memory the noise source walks, and
  *   - struct rand_data, with the previous time stamp, the health test
- *     counters and the pointers to the other two.
+ *     counters, the pointer to the pool and, as a member, the SHAKE state,
+ *     which holds the collected entropy itself.
  *
  * One collector per allocation: the watch follows one address at a time, and
- * the free path releases all three in the same call.
+ * the free path releases both in the same call.
  */
 static void test_collector_state_wiped(void)
 {
-	enum { ZE_POOL, ZE_HASH, ZE_STATE, ZE_PARTS };
+	enum { ZE_POOL, ZE_STATE, ZE_PARTS };
 	static const char *names[ZE_PARTS] = {
 		"the entropy pool is wiped on free",
-		"the hash state is wiped on free",
-		"the collector state is wiped on free",
+		"the collector and hash state are wiped on free",
 	};
 	unsigned int part;
 
@@ -351,10 +365,6 @@ static void test_collector_state_wiped(void)
 		case ZE_POOL:
 			ptr = ec->mem;
 			len = (size_t)ec->memmask + 1;
-			break;
-		case ZE_HASH:
-			ptr = ec->hash_state;
-			len = JENT_SHA_MAX_CTX_SIZE;
 			break;
 		default:
 			ptr = ec;

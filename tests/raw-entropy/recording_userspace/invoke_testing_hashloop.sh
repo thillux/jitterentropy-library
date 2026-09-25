@@ -12,20 +12,20 @@
 
 raw_entropy_ntg1_hashloop()
 {
-	local hashloop=$1
+	hashloop=$1
 	shift
 
 	echo "---"
 	echo "Obtaining $NUM_EVENTS raw entropy measurement from Jitter RNG"
 
-	local cmdopts="--hloopcnt ${hashloop} --hashloop $@"
+	cmdopts="--hloopcnt ${hashloop} --hashloop $*"
 
 	if [ -n "$FORCE_NOTIME_NOISE_SOURCE" ]
 	then
 		cmdopts="$cmdopts --disable-internal-timer"
 	fi
 
-	$JENT_HASHTIME $NUM_EVENTS 1 $OUTDIR/${NONIID_HASH_DATA}_${hashloop} $cmdopts
+	hashtime_record $NUM_EVENTS 1 $OUTDIR/${NONIID_HASH_DATA}_${hashloop} $cmdopts
 
 	echo "---"
 }
@@ -33,7 +33,7 @@ raw_entropy_ntg1_hashloop()
 initialization
 
 ################################################################################
-make -s -f Makefile.hashtime
+hashtime_build
 
 size=0
 while [ $size -le 7 ]
