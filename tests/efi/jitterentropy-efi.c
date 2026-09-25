@@ -72,11 +72,14 @@
  * application has to use and what the firmware reclaims when it exits.
  *
  * The Jitter RNG asks for its entropy pool through this, and asks for it
- * zeroed - jent_zalloc() clears what it gets, so nothing here has to. It is
- * not secure memory in the sense the library means: there is no kernel to ask
- * to keep a page off a swap device, and there is no swap device either.
- * jent_secure_memory_supported() reports that, and a caller asking for
- * JENT_FORCE_SECURE_MEM is refused rather than quietly given ordinary memory.
+ * zeroed - jent_zalloc() clears what it gets, so nothing here has to. The
+ * library counts it as secure memory: there is no kernel to ask to keep a page
+ * off a swap device, but there is no swap device either, nor a second process
+ * to read it or a core dump for it to land in. So the freestanding build
+ * advertises secure memory (JENT_BAREMETAL in
+ * arch/jitterentropy-arch-memory.c), jent_secure_memory_supported() reports
+ * it, and JENT_FORCE_SECURE_MEM is satisfied by this allocator rather than
+ * refused.
  */
 void *malloc(UINTN size);
 void free(void *ptr);
@@ -383,10 +386,9 @@ static EFI_STATUS je_collector(const CHAR16 *name, unsigned int flags,
  * a collector whose clock is a counter nothing increments, which would then
  * spin forever on the first measurement rather than return an error.
  *
- * Run last, and that is not arbitrary. A startup that fails clears the
- * process-wide latch recording that the self tests have run, so the next
- * allocation repeats them; harmless, but it would happen underneath the three
- * configurations above and they are what this program is for.
+ * Run last, after the three configurations above that this program is for. A
+ * refused startup leaves the process-wide startup verdicts as they were - a
+ * failure never retracts one - so the order is not needed for correctness.
  */
 static EFI_STATUS je_no_internal_timer(void)
 {

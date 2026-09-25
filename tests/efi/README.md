@@ -94,9 +94,8 @@ three ways with no operating system under it.
 Two things in the status document are properties of having no operating system
 rather than defects, and the VM check asserts both so that they stay stated:
 
-* `"uuid": "00000000-..."` - the instance identifier is drawn from the
-  platform CSPRNG, and there is none. The library says so rather than inventing
-  one.
+* `"uuid"` is a version 8 UUID - there is no platform CSPRNG to draw the
+  identifier from, so it is hashed from a counter and the time.
 * `"internalTimer": false` - the counting thread needs a thread. Asking for it
   anyway, with `JENT_FORCE_INTERNAL_TIMER`, has to be *refused*, and the last
   line of the run checks that it is on both entry points that accept the flag.
@@ -197,14 +196,14 @@ relying on their startup code carrying a hand-written PE header, wherever
 `pei-aarch64-little` - and the fallback does not produce an image this firmware
 will load at all, so the real thing is written instead.
 
-`-mno-outline-atomics` is the other one that is not optional, and it is a fact
+`-mno-outline-atomics` is kept as a safeguard, and it is a fact
 about porting this library to aarch64 rather than about EFI. GCC 10 and later
 default to `-moutline-atomics` there, which turns an atomic access into a call
-to a libgcc helper - `__aarch64_swp4_acq_rel` for the one read-modify-write in
-`arch/jitterentropy-arch-atomic.c` - that selects the LSE or the LL/SC
+to a libgcc helper - `__aarch64_swp4_acq_rel` for the read-modify-write
+`arch/jitterentropy-arch-atomic.c` once had - that selects the LSE or the LL/SC
 implementation at run time through a libgcc ifunc. A `-nostdlib` link has no
-libgcc, so the symbol stays undefined and the first
-`jent_atomic_exchange_int()` of the startup jumps into nothing.
+libgcc, so the symbol stays undefined and the first such access jumps into
+nothing.
 
 What that looks like is worth recording, because the console says almost
 nothing: one line, `Synchronous Exception at 0x0000000000013780`, and no
