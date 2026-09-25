@@ -4,6 +4,7 @@
  * the debugfs raw entropy test interface (jent_raw_hires).
  *
  * Copyright (C) 2026, Stephan Mueller <smueller@chronox.de>
+ * Copyright (C) 2026, Markus Theil <theil.markus@gmail.com>
  */
 
 #ifndef _UAPI_JITTERENTROPY_H
@@ -53,10 +54,22 @@ struct jent_status_ioctl {
  * configured with; any other value is passed as the loop_cnt parameter of
  * every subsequent raw noise measurement (see the jent_measure_jitter*()
  * functions), overriding the configured hash and memory access loop counts.
- * Values above UINT_MAX are rejected with -EINVAL, mirroring the bound of the
- * userspace recording tools.
+ * Values above JENT_LOOPCNT_MAX are rejected with -EINVAL.
  */
 #define JENT_IOCLOOPCNT _IOW(JENT_IOC_MAGIC, 0x02, __u64)
+
+/*
+ * Largest loop count JENT_IOCLOOPCNT accepts. One measurement runs both loops
+ * without a reschedule point - the recording yields between measurements, but
+ * a measurement is the unit being timed and cannot be split - so the count
+ * bounds how long it holds the CPU. 1 << 16, far above any loop count the
+ * library runs itself (at most 384), takes about 0.6 seconds per measurement on
+ * current x86. That leaves room for a CPU some 30 times slower (a small
+ * 32-bit ARM core running the unoptimized Keccak) before the 20 second
+ * softlockup watchdog and RCU stall detector of a non-preemptible kernel
+ * fire; 1 << 18 left less than a factor of ten.
+ */
+#define JENT_LOOPCNT_MAX (1U << 16)
 
 /*
  * The single fields of the status document, for callers that want one value
