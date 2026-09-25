@@ -21,17 +21,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, ubuntu-24.04-arm ]
+        # Every Ubuntu LTS still supported: each brings its own gcc, clang
+        # and glibc here, and its own kernel headers to linux-kmod and
+        # linux-dkms, which use the same list.
+        os: [ ubuntu-22.04, ubuntu-24.04, ubuntu-26.04, ubuntu-22.04-arm, ubuntu-24.04-arm, ubuntu-26.04-arm ]
         cc: [ gcc, clang ]
         shared: [ 'ON', 'OFF' ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      # For health-cutoff-tables, which JENT_REQUIRE_CUTOFF_CHECK makes gating.
+      - name: Install mpmath
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-mpmath
 
       - name: Configure
         run: |
           cmake -S . -B build \
             -DCMAKE_C_COMPILER=${{ matrix.cc }} \
-            -DBUILD_SHARED_LIBS=${{ matrix.shared }}
+            -DBUILD_SHARED_LIBS=${{ matrix.shared }} \
+            -DJENT_REQUIRE_CUTOFF_CHECK=ON
 
       - name: Build
         run: cmake --build build -j "$(nproc)"
@@ -60,7 +70,7 @@ jobs:
     name: Linux / gcc -m32
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install 32-bit toolchain
         run: |
@@ -91,6 +101,58 @@ jobs:
               echo "::warning::jitterentropy-rng $opt failed on this machine"
           done
 
+  # The only job building the stub half of jitterentropy-timer.c.
+  linux-no-internal-timer:
+    name: Linux / gcc / INTERNAL_TIMER=OFF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure
+        run: cmake -S . -B build -DINTERNAL_TIMER=OFF
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Run tests
+        run: |
+          ctest --test-dir build --output-on-failure -LE unreliable
+          ./build/tests/raw-entropy/recording_userspace/jitterentropy-rng 256 > /dev/null
+
+  # acvpparser's jent backend, the CAVP test harness of the conditioner,
+  # #includes src/jitterentropy-sha3.c and builds it with -Werror. Unpinned:
+  # the current parser is the one that has to keep working.
+  linux-acvp-parser:
+    name: Linux / acvpparser / jent backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        with:
+          repository: smuellerDD/acvpparser
+          path: acvpparser
+
+      - name: Show the acvpparser revision
+        run: git -C acvpparser log -1 --format='%H %cd %s'
+
+      - name: Build the library
+        run: |
+          cmake -S . -B build -DBUILD_SHARED_LIBS=OFF
+          cmake --build build -j "$(nproc)" --target jitterentropy
+
+      # The archive supplies jent_memset_secure(), which sha3.c calls. LDFLAGS
+      # from the environment, as acvpparser's Makefile appends to it.
+      - name: Build acvpparser against this tree
+        run: |
+          LDFLAGS="$PWD/build/libjitterentropy.a" \
+            make -C acvpparser jent JENT_SRC="$PWD" -j "$(nproc)"
+
+      - name: Check its digests against hashlib
+        run: |
+          python3 .github/scripts/acvp-parser-check.py \
+            acvpparser/acvp-parser "$RUNNER_TEMP"
+
   linux-musl:
     name: Linux / musl-gcc / ${{ matrix.link }}
     runs-on: ubuntu-latest
@@ -106,7 +168,7 @@ jobs:
             flags: '-static'
             expect: statically linked
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install musl toolchain
         run: |
@@ -130,7 +192,7 @@ jobs:
           bin=build/tests/gcd/gcd
           file "$bin"
 
-          if strings "$bin" | grep -q GLIBC; then
+          if grep -q GLIBC < <(strings "$bin"); then
             echo "::error::GLIBC symbol versions present, this is not musl"
             exit 1
           fi
@@ -158,9 +220,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 7.9 is the last RHEL 7 minor release; the other entries float.
-          - name: RHEL 7
-            image: registry.access.redhat.com/ubi7/ubi:7.9
+          # The RHEL 7 generation (glibc 2.17, gcc 4.8), pinned at its last
+          # minor release; the other entries float. CentOS, as the public UBI 7
+          # content no longer carries a toolchain.
+          - name: CentOS 7
+            image: quay.io/centos/centos:centos7.9.2009
             # No distro CMake meets the 3.22 floor here.
             cmake: kitware
           - name: RHEL 8
@@ -185,7 +249,7 @@ jobs:
     env:
       CMAKE_VERSION: 3.31.9
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build and test in a ${{ matrix.name }} container
         run: |
@@ -196,6 +260,16 @@ jobs:
             bash -euxo pipefail -c '
               # No apostrophes anywhere in here: the whole script is a
               # single-quoted argument to bash -c, and one would end it.
+
+              # mirrorlist.centos.org is gone: point CentOS 7 at the vault.
+              # gpgcheck stays on with the key the image ships.
+              if [ -f /etc/yum.repos.d/CentOS-Base.repo ]; then
+                sed -i \
+                  -e "s|^mirrorlist=|#mirrorlist=|" \
+                  -e "s|^#baseurl=http://mirror.centos.org/centos/\$releasever|baseurl=https://vault.centos.org/7.9.2009|" \
+                  /etc/yum.repos.d/CentOS-Base.repo
+              fi
+
               if command -v dnf > /dev/null; then
                 install="dnf -y install"
               elif command -v zypper > /dev/null; then
@@ -210,11 +284,11 @@ jobs:
               if [ "$CMAKE_SOURCE" = distro ]; then
                 $install cmake
               else
-                # tar is not in the RHEL 7 base image and the tarball needs it.
+                # The tarball needs tar, which not every base image carries.
                 $install tar
                 url=https://github.com/Kitware/CMake/releases/download
-                # Retries only: RHEL 7 ships curl 7.29, which has neither
-                # --http1.1 nor --retry-all-errors, and no HTTP/2 either.
+                # Retries only: CentOS 7 ships curl 7.29, which has neither
+                # --http1.1 nor --retry-all-errors.
                 curl -fsSL --retry 5 --retry-delay 5 \
                   "$url/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-linux-x86_64.tar.gz" \
                   -o /tmp/cmake.tar.gz
@@ -232,7 +306,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, ubuntu-24.04-arm ]
+        os: [ ubuntu-22.04, ubuntu-24.04, ubuntu-26.04, ubuntu-22.04-arm, ubuntu-24.04-arm, ubuntu-26.04-arm ]
         config: [ default, test-interface, minimal ]
         include:
           - config: default
@@ -245,7 +319,7 @@ jobs:
               CONFIG_EXTERNAL_JITTERENTROPY_CHARDEV=n
               CONFIG_EXTERNAL_JITTERENTROPY_HWRNG=n
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install kernel headers
         run: |
@@ -272,7 +346,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, ubuntu-24.04-arm ]
+        os: [ ubuntu-22.04, ubuntu-24.04, ubuntu-26.04, ubuntu-22.04-arm, ubuntu-24.04-arm, ubuntu-26.04-arm ]
         config: [ default, test-interface ]
         include:
           - config: default
@@ -280,7 +354,7 @@ jobs:
           - config: test-interface
             testinterface: 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install DKMS and kernel headers
         run: |
@@ -398,7 +472,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.linux-in-tree-list.outputs.kernels) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: jitterentropy-library
 
@@ -418,11 +492,25 @@ jobs:
           # enough to matter, which curl reports as exit 92, and one tarball
           # needs no multiplexing. --retry-all-errors extends the retries to
           # transport failures rather than only to transient response codes.
-          curl -fsSL --http1.1 --retry 5 --retry-delay 5 --retry-all-errors \
-            "$SOURCE" -o linux.tar
+          #
+          # A mainline snapshot from git.kernel.org is generated on the fly
+          # and has arrived corrupt with a 200, which no curl retry sees:
+          # read the whole archive before trusting it, and fetch it anew if
+          # it does not list.
+          for attempt in 1 2 3; do
+            curl -fsSL --http1.1 --retry 5 --retry-delay 5 --retry-all-errors \
+              "$SOURCE" -o linux.tar &&
+              tar -tf linux.tar > linux.list && break
+            if [ "$attempt" = 3 ]; then
+              echo "::error::no usable archive from $SOURCE"
+              exit 1
+            fi
+            echo "::warning::attempt $attempt gave no usable archive, retrying"
+            sleep 30
+          done
 
           tar -xf linux.tar
-          echo "KDIR=$PWD/$(tar -tf linux.tar | head -1 | cut -d/ -f1)" \
+          echo "KDIR=$PWD/$(head -1 linux.list | cut -d/ -f1)" \
             >> "$GITHUB_ENV"
 
       - name: Copy the Jitter RNG tree into the kernel source (README step 1)
@@ -514,7 +602,7 @@ jobs:
       consumers: ${{ steps.consumers.outputs.attrs }}
       crypto: ${{ steps.crypto.outputs.attrs }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -622,7 +710,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.nix-list.outputs.pairs) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -663,7 +751,7 @@ jobs:
       matrix:
         attr: ${{ fromJSON(needs.nix-list.outputs.intree) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -693,7 +781,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -730,6 +818,67 @@ jobs:
           OUT: ${{ steps.build.outputs.out }}
         run: cat "$OUT/console.txt"
 
+  nix-sp800-90b:
+    name: Nix / SP800-90B output assessment
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # 1 MiB of output through the NIST estimators. Not a noise source
+      # assessment - the bytes are conditioned, so this is the whole chain
+      # answering, and what it catches is a collector that comes up, reports
+      # success and hands out something degenerate. Generation is minutes: the
+      # measurement loop runs at -O0 by construction.
+      - name: Generate and assess 1 MiB of output
+        id: build
+        run: |
+          out=$(nix build --no-link --print-build-logs --print-out-paths \
+            ".#checks.x86_64-linux.sp800-90b")
+          echo "out=$out" >> "$GITHUB_OUTPUT"
+
+      # The estimates are the evidence, and worth having in the log whether or
+      # not the floor was met: which estimator bound the result is in there.
+      - name: Show the assessment
+        if: always() && steps.build.outputs.out != ''
+        env:
+          OUT: ${{ steps.build.outputs.out }}
+        run: cat "$OUT/result.json"
+
+  nix-raw-entropy:
+    name: Nix / raw entropy tools on NixOS
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            # Nix only advertises kvm if /dev/kvm existed at daemon start.
+            system-features = nixos-test benchmark big-parallel kvm
+
+      # /dev/kvm is root-only on the runners; without this QEMU uses TCG.
+      - name: Enable KVM for the unprivileged builder
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # The tests/raw-entropy recording and validation scripts, run in a
+      # NixOS VM against the userspace library and the kernel module.
+      - name: Record and validate raw entropy
+        run: |
+          nix build --no-link --print-build-logs \
+            ".#checks.x86_64-linux.raw-entropy-vm"
+
   nix-cross:
     name: Nix / ${{ matrix.attr }}
     runs-on: ubuntu-latest
@@ -740,7 +889,7 @@ jobs:
       matrix:
         attr: ${{ fromJSON(needs.nix-list.outputs.cross) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -772,7 +921,7 @@ jobs:
       matrix:
         attr: ${{ fromJSON(needs.nix-list.outputs.consumers) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -801,7 +950,7 @@ jobs:
 
           syms=$(nix shell nixpkgs#binutils -c \
             nm $nmflags --defined-only "$OUT/$file")
-          grep -E ' [TtWw] jent_' <<<"$syms" | head -20
+          grep -m 20 -E ' [TtWw] jent_' <<<"$syms" || true
           grep -qE ' [TtWw] jent_entropy_init$' <<<"$syms" || {
             echo "::error::no jitterentropy symbols in $file"
             exit 1
@@ -817,7 +966,7 @@ jobs:
       matrix:
         attr: ${{ fromJSON(needs.nix-list.outputs.crypto) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -879,7 +1028,7 @@ jobs:
       matrix:
         cc: [ gcc, clang ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         run: |
@@ -938,7 +1087,7 @@ jobs:
       matrix:
         cc: [ gcc, clang ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # A build of its own, not an addition to the sanitizers job: the thread
       # and the address sanitizer cannot be combined, and a run under one says
@@ -979,7 +1128,7 @@ jobs:
     name: Linux / clang / fuzzing
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Without the sanitizers: they cost fuzz-api about a factor of ten in
       # executions per second, which is most of what it has. The corpus this
@@ -1047,7 +1196,7 @@ jobs:
       # clean run: worth keeping, as the next run starts from it rather than
       # from nothing.
       - name: Upload the corpus
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: fuzz-corpus
           path: |
@@ -1060,7 +1209,7 @@ jobs:
       # failed the job by then.
       - name: Upload the artifacts of a failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: fuzz-artifacts
           path: artifacts/
@@ -1070,7 +1219,7 @@ jobs:
     name: Linux / gcc / coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install gcovr
         run: |
@@ -1096,7 +1245,7 @@ jobs:
           cmake --build build --target coverage
 
       - name: Upload the report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-html
           path: build/coverage/
@@ -1106,7 +1255,7 @@ jobs:
     name: Nix / musl-static
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -1124,16 +1273,24 @@ jobs:
         env:
           OUT: ${{ steps.build.outputs.out }}
         run: |
+          # Each tool's output is captured before it is searched: in a pipe
+          # into grep a failing or silent strings/file leaves grep with
+          # nothing to match, and "no GLIBC" would pass vacuously.
           nix shell nixpkgs#file nixpkgs#binutils -c sh -c '
             set -e
-            file "$1"
+            info=$(file -E "$1")
+            echo "$info"
+            syms=$(strings "$1")
+            [ -n "$syms" ] || {
+              echo "::error::strings printed nothing for $1"; exit 1
+            }
 
-            if strings "$1" | grep -q GLIBC; then
+            if printf "%s\n" "$syms" | grep -q GLIBC; then
               echo "::error::GLIBC symbol versions present, this is not musl"
               exit 1
             fi
 
-            file "$1" | grep -q "statically linked" || {
+            printf "%s\n" "$info" | grep -q "statically linked" || {
               echo "::error::expected a statically linked binary"; exit 1
             }
           ' sh "$OUT/bin/gcd"
@@ -1153,7 +1310,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -1179,6 +1336,166 @@ jobs:
             }
           done
 
+  # The example app in tests/android: the library built through CMake by
+  # Gradle, as an app embeds it, rather than by ndk-build as above.
+  nix-android-example:
+    name: Nix / android example app
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build
+        id: build
+        run: |
+          out=$(nix build --no-link --print-build-logs --print-out-paths .#android-example)
+          echo "out=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Check the APK
+        env:
+          OUT: ${{ steps.build.outputs.out }}
+        run: |
+          apk="$OUT/jitterentropy-example.apk"
+          unzip -l "$apk"
+          for abi in arm64-v8a x86_64; do
+            unzip -l "$apk" "lib/$abi/libjitterentropy_jni.so" > /dev/null || {
+              echo "::error::no libjitterentropy_jni.so for ABI $abi"
+              exit 1
+            }
+          done
+
+  # The example app in tests/ios, built for the simulator: no signing needed.
+  ios:
+    name: iOS example app
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure
+        run: cmake -S tests/ios -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS
+
+      - name: Build
+        run: |
+          cmake --build build-ios --config Debug -- \
+            -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO
+
+      - name: Check the app
+        run: |
+          app=build-ios/Debug-iphonesimulator/JitterEntropyExample.app
+          test -x "$app/JitterEntropyExample" || {
+            echo "::error::no app binary in $app"
+            exit 1
+          }
+          plutil -p "$app/Info.plist"
+
+  apple-embedded:
+    name: ${{ matrix.platform }} cross-build
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: watchOS
+            device_sdk: watchos
+            sim_sdk: watchsimulator
+          - platform: tvOS
+            device_sdk: appletvos
+            sim_sdk: appletvsimulator
+          - platform: visionOS
+            device_sdk: xros
+            sim_sdk: xrsimulator
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the SDKs are installed
+        run: |
+          for sdk in '${{ matrix.device_sdk }}' '${{ matrix.sim_sdk }}'; do
+            xcrun --sdk "$sdk" --show-sdk-path || {
+              echo "::error::no $sdk SDK in $(xcode-select -p)"
+              xcodebuild -showsdks
+              exit 1
+            }
+          done
+
+      - name: Cross-build the library
+        run: |
+          platform='${{ matrix.platform }}'
+          # WATCHOS, TVOS, VISIONOS - the token vtool prints for the device
+          # SDK; the simulator SDKs append SIMULATOR to it.
+          platform_uc=$(printf '%s' "$platform" | tr '[:lower:]' '[:upper:]')
+
+          for sdk in '${{ matrix.device_sdk }}' '${{ matrix.sim_sdk }}'; do
+            case "$sdk" in
+            *simulator)	expect="${platform_uc}SIMULATOR" ;;
+            *)		expect="$platform_uc" ;;
+            esac
+
+            for shared in ON OFF; do
+              build="build-$sdk-$shared"
+              echo "::group::$platform / $sdk / shared=$shared"
+
+              #
+              # The tools and the test programs are left out: CMake makes an
+              # executable a MACOSX_BUNDLE target on every embedded Apple
+              # platform, and their install() calls name no bundle
+              # destination, so configuring with them fails before the
+              # library is reached. This is not particular to the three
+              # platforms here - CMAKE_SYSTEM_NAME=iOS fails the same way,
+              # which is why tests/ios is a project of its own.
+              #
+              cmake -S . -B "$build" \
+                -DCMAKE_SYSTEM_NAME="$platform" \
+                -DCMAKE_OSX_SYSROOT="$sdk" \
+                -DBUILD_SHARED_LIBS="$shared" \
+                -DENABLE_TOOLS=OFF -DBUILD_TESTING=OFF
+              cmake --build "$build" -j "$(sysctl -n hw.ncpu)"
+
+              if [ "$shared" = ON ]; then
+                lib="$build/libjitterentropy.dylib"
+                #
+                # The dynamic link is what makes this job worth running: the
+                # Apple back-ends reach for Mach and BSD interfaces
+                # (thread_policy_set, pthread_mach_thread_np, sysctlbyname,
+                # arc4random_buf, mlock) through a plain __APPLE__ guard that
+                # tells these platforms apart from macOS in no way at all.
+                # One of them missing here is a link error rather than a
+                # consumer's problem.
+                #
+                test -f "$lib" || {
+                  echo "::error::$sdk shared build produced no $lib"
+                  exit 1
+                }
+                xcrun vtool -show-build "$lib"
+                got=$(xcrun vtool -show-build "$lib" |
+                      awk '$1 == "platform" { print $2 }')
+                [ "$got" = "$expect" ] || {
+                  echo "::error::$lib is stamped $got, expected $expect"
+                  exit 1
+                }
+                xcrun nm -gU "$lib" | grep -q ' _jent_read_entropy$' || {
+                  echo "::error::$lib exports no jent_read_entropy"
+                  exit 1
+                }
+              else
+                lib="$build/libjitterentropy.a"
+                test -f "$lib" || {
+                  echo "::error::$sdk static build produced no $lib"
+                  exit 1
+                }
+                xcrun lipo -info "$lib"
+              fi
+
+              echo "::endgroup::"
+            done
+          done
+
   makefile:
     name: Makefile / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -1187,10 +1504,15 @@ jobs:
       matrix:
         os: [ ubuntu-latest, macos-latest ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build
         run: make -j 4
+
+      # The unit, gcd and health tests through their own Makefiles - the
+      # fallback for a tree without CMake, which nothing else here builds.
+      - name: Run the tests
+        run: make check
 
       - name: Build and run the CPU information tool
         working-directory: tests/raw-entropy/recording_userspace
@@ -1243,10 +1565,10 @@ jobs:
       - name: Link and run against the installed library
         run: |
           # Rebuilt rather than installed on top: on macOS PREFIX is baked in
-          # at link time as -install_name.
+          # at link time as -install_name. No "make" first: the install
+          # targets build what they install, and this is where that is shown.
           make clean
-          make -j 4 PREFIX="$PWD/prefix"
-          make install install-static PREFIX="$PWD/prefix"
+          make -j 4 install install-static PREFIX="$PWD/prefix"
           ls -l prefix/lib
           case "${{ runner.os }}" in
             Linux) LIBS="-pthread -lrt" ;;
@@ -1264,16 +1586,45 @@ jobs:
             prefix/lib/libjitterentropy.a $LIBS -o linktest-static
           ./linktest-static
 
+      # The .pc file comes from cmake/jitterentropy.pc.in, as the CMake
+      # build's does.
+      - name: Link and run through pkg-config
+        run: |
+          command -v pkg-config > /dev/null || brew install pkg-config
+          export PKG_CONFIG_PATH="$PWD/prefix/lib/pkgconfig"
+          echo "modversion: $(pkg-config --modversion jitterentropy)"
+          cflags=$(pkg-config --cflags jitterentropy)
+          cc -std=c11 $cflags tests/linking/jitterentropy-linktest.c \
+            $(pkg-config --libs jitterentropy) \
+            -Wl,-rpath,"$PWD/prefix/lib" -o linktest-pc
+          ./linktest-pc
+
+      # The page carries this tree's version, not the x.y.z placeholder, and
+      # each function has an alias symlinked to it.
+      - name: Check the installed man page
+        run: |
+          v=$(awk '/^#define JENT_(MAJVERSION|MINVERSION|PATCHLEVEL) / {
+                     printf "%s%s", s, $3; s = "." }' jitterentropy.h)
+          man=prefix/share/man/man3
+          gzip -dc "$man/jitterentropy.3.gz" | grep -q "\"jitterentropy $v\"" || {
+            echo "::error::$man/jitterentropy.3.gz does not carry version $v"
+            exit 1
+          }
+          [ "$(readlink "$man/jent_read_entropy.3.gz")" = jitterentropy.3.gz ] || {
+            echo "::error::$man/jent_read_entropy.3.gz is no alias of the page"
+            exit 1
+          }
+
   linking:
     name: Linking / ${{ matrix.os }} / shared=${{ matrix.shared }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest ]
+        os: [ ubuntu-latest, ubuntu-26.04, ubuntu-24.04-arm, ubuntu-26.04-arm, macos-latest, windows-latest ]
         shared: [ 'ON', 'OFF' ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # CMAKE_INSTALL_LIBDIR is pinned so the later steps can name the install
       # tree, and the prefix is a native path for Windows cmake.
@@ -1296,6 +1647,34 @@ jobs:
             -DCMAKE_INSTALL_LIBDIR=lib
           cmake --build build --config Release --parallel 4
           cmake --install build --config Release
+
+      # The page carries this tree's version, not the x.y.z placeholder, and
+      # each function has an alias symlinked to it that install_manifest.txt
+      # lists. Windows, which has no man, gets no page at all (INSTALL_MAN).
+      - name: Check the installed man page
+        run: |
+          v=$(awk '/^#define JENT_(MAJVERSION|MINVERSION|PATCHLEVEL) / {
+                     printf "%s%s", s, $3; s = "." }' jitterentropy.h)
+          man=prefix/share/man/man3
+          if [ "${{ runner.os }}" = Windows ]; then
+            if grep -q '/man3/' build/install_manifest.txt; then
+              echo "::error::a man page was installed for Windows"
+              exit 1
+            fi
+            exit 0
+          fi
+          grep -q "\"jitterentropy $v\"" "$man/jitterentropy.3" || {
+            echo "::error::$man/jitterentropy.3 does not carry version $v"
+            exit 1
+          }
+          [ "$(readlink "$man/jent_read_entropy.3")" = jitterentropy.3 ] || {
+            echo "::error::$man/jent_read_entropy.3 is no alias of the page"
+            exit 1
+          }
+          grep -q '/man3/jent_read_entropy\.3$' build/install_manifest.txt || {
+            echo "::error::install_manifest.txt lacks the aliases"
+            exit 1
+          }
 
       - name: Link and run through the CMake package
         run: |
@@ -1347,6 +1726,15 @@ jobs:
             exit 1
           }
           echo "modversion: $(pkg-config --modversion jitterentropy)"
+          # The library itself is in Libs for both kinds of build, so a plain
+          # --libs names it even where only the archive is installed. What a
+          # plain --libs may lack for a static build is Libs.private, the
+          # archive's own dependencies, which is why the link below still uses
+          # --static; this is the check that --static alone would hide.
+          if ! pkg-config --libs jitterentropy | grep -qw -- -ljitterentropy; then
+            echo "::error::pkg-config --libs does not name -ljitterentropy"
+            exit 1
+          fi
           # Only --static prints Libs.private.
           if [ "${{ matrix.shared }}" = ON ]; then
             libs=$(pkg-config --libs jitterentropy)
@@ -1362,6 +1750,25 @@ jobs:
             -Wl,-rpath,"$PWD/prefix/lib" -o linktest-pc
           ./linktest-pc
 
+      # No loader variables: an installed tool has to find the installed
+      # library by itself - through the absolute install name on macOS and
+      # the $ORIGIN rpath elsewhere, $PWD/prefix not being a directory the
+      # loader searches. The @rpath install name CMake gives a dylib by
+      # default left every tool aborting with "Library not loaded". An
+      # invalid argument is the run: it reaches main(), which is all the
+      # loader has to allow, without depending on the noise source.
+      - name: Run an installed tool
+        if: runner.os != 'Windows' && matrix.shared == 'ON'
+        run: |
+          rc=0
+          env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
+            prefix/bin/jitterentropy-rng x 2> rng.err || rc=$?
+          cat rng.err
+          if [ "$rc" -ne 1 ] || ! grep -q 'Invalid rounds value' rng.err; then
+            echo "::error::installed jitterentropy-rng did not start (exit $rc)"
+            exit 1
+          fi
+
   linking-mingw:
     name: Linking / MinGW-w64 / shared=${{ matrix.shared }}
     runs-on: windows-latest
@@ -1373,7 +1780,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: msys2/setup-msys2@v2
         with:
@@ -1411,6 +1818,15 @@ jobs:
             echo "::error::no jitterentropy.pc under $PKG_CONFIG_PATH"
             exit 1
           }
+          # The library itself is in Libs for both kinds of build, so a plain
+          # --libs names it even where only the archive is installed. What a
+          # plain --libs may lack for a static build is Libs.private, the
+          # archive's own dependencies, which is why the link below still uses
+          # --static; this is the check that --static alone would hide.
+          if ! pkg-config --libs jitterentropy | grep -qw -- -ljitterentropy; then
+            echo "::error::pkg-config --libs does not name -ljitterentropy"
+            exit 1
+          fi
           if [ "${{ matrix.shared }}" = ON ]; then
             libs=$(pkg-config --libs jitterentropy)
           else
@@ -1432,7 +1848,7 @@ jobs:
         os: [ macos-latest, macos-15-intel ]
         shared: [ 'ON', 'OFF' ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         run: cmake -S . -B build -DBUILD_SHARED_LIBS=${{ matrix.shared }}
@@ -1459,7 +1875,7 @@ jobs:
     name: FreeBSD / cmake + make
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build and test in a FreeBSD VM
         uses: vmactions/freebsd-vm@v1
@@ -1471,11 +1887,27 @@ jobs:
           run: |
             sh .github/scripts/vm-build-and-test.sh
 
+  freebsd-kmod:
+    name: FreeBSD / kernel module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The library built into a .ko with the kernel's own flags and run once
+      # on kldload; see tests/freebsd-kmod/README.md.
+      - name: Build and load the test module in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          copyback: false
+          run: |
+            sh tests/freebsd-kmod/run-in-vm.sh
+
   openbsd:
     name: OpenBSD / cmake + make
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build and test in an OpenBSD VM
         uses: vmactions/openbsd-vm@v1
@@ -1491,7 +1923,7 @@ jobs:
     name: NetBSD / cmake + make
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build and test in a NetBSD VM
         uses: vmactions/netbsd-vm@v1
@@ -1507,7 +1939,7 @@ jobs:
     name: DragonFly BSD / cmake + make
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build and test in a DragonFly BSD VM
         uses: vmactions/dragonflybsd-vm@v1
@@ -1523,7 +1955,7 @@ jobs:
     name: Solaris / cmake + make
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build and test in a Solaris VM
         uses: vmactions/solaris-vm@v1
@@ -1537,26 +1969,6 @@ jobs:
           run: |
             CC=gcc sh .github/scripts/vm-build-and-test.sh
 
-  haiku:
-    name: Haiku / cmake + make
-    runs-on: ubuntu-latest
-    # Disabled: the cached VM image and the rolling HaikuPorts repository
-    # disagree, so pkgman fails to install cmake and the build never starts.
-    # Re-enable by deleting this line, ideally with disable-cache set.
-    if: false
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build and test in a Haiku VM
-        uses: vmactions/haiku-vm@v1
-        with:
-          usesh: true
-          copyback: false
-          prepare: |
-            pkgman install -y cmake make
-          run: |
-            MAKE=make sh .github/scripts/vm-build-and-test.sh
-
   cygwin:
     name: Cygwin / cmake + make
     runs-on: windows-latest
@@ -1565,7 +1977,7 @@ jobs:
       - name: Keep line endings as committed
         run: git config --global core.autocrlf input
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cygwin/cygwin-install-action@v6
         with:
@@ -1587,7 +1999,7 @@ jobs:
         os: [ windows-latest, windows-11-arm ]
         shared: [ 'ON', 'OFF' ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         run: cmake -S . -B build -DBUILD_SHARED_LIBS=${{ matrix.shared }}
@@ -1614,7 +2026,7 @@ jobs:
     name: Windows / clang-cl
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         run: cmake -S . -B build -T ClangCL
@@ -1651,7 +2063,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: msys2/setup-msys2@v2
         with:
