@@ -11,6 +11,7 @@ coverage/
 # Programs and objects the Makefile fallbacks build in place. The CMake build
 # puts its own outputs under build*/, which is covered above.
 *.o
+*.d
 tests/gcd/gcd
 tests/health/health
 tests/unit/unit-*
