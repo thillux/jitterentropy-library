@@ -713,6 +713,16 @@
             # would never see EAGAIN. A second vCPU makes it real
             # concurrency.
             virtualisation.cores = 2;
+            # Every open runs the NTG.1 startup, whose RCT with memory cutoffs
+            # are tightest at the minimum oversampling rate. On a runner's
+            # nested-KVM clock a startup at osr 3 can end in a permanent
+            # RCT-mem failure, which the open reports as ENOMEM. Twice the
+            # minimum keeps NTG.1 under test with headroom for that clock;
+            # the live images keep the default. Later modprobes that set
+            # osr themselves override this.
+            boot.extraModprobeConfig = ''
+              options jitter_rng osr=6
+            '';
           };
 
           testScript = ''
