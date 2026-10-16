@@ -87,8 +87,8 @@ static int foreground = 0;
 
 /*
  * When set, the daemon will exit on any error it encounters. The goal is that
- * a wrapping monitor will pick up the errors and handle it as it sees fit, such
- * as creating audit logs and possibly restart the daemon.
+ * a wrapping monitor will pick up the errors and handle them as it sees fit,
+ * such as creating audit logs and possibly restarting the daemon.
  *
  * The following errors are returned:
  *
@@ -878,10 +878,10 @@ static ssize_t gather_entropy(struct kernel_rng *rng)
 {
 	sigset_t blocking_set, previous_set;
 /*
- * Maximum numbers of blocks is determined by numbers of reseed IOCTLs: if
- * the reseed IOCTL is used, we call ceil(256 / 80) numbers of IOCTLs. As
+ * Maximum number of blocks is determined by the number of reseed IOCTLs: if
+ * the reseed IOCTL is used, we call ceil(256 / 80) IOCTLs. As
  * each IOCTL may drain the entropy pool by 256 bits, we need to ensure that
- * after the numbers of IOCTLs, we finally inject more blocks than the numbers
+ * after these IOCTLs, we finally inject more blocks than the number
  * of IOCTLs into the input_pool. Otherwise the entropy estimator will never
  * rise and we encounter an endless loop.
  */
@@ -910,7 +910,7 @@ static ssize_t gather_entropy(struct kernel_rng *rng)
 
 		/*
 		 * Write the entropy, LRNG seeds automatically - the Jitter RNG
-		 * provides full entropy so, we tell the Linux RNG the amount of
+		 * provides full entropy, so we tell the Linux RNG the amount of
 		 * entropy.
 		 */
 		ret = write_random(rng, buf, buflen, (size_t)ret, 0);
@@ -936,7 +936,7 @@ static ssize_t gather_entropy(struct kernel_rng *rng)
 
 		/*
 		 * Write the entropy and trigger reseed - the Jitter RNG provides
-		 * full entropy so, we tell the Linux RNG the amount of entropy.
+		 * full entropy, so we tell the Linux RNG the amount of entropy.
 		 */
 		ret = write_random(rng, buf, buflen, (size_t)ret, 1);
 	}
